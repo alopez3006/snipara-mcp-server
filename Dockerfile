@@ -31,11 +31,15 @@ WORKDIR /app
 
 # Create non-root user
 RUN groupadd --gid 1000 appgroup && \
-    useradd --uid 1000 --gid appgroup --shell /bin/bash appuser
+    useradd --uid 1000 --gid appgroup --shell /bin/bash --create-home appuser
 
 # Copy virtual environment from builder
 COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
+
+# Copy Prisma binaries from builder and set correct permissions
+COPY --from=builder /root/.cache/prisma-python /home/appuser/.cache/prisma-python
+RUN chown -R appuser:appgroup /home/appuser/.cache
 
 # Copy application code
 COPY src ./src
@@ -45,6 +49,9 @@ RUN chown -R appuser:appgroup /app
 
 # Switch to non-root user
 USER appuser
+
+# Set home directory for Prisma to find binaries
+ENV HOME=/home/appuser
 
 # Expose port
 EXPOSE 8000
