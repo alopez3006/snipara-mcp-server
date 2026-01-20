@@ -581,6 +581,123 @@ async def mcp_sse_endpoint_post(
     )
 
 
+# ============ DOCUMENT REST ENDPOINTS ============
+
+
+@app.get("/v1/{project_id}/documents", tags=["Documents"])
+async def list_documents(
+    project_id: str,
+    api_key: Annotated[str, Depends(get_api_key)],
+):
+    """
+    List all documents for a project.
+    """
+    # Validate API key and project
+    await validate_and_rate_limit(project_id, api_key)
+
+    try:
+        documents = await db.document.find_many(
+            where={"projectId": project_id},
+            order={"path": "asc"},
+        )
+
+        return JSONResponse(
+            content={
+                "success": True,
+                "documents": [
+                    {
+                        "id": doc.id,
+                        "path": doc.path,
+                        "size": doc.size,
+                        "hash": doc.hash,
+                        "createdAt": doc.createdAt.isoformat() if doc.createdAt else None,
+                        "updatedAt": doc.updatedAt.isoformat() if doc.updatedAt else None,
+                    }
+                    for doc in documents
+                ],
+            }
+        )
+    except Exception as e:
+        logger.error(f"List documents error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/v1/{project_id}/documents", tags=["Documents"])
+async def upload_document(
+    project_id: str,
+    request: Request,
+    api_key: Annotated[str, Depends(get_api_key)],
+):
+    """
+    Upload or update a document. Supports single document or bulk upload.
+
+    Single document:
+    {
+        "path": "docs/readme.md",
+        "content": "..."
+    }
+
+    Bulk upload:
+    {
+        "documents": [
+            {"path": "docs/readme.md", "content": "..."},
+            {"path": "CLAUDE.md", "content": "..."}
+        ],
+        "delete_missing": false
+    }
+    """
+    start_time = time.perf_counter()
+
+    # Validate API key and project
+    _, _, plan = await validate_and_rate_limit(project_id, api_key)
+
+    try:
+        body = await request.json()
+        engine = RLMEngine(project_id, plan=plan)
+
+        # Check if bulk upload or single document
+        if "documents" in body:
+            # Bulk upload
+            result = await engine.execute(
+                ToolName.RLM_SYNC_DOCUMENTS,
+                {
+                    "documents": body["documents"],
+                    "delete_missing": body.get("delete_missing", False),
+                },
+            )
+        else:
+            # Single document
+            result = await engine.execute(
+                ToolName.RLM_UPLOAD_DOCUMENT,
+                {"path": body["path"], "content": body["content"]},
+            )
+
+        latency_ms = int((time.perf_counter() - start_time) * 1000)
+
+        # Track usage
+        await track_usage(
+            project_id=project_id,
+            tool="rest_upload",
+            input_tokens=result.input_tokens,
+            output_tokens=result.output_tokens,
+            latency_ms=latency_ms,
+            success=True,
+        )
+
+        return JSONResponse(
+            content={
+                "success": True,
+                "result": result.data,
+                "latency_ms": latency_ms,
+            },
+            status_code=201,
+        )
+
+    except Exception as e:
+        logger.error(f"Upload document error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ============ WEBHOOK ENDPOINTS ============
 
 
