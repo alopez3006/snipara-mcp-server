@@ -26,6 +26,14 @@ This server exposes the following MCP tools:
 | `rlm_decompose` | Break complex queries into sub-queries |
 | `rlm_multi_query` | Execute multiple queries in one call |
 
+### Document Management Tools
+
+| Tool | Description |
+|------|-------------|
+| `rlm_upload_document` | Upload or update a single document |
+| `rlm_sync_documents` | Bulk sync multiple documents (for CI/CD) |
+| `rlm_settings` | Get project settings from dashboard |
+
 ### Supporting Tools
 
 | Tool | Description |
@@ -152,6 +160,59 @@ MCP endpoint for tool calls.
   "total_tokens": 3800,
   "suggestions": ["Also check: docs/security.md"]
 }
+```
+
+## Document Upload
+
+### Via MCP Tool
+
+Upload documents directly from your LLM client:
+
+```
+rlm_upload_document(path="CLAUDE.md", content="# My Project\n...")
+```
+
+### Via Webhook (CI/CD)
+
+Sync documents on git push:
+
+```bash
+curl -X POST "https://api.snipara.com/v1/YOUR_PROJECT_ID/webhook/sync" \
+  -H "X-API-Key: YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "documents": [
+      {"path": "CLAUDE.md", "content": "# My Project..."},
+      {"path": "docs/api.md", "content": "# API Reference..."}
+    ],
+    "delete_missing": false
+  }'
+```
+
+### GitHub Action Example
+
+```yaml
+name: Sync Docs to Snipara
+on:
+  push:
+    paths: ['**/*.md']
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Collect and sync docs
+        run: |
+          # Build JSON payload with all markdown files
+          docs=$(find . -name '*.md' -not -path './node_modules/*' | while read f; do
+            content=$(cat "$f" | jq -Rs .)
+            echo "{\"path\": \"${f#./}\", \"content\": $content}"
+          done | jq -s '{documents: .}')
+
+          curl -X POST "${{ secrets.SNIPARA_WEBHOOK_URL }}" \
+            -H "X-API-Key: ${{ secrets.SNIPARA_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d "$docs"
 ```
 
 ## Environment Variables
