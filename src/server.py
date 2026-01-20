@@ -596,6 +596,7 @@ async def list_documents(
     await validate_and_rate_limit(project_id, api_key)
 
     try:
+        db = await get_db()
         documents = await db.document.find_many(
             where={"projectId": project_id},
             order={"path": "asc"},
