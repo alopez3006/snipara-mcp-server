@@ -664,12 +664,17 @@ async def mcp_endpoint(
     except Exception:
         return JSONResponse(jsonrpc_error(None, -32700, "Parse error"), status_code=400)
 
-    if isinstance(body, list):
-        responses = [r for req in body if (r := await handle_request(req, project_id, plan))]
-        return JSONResponse(responses)
+    try:
+        if isinstance(body, list):
+            responses = [r for req in body if (r := await handle_request(req, project_id, plan))]
+            return JSONResponse(responses)
 
-    response = await handle_request(body, project_id, plan)
-    return JSONResponse(response) if response else JSONResponse({}, status_code=204)
+        response = await handle_request(body, project_id, plan)
+        return JSONResponse(response) if response else JSONResponse({}, status_code=204)
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error(f"MCP request error: {e}", exc_info=True)
+        return JSONResponse(jsonrpc_error(body.get("id"), -32000, f"Server error: {str(e)}"))
 
 
 @router.get("/{project_id}")
