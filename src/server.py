@@ -12,10 +12,16 @@ from uuid import uuid4
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from starlette.middleware.base import BaseHTTPMiddleware
-
+from pydantic import ValidationError
 from . import __version__
-from .auth import get_project_with_team, validate_api_key
+from .auth import (
+    get_project_settings,
+    get_project_with_team,
+    get_team_by_slug_or_id,
+    validate_api_key,
+    validate_oauth_token,
+    validate_team_api_key,
+)
 from .config import settings
 from .db import close_db, get_db
 from .models import (
@@ -23,11 +29,12 @@ from .models import (
     LimitsInfo,
     MCPRequest,
     MCPResponse,
+    MultiProjectQueryParams,
     Plan,
     ToolName,
     UsageInfo,
 )
-from .rlm_engine import RLMEngine
+from .rlm_engine import RLMEngine, count_tokens
 from .usage import (
     check_rate_limit,
     check_usage_limits,
@@ -81,26 +88,44 @@ def sanitize_error_message(error: Exception) -> str:
 # ============ SECURITY MIDDLEWARE ============
 
 
-class SecurityHeadersMiddleware(BaseHTTPMiddleware):
-    """Add security headers to all responses."""
+class SecurityHeadersMiddleware:
+    """
+    Add security headers to all responses.
 
-    async def dispatch(self, request: Request, call_next):
+    Uses pure ASGI middleware pattern instead of BaseHTTPMiddleware
+    to avoid Content-Length mismatch issues with streaming responses.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
         # Generate request ID for tracing
         request_id = str(uuid4())
 
-        response = await call_next(request)
+        async def send_with_headers(message):
+            if message["type"] == "http.response.start":
+                headers = list(message.get("headers", []))
+                # Add security headers
+                headers.append((b"x-request-id", request_id.encode()))
+                headers.append((b"x-content-type-options", b"nosniff"))
+                headers.append((b"x-frame-options", b"DENY"))
+                headers.append((b"x-xss-protection", b"1; mode=block"))
 
-        # Add security headers
-        response.headers["X-Request-ID"] = request_id
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["X-Frame-Options"] = "DENY"
-        response.headers["X-XSS-Protection"] = "1; mode=block"
+                # Add HSTS in production (non-debug mode)
+                if not settings.debug:
+                    headers.append(
+                        (b"strict-transport-security", b"max-age=31536000; includeSubDomains")
+                    )
 
-        # Add HSTS in production (non-debug mode)
-        if not settings.debug:
-            response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+                message = {**message, "headers": headers}
+            await send(message)
 
-        return response
+        await self.app(scope, receive, send_with_headers)
 
 
 @asynccontextmanager
@@ -157,21 +182,34 @@ async def get_api_key(
 async def validate_and_rate_limit(
     project_id: str,
     api_key: str,
-) -> tuple[dict, any, Plan]:
+) -> tuple[dict, any, Plan, dict | None]:
     """
     Common validation logic for all endpoints.
-    Validates API key, gets project, and checks rate limit.
+    Validates API key or OAuth token, gets project, checks rate limit, and fetches settings.
+
+    Supports both:
+    - OAuth tokens (snipara_at_...)
+    - API keys (rlm_...)
 
     Returns:
-        Tuple of (api_key_info, project, plan)
+        Tuple of (auth_info, project, plan, project_settings)
 
     Raises:
         HTTPException on validation failure
     """
-    # 1. Validate API key
-    api_key_info = await validate_api_key(api_key, project_id)
-    if not api_key_info:
-        raise HTTPException(status_code=401, detail="Invalid API key")
+    # 1. Validate auth (OAuth token or API key)
+    auth_info = None
+
+    # Check if it's an OAuth token
+    if api_key.startswith("snipara_at_"):
+        auth_info = await validate_oauth_token(api_key, project_id)
+        if not auth_info:
+            raise HTTPException(status_code=401, detail="Invalid or expired OAuth token")
+    else:
+        # Fall back to API key validation
+        auth_info = await validate_api_key(api_key, project_id)
+        if not auth_info:
+            raise HTTPException(status_code=401, detail="Invalid API key")
 
     # 2. Get project with team subscription
     project = await get_project_with_team(project_id)
@@ -189,7 +227,183 @@ async def validate_and_rate_limit(
     # 4. Determine plan
     plan = Plan(project.team.subscription.plan if project.team.subscription else "FREE")
 
-    return api_key_info, project, plan
+    # 5. Get project automation settings (from dashboard)
+    project_settings = await get_project_settings(project_id)
+
+    return api_key_info, project, plan, project_settings
+
+
+async def validate_team_and_rate_limit(
+    team_slug_or_id: str,
+    api_key: str,
+) -> tuple[dict, any, Plan]:
+    """
+    Validate team API key, resolve team, and check rate limits.
+
+    Returns:
+        Tuple of (api_key_info, team, plan)
+    """
+    team = await get_team_by_slug_or_id(team_slug_or_id)
+    if not team:
+        raise HTTPException(status_code=404, detail="Team not found")
+
+    api_key_info = await validate_team_api_key(api_key, team.id)
+    if not api_key_info:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    rate_ok = await check_rate_limit(api_key_info["id"])
+    if not rate_ok:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Rate limit exceeded: {settings.rate_limit_requests} requests per minute",
+        )
+
+    plan = Plan(team.subscription.plan if team.subscription else "FREE")
+
+    return api_key_info, team, plan
+
+
+async def execute_multi_project_query(
+    team: any,
+    plan: Plan,
+    params: dict,
+) -> tuple[dict, int, int]:
+    """
+    Execute a multi-project query for a team.
+
+    Returns:
+        Tuple of (result_payload, total_input_tokens, total_output_tokens)
+    """
+    try:
+        parsed = MultiProjectQueryParams.model_validate(params)
+    except ValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    projects = list(team.projects or [])
+    include_ids = set(parsed.project_ids)
+    exclude_ids = set(parsed.exclude_project_ids)
+
+    if include_ids:
+        projects = [
+            project
+            for project in projects
+            if project.id in include_ids or project.slug in include_ids
+        ]
+
+    if exclude_ids:
+        projects = [
+            project
+            for project in projects
+            if project.id not in exclude_ids and project.slug not in exclude_ids
+        ]
+
+    if not projects:
+        empty_result = {
+            "query": parsed.query,
+            "max_tokens": parsed.max_tokens,
+            "per_project_limit": parsed.per_project_limit,
+            "search_mode": parsed.search_mode.value,
+            "projects_queried": 0,
+            "projects_skipped": 0,
+            "results": [],
+        }
+        return empty_result, count_tokens(parsed.query), 0
+
+    per_project_budget = max(1, parsed.max_tokens // len(projects))
+
+    async def execute_project(project: any) -> dict:
+        limits = await check_usage_limits(project.id, plan)
+        if limits.exceeded:
+            return {
+                "project_id": project.id,
+                "project_slug": project.slug,
+                "success": False,
+                "skipped": True,
+                "error": f"Monthly usage limit exceeded: {limits.current}/{limits.max}",
+                "input_tokens": 0,
+                "output_tokens": 0,
+            }
+
+        project_settings = await get_project_settings(project.id)
+        tool_params = {
+            "query": parsed.query,
+            "max_tokens": per_project_budget,
+            "search_mode": parsed.search_mode.value,
+            "include_metadata": parsed.include_metadata,
+            "prefer_summaries": parsed.prefer_summaries,
+        }
+
+        start_time = time.perf_counter()
+
+        try:
+            engine = RLMEngine(project.id, plan=plan, settings=project_settings)
+            result = await engine.execute(ToolName.RLM_CONTEXT_QUERY, tool_params)
+
+            latency_ms = int((time.perf_counter() - start_time) * 1000)
+            await track_usage(
+                project_id=project.id,
+                tool=ToolName.RLM_MULTI_PROJECT_QUERY.value,
+                input_tokens=result.input_tokens,
+                output_tokens=result.output_tokens,
+                latency_ms=latency_ms,
+                success=True,
+            )
+
+            result_data = result.data
+            if isinstance(result_data, dict) and "sections" in result_data:
+                result_data["sections"] = result_data["sections"][: parsed.per_project_limit]
+
+            return {
+                "project_id": project.id,
+                "project_slug": project.slug,
+                "success": True,
+                "skipped": False,
+                "result": result_data,
+                "input_tokens": result.input_tokens,
+                "output_tokens": result.output_tokens,
+            }
+        except Exception as e:
+            latency_ms = int((time.perf_counter() - start_time) * 1000)
+            await track_usage(
+                project_id=project.id,
+                tool=ToolName.RLM_MULTI_PROJECT_QUERY.value,
+                input_tokens=0,
+                output_tokens=0,
+                latency_ms=latency_ms,
+                success=False,
+                error=str(e),
+            )
+            return {
+                "project_id": project.id,
+                "project_slug": project.slug,
+                "success": False,
+                "skipped": False,
+                "error": sanitize_error_message(e),
+                "input_tokens": 0,
+                "output_tokens": 0,
+            }
+
+    results = await asyncio.gather(*[execute_project(project) for project in projects])
+
+    total_input_tokens = sum(item["input_tokens"] for item in results)
+    total_output_tokens = sum(item["output_tokens"] for item in results)
+    projects_queried = sum(1 for item in results if item["success"])
+    projects_skipped = sum(1 for item in results if item.get("skipped"))
+
+    payload = {
+        "query": parsed.query,
+        "max_tokens": parsed.max_tokens,
+        "per_project_limit": parsed.per_project_limit,
+        "search_mode": parsed.search_mode.value,
+        "projects_queried": projects_queried,
+        "projects_skipped": projects_skipped,
+        "results": [
+            {k: v for k, v in item.items() if k not in {"input_tokens", "output_tokens"}}
+            for item in results
+        ],
+    }
+
+    return payload, total_input_tokens, total_output_tokens
 
 
 # ============ EXCEPTION HANDLERS ============
@@ -271,8 +485,10 @@ async def mcp_endpoint(
     """
     start_time = time.perf_counter()
 
-    # Validate API key, project, and rate limit
-    api_key_info, project, plan = await validate_and_rate_limit(project_id, api_key)
+    # Validate API key, project, rate limit, and get settings
+    api_key_info, project, plan, project_settings = await validate_and_rate_limit(
+        project_id, api_key
+    )
 
     # Check usage limits
     limits = await check_usage_limits(project_id, plan)
@@ -282,9 +498,9 @@ async def mcp_endpoint(
             detail=f"Monthly usage limit exceeded: {limits.current}/{limits.max} queries. Upgrade your plan to continue.",
         )
 
-    # Execute the tool
+    # Execute the tool with project settings from dashboard
     try:
-        engine = RLMEngine(project_id, plan=plan)
+        engine = RLMEngine(project_id, plan=plan, settings=project_settings)
         result = await engine.execute(request.tool, request.params)
 
         latency_ms = int((time.perf_counter() - start_time) * 1000)
@@ -331,6 +547,51 @@ async def mcp_endpoint(
         )
 
 
+@app.post("/v1/team/{team_slug}/mcp", response_model=MCPResponse, tags=["MCP"])
+async def team_mcp_endpoint(
+    team_slug: str,
+    request: MCPRequest,
+    api_key: Annotated[str, Depends(get_api_key)],
+) -> MCPResponse:
+    """
+    Execute team-scoped MCP tools.
+
+    This endpoint only allows rlm_multi_project_query with a team API key.
+    """
+    start_time = time.perf_counter()
+
+    _, team, plan = await validate_team_and_rate_limit(team_slug, api_key)
+
+    if request.tool != ToolName.RLM_MULTI_PROJECT_QUERY:
+        raise HTTPException(status_code=400, detail="Invalid tool for team API key")
+
+    try:
+        result_payload, input_tokens, output_tokens = await execute_multi_project_query(
+            team, plan, request.params
+        )
+
+        latency_ms = int((time.perf_counter() - start_time) * 1000)
+
+        return MCPResponse(
+            success=True,
+            result=result_payload,
+            usage=UsageInfo(
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                latency_ms=latency_ms,
+            ),
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        latency_ms = int((time.perf_counter() - start_time) * 1000)
+        return MCPResponse(
+            success=False,
+            error=sanitize_error_message(e),
+            usage=UsageInfo(latency_ms=latency_ms),
+        )
+
+
 @app.get("/v1/{project_id}/context", tags=["MCP"])
 async def get_context(
     project_id: str,
@@ -347,7 +608,7 @@ async def get_context(
         Current session context
     """
     # Validate API key, project, and rate limit
-    await validate_and_rate_limit(project_id, api_key)
+    _, _, _, _ = await validate_and_rate_limit(project_id, api_key)
 
     engine = RLMEngine(project_id)
     await engine.load_session_context()
@@ -375,7 +636,7 @@ async def get_limits(
         Current usage and limits
     """
     # Validate API key, project, and rate limit
-    _, _, plan = await validate_and_rate_limit(project_id, api_key)
+    _, _, plan, _ = await validate_and_rate_limit(project_id, api_key)
 
     return await check_usage_limits(project_id, plan)
 
@@ -398,7 +659,7 @@ async def get_stats(
         Usage statistics
     """
     # Validate API key, project, and rate limit
-    await validate_and_rate_limit(project_id, api_key)
+    _, _, _, _ = await validate_and_rate_limit(project_id, api_key)
 
     stats = await get_usage_stats(project_id, days)
     return {"project_id": project_id, **stats}
@@ -490,7 +751,7 @@ async def mcp_sse_endpoint(
         SSE stream with tool execution events
     """
     # Validate API key, project, and rate limit
-    _, _, plan = await validate_and_rate_limit(project_id, api_key)
+    _, _, plan, _ = await validate_and_rate_limit(project_id, api_key)
 
     # Check usage limits
     limits = await check_usage_limits(project_id, plan)
@@ -557,7 +818,7 @@ async def mcp_sse_endpoint_post(
         SSE stream with tool execution events
     """
     # Validate API key, project, and rate limit
-    _, _, plan = await validate_and_rate_limit(project_id, api_key)
+    _, _, plan, _ = await validate_and_rate_limit(project_id, api_key)
 
     # Check usage limits
     limits = await check_usage_limits(project_id, plan)
@@ -577,192 +838,6 @@ async def mcp_sse_endpoint_post(
             "X-Accel-Buffering": "no",  # Disable nginx buffering
         },
     )
-
-
-# ============ DOCUMENT REST ENDPOINTS ============
-
-
-@app.get("/v1/{project_id}/documents", tags=["Documents"])
-async def list_documents(
-    project_id: str,
-    api_key: Annotated[str, Depends(get_api_key)],
-):
-    """
-    List all documents for a project.
-    """
-    # Validate API key and project
-    await validate_and_rate_limit(project_id, api_key)
-
-    try:
-        db = await get_db()
-        documents = await db.document.find_many(
-            where={"projectId": project_id},
-            order={"path": "asc"},
-        )
-
-        return JSONResponse(
-            content={
-                "success": True,
-                "documents": [
-                    {
-                        "id": doc.id,
-                        "path": doc.path,
-                        "size": doc.size,
-                        "hash": doc.hash,
-                        "createdAt": doc.createdAt.isoformat() if doc.createdAt else None,
-                        "updatedAt": doc.updatedAt.isoformat() if doc.updatedAt else None,
-                    }
-                    for doc in documents
-                ],
-            }
-        )
-    except Exception as e:
-        logger.error(f"List documents error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/v1/{project_id}/documents", tags=["Documents"])
-async def upload_document(
-    project_id: str,
-    request: Request,
-    api_key: Annotated[str, Depends(get_api_key)],
-):
-    """
-    Upload or update a document. Supports single document or bulk upload.
-
-    Single document:
-    {
-        "path": "docs/readme.md",
-        "content": "..."
-    }
-
-    Bulk upload:
-    {
-        "documents": [
-            {"path": "docs/readme.md", "content": "..."},
-            {"path": "CLAUDE.md", "content": "..."}
-        ],
-        "delete_missing": false
-    }
-    """
-    start_time = time.perf_counter()
-
-    # Validate API key and project
-    _, _, plan = await validate_and_rate_limit(project_id, api_key)
-
-    try:
-        body = await request.json()
-        engine = RLMEngine(project_id, plan=plan)
-
-        # Check if bulk upload or single document
-        if "documents" in body:
-            # Bulk upload
-            result = await engine.execute(
-                ToolName.RLM_SYNC_DOCUMENTS,
-                {
-                    "documents": body["documents"],
-                    "delete_missing": body.get("delete_missing", False),
-                },
-            )
-        else:
-            # Single document
-            result = await engine.execute(
-                ToolName.RLM_UPLOAD_DOCUMENT,
-                {"path": body["path"], "content": body["content"]},
-            )
-
-        latency_ms = int((time.perf_counter() - start_time) * 1000)
-
-        # Track usage
-        await track_usage(
-            project_id=project_id,
-            tool="rest_upload",
-            input_tokens=result.input_tokens,
-            output_tokens=result.output_tokens,
-            latency_ms=latency_ms,
-            success=True,
-        )
-
-        return JSONResponse(
-            content={
-                "success": True,
-                "result": result.data,
-                "latency_ms": latency_ms,
-            },
-            status_code=201,
-        )
-
-    except Exception as e:
-        logger.error(f"Upload document error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ============ WEBHOOK ENDPOINTS ============
-
-
-@app.post("/v1/{project_id}/webhook/sync", tags=["Webhook"])
-async def webhook_sync_documents(
-    project_id: str,
-    request: Request,
-    api_key: Annotated[str, Depends(get_api_key)],
-):
-    """
-    Webhook endpoint for syncing documents from git commits.
-
-    Can be triggered by GitHub Actions, GitLab CI, or any CI/CD pipeline.
-
-    Body format:
-    {
-        "documents": [
-            {"path": "docs/readme.md", "content": "..."},
-            {"path": "CLAUDE.md", "content": "..."}
-        ],
-        "delete_missing": false  // optional: delete docs not in list
-    }
-    """
-    start_time = time.perf_counter()
-
-    # Validate API key and project
-    _, _, plan = await validate_and_rate_limit(project_id, api_key)
-
-    try:
-        body = await request.json()
-        documents = body.get("documents", [])
-        delete_missing = body.get("delete_missing", False)
-
-        if not documents:
-            raise HTTPException(status_code=400, detail="No documents provided")
-
-        # Use the sync_documents tool
-        engine = RLMEngine(project_id, plan=plan)
-        result = await engine.execute(
-            ToolName.RLM_SYNC_DOCUMENTS,
-            {"documents": documents, "delete_missing": delete_missing},
-        )
-
-        latency_ms = int((time.perf_counter() - start_time) * 1000)
-
-        # Track usage
-        await track_usage(
-            project_id=project_id,
-            tool="webhook_sync",
-            input_tokens=result.input_tokens,
-            output_tokens=result.output_tokens,
-            latency_ms=latency_ms,
-            success=True,
-        )
-
-        return JSONResponse(
-            content={
-                "success": True,
-                "result": result.data,
-                "latency_ms": latency_ms,
-            }
-        )
-
-    except Exception as e:
-        logger.error(f"Webhook sync error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ============ MAIN ============
