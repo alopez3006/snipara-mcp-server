@@ -109,12 +109,10 @@ async def lifespan(app: FastAPI):
     # Startup
     logger.info(f"Starting RLM MCP Server v{__version__}")
 
-    # Validate CORS configuration in production
-    if not settings.debug and settings.cors_allowed_origins == "*":
-        logger.warning(
-            "SECURITY WARNING: CORS is configured to allow all origins ('*'). "
-            "Set CORS_ALLOWED_ORIGINS to specific domains in production."
-        )
+    # CORS is intentionally permissive for MCP API (programmatic clients, not browsers)
+    # Authentication is enforced via API keys/OAuth tokens
+    if settings.cors_allowed_origins == "*":
+        logger.info("CORS: Allowing all origins (MCP API mode)")
 
     await get_db()  # Initialize database connection
     yield

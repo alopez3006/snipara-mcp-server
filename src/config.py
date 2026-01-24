@@ -26,8 +26,9 @@ class Settings(BaseSettings):
     debug: bool = False
 
     # CORS - comma-separated list of allowed origins
-    # In production, this MUST be set explicitly (not "*")
-    cors_allowed_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
+    # For MCP API: allow all origins since clients are programmatic (not browsers)
+    # Authentication is handled via API keys/OAuth tokens
+    cors_allowed_origins: str = "*"
 
     # Rate limiting
     rate_limit_requests: int = 100  # requests per minute per API key
