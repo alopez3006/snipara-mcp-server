@@ -612,7 +612,7 @@ async def handle_request(body: dict, project_id: str, plan: Plan) -> dict | None
     if method == "initialize":
         return jsonrpc_response(id, {
             "protocolVersion": MCP_VERSION,
-            "serverInfo": {"name": "snipara", "version": "1.7.4"},
+            "serverInfo": {"name": "snipara", "version": "1.7.5"},
             "capabilities": {"tools": {}},
         })
     elif method == "tools/list":
