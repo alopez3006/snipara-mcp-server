@@ -257,3 +257,4 @@ MIT License - see [LICENSE](LICENSE) for details.
 - **Website:** [snipara.com](https://snipara.com)
 - **Documentation:** [snipara.com/docs](https://snipara.com/docs)
 - **Issues:** [GitHub Issues](https://github.com/alopez3006/snipara-mcp-server/issues)
+
