@@ -14,7 +14,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# Generate Prisma client
+# Generate Prisma client - force rebuild v1.7.1 with OAuth models
 COPY prisma ./prisma
 RUN prisma generate
 
