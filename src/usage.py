@@ -10,22 +10,41 @@ from .models import LimitsInfo, Plan
 
 # Redis client for rate limiting
 _redis: redis.Redis | None = None
+_redis_available: bool | None = None
 
 
-async def get_redis() -> redis.Redis:
-    """Get or create Redis client."""
-    global _redis
+async def get_redis() -> redis.Redis | None:
+    """Get or create Redis client. Returns None if Redis is not configured."""
+    global _redis, _redis_available
+
+    # If we already know Redis is unavailable, skip
+    if _redis_available is False:
+        return None
+
     if _redis is None:
-        _redis = redis.from_url(settings.redis_url)
+        if not settings.redis_url:
+            _redis_available = False
+            return None
+        try:
+            _redis = redis.from_url(settings.redis_url)
+            # Test connection
+            await _redis.ping()
+            _redis_available = True
+        except Exception as e:
+            print(f"[Warning] Redis connection failed, rate limiting disabled: {e}")
+            _redis_available = False
+            _redis = None
+            return None
     return _redis
 
 
 async def close_redis() -> None:
     """Close Redis connection."""
-    global _redis
+    global _redis, _redis_available
     if _redis is not None:
         await _redis.close()
         _redis = None
+    _redis_available = None
 
 
 async def check_rate_limit(api_key_id: str) -> bool:
@@ -39,22 +58,32 @@ async def check_rate_limit(api_key_id: str) -> bool:
         True if within limits, False if exceeded
     """
     r = await get_redis()
-    key = f"rate_limit:{api_key_id}"
 
-    # Get current count
-    count = await r.get(key)
-    if count is None:
-        # First request, set counter with expiry
-        await r.setex(key, settings.rate_limit_window, 1)
+    # If Redis is not available, skip rate limiting
+    if r is None:
         return True
 
-    count = int(count)
-    if count >= settings.rate_limit_requests:
-        return False
+    try:
+        key = f"rate_limit:{api_key_id}"
 
-    # Increment counter
-    await r.incr(key)
-    return True
+        # Get current count
+        count = await r.get(key)
+        if count is None:
+            # First request, set counter with expiry
+            await r.setex(key, settings.rate_limit_window, 1)
+            return True
+
+        count = int(count)
+        if count >= settings.rate_limit_requests:
+            return False
+
+        # Increment counter
+        await r.incr(key)
+        return True
+    except Exception as e:
+        # If Redis fails, allow the request
+        print(f"[Warning] Rate limit check failed: {e}")
+        return True
 
 
 async def check_usage_limits(project_id: str, plan: Plan) -> LimitsInfo:

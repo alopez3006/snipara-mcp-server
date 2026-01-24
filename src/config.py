@@ -17,8 +17,8 @@ class Settings(BaseSettings):
     # Database
     database_url: str
 
-    # Redis (for rate limiting)
-    redis_url: str = "redis://localhost:6379"
+    # Redis (for rate limiting) - optional, rate limiting disabled if not set
+    redis_url: str = ""
 
     # Server
     host: str = "0.0.0.0"
@@ -26,9 +26,8 @@ class Settings(BaseSettings):
     debug: bool = False
 
     # CORS - comma-separated list of allowed origins
-    # For MCP API: allow all origins since clients are programmatic (not browsers)
-    # Authentication is handled via API keys/OAuth tokens
-    cors_allowed_origins: str = "*"
+    # In production, this MUST be set explicitly (not "*")
+    cors_allowed_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
 
     # Rate limiting
     rate_limit_requests: int = 100  # requests per minute per API key

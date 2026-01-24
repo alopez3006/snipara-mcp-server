@@ -25,12 +25,33 @@ class ToolName(str, Enum):
     # Phase 4.5: Recursive Context Tools
     RLM_DECOMPOSE = "rlm_decompose"
     RLM_MULTI_QUERY = "rlm_multi_query"
+    RLM_MULTI_PROJECT_QUERY = "rlm_multi_project_query"
     RLM_PLAN = "rlm_plan"
     # Phase 4.6: Summary Storage Tools
     RLM_STORE_SUMMARY = "rlm_store_summary"
     RLM_GET_SUMMARIES = "rlm_get_summaries"
     RLM_DELETE_SUMMARY = "rlm_delete_summary"
-    # Phase 5: Document Upload Tools
+    # Phase 7: Shared Context Tools
+    RLM_SHARED_CONTEXT = "rlm_shared_context"
+    RLM_LIST_TEMPLATES = "rlm_list_templates"
+    RLM_GET_TEMPLATE = "rlm_get_template"
+    # Phase 8.2: Agent Memory Tools
+    RLM_REMEMBER = "rlm_remember"
+    RLM_RECALL = "rlm_recall"
+    RLM_MEMORIES = "rlm_memories"
+    RLM_FORGET = "rlm_forget"
+    # Phase 9.1: Multi-Agent Swarm Tools
+    RLM_SWARM_CREATE = "rlm_swarm_create"
+    RLM_SWARM_JOIN = "rlm_swarm_join"
+    RLM_CLAIM = "rlm_claim"
+    RLM_RELEASE = "rlm_release"
+    RLM_STATE_GET = "rlm_state_get"
+    RLM_STATE_SET = "rlm_state_set"
+    RLM_BROADCAST = "rlm_broadcast"
+    RLM_TASK_CREATE = "rlm_task_create"
+    RLM_TASK_CLAIM = "rlm_task_claim"
+    RLM_TASK_COMPLETE = "rlm_task_complete"
+    # Phase 10: Document Sync Tools
     RLM_UPLOAD_DOCUMENT = "rlm_upload_document"
     RLM_SYNC_DOCUMENTS = "rlm_sync_documents"
     RLM_SETTINGS = "rlm_settings"
@@ -112,6 +133,44 @@ class ContextQueryParams(BaseModel):
         default=False,
         description="Prefer stored summaries over full document content when available",
     )
+
+class MultiProjectQueryParams(BaseModel):
+    """Parameters for rlm_multi_project_query tool."""
+
+    query: str = Field(..., description="The query/question to get context for")
+    max_tokens: int = Field(
+        default=4000,
+        ge=100,
+        le=100000,
+        description="Maximum tokens to return across all projects",
+    )
+    per_project_limit: int = Field(
+        default=3,
+        ge=1,
+        le=20,
+        description="Maximum sections to return per project",
+    )
+    project_ids: list[str] = Field(
+        default_factory=list,
+        description="Optional list of project IDs or slugs to include",
+    )
+    exclude_project_ids: list[str] = Field(
+        default_factory=list,
+        description="Optional list of project IDs or slugs to exclude",
+    )
+    search_mode: SearchMode = Field(
+        default=SearchMode.KEYWORD,
+        description="Search strategy: keyword, semantic, or hybrid",
+    )
+    include_metadata: bool = Field(
+        default=True,
+        description="Include file paths, line numbers, and relevance scores",
+    )
+    prefer_summaries: bool = Field(
+        default=False,
+        description="Prefer stored summaries when available",
+    )
+
 
 
 # ============ RESPONSE MODELS ============
@@ -237,6 +296,19 @@ class ContextQueryResult(BaseModel):
     timing: dict[str, int] | None = Field(
         default=None,
         description="Timing breakdown in milliseconds (embed_ms, search_ms, score_ms, total_ms)",
+    )
+    system_instructions: str | None = Field(
+        default=None,
+        description="System instructions to guide LLM behavior when using Snipara tools",
+    )
+    shared_context_included: bool = Field(
+        default=False,
+        description="Whether shared best practices were included (from linked collections)",
+    )
+    shared_context_tokens: int = Field(
+        default=0,
+        ge=0,
+        description="Number of tokens from shared context collections",
     )
 
 
@@ -522,17 +594,519 @@ class DeleteSummaryResult(BaseModel):
     message: str = Field(..., description="Human-readable status message")
 
 
-# ============ DOCUMENT UPLOAD MODELS (Phase 5) ============
+# ============ SHARED CONTEXT MODELS (Phase 7) ============
 
 
-class UploadDocumentParams(BaseModel):
-    """Parameters for rlm_upload_document tool."""
+class DocumentCategoryEnum(str, Enum):
+    """Document category for token budget allocation."""
 
-    path: str = Field(
-        ...,
-        description="Document path relative to project root (e.g., 'docs/api.md')",
+    MANDATORY = "MANDATORY"
+    BEST_PRACTICES = "BEST_PRACTICES"
+    GUIDELINES = "GUIDELINES"
+    REFERENCE = "REFERENCE"
+
+
+class SharedDocumentInfo(BaseModel):
+    """Information about a shared document."""
+
+    id: str = Field(..., description="Document ID")
+    title: str = Field(..., description="Document title")
+    category: DocumentCategoryEnum = Field(..., description="Document category")
+    token_count: int = Field(..., ge=0, description="Token count")
+    collection_name: str = Field(..., description="Source collection name")
+    tags: list[str] = Field(default_factory=list, description="Document tags")
+
+
+class SharedContextParams(BaseModel):
+    """Parameters for rlm_shared_context tool."""
+
+    max_tokens: int = Field(
+        default=4000,
+        ge=100,
+        le=100000,
+        description="Maximum tokens for shared context",
     )
-    content: str = Field(..., min_length=1, description="Document content (markdown)")
+    categories: list[DocumentCategoryEnum] | None = Field(
+        default=None,
+        description="Filter by categories (null = all categories)",
+    )
+    include_content: bool = Field(
+        default=True,
+        description="Include document content in response",
+    )
+
+
+class SharedContextResult(BaseModel):
+    """Result of rlm_shared_context tool."""
+
+    documents: list[SharedDocumentInfo] = Field(
+        default_factory=list,
+        description="Shared documents matching criteria",
+    )
+    merged_content: str | None = Field(
+        default=None,
+        description="Merged content string (if include_content=True)",
+    )
+    total_tokens: int = Field(default=0, ge=0, description="Total tokens returned")
+    collections_loaded: int = Field(
+        default=0, ge=0, description="Number of collections loaded"
+    )
+    context_hash: str = Field(
+        default="",
+        description="Hash for cache invalidation",
+    )
+
+
+class PromptTemplateInfo(BaseModel):
+    """Information about a prompt template."""
+
+    id: str = Field(..., description="Template ID")
+    name: str = Field(..., description="Template name")
+    slug: str = Field(..., description="Template slug")
+    description: str | None = Field(default=None, description="Template description")
+    prompt: str = Field(..., description="The prompt template text")
+    variables: list[str] = Field(
+        default_factory=list, description="Variables in the template"
+    )
+    category: str = Field(..., description="Template category")
+    collection_name: str = Field(..., description="Source collection name")
+
+
+class ListTemplatesParams(BaseModel):
+    """Parameters for rlm_list_templates tool."""
+
+    category: str | None = Field(default=None, description="Filter by category")
+
+
+class ListTemplatesResult(BaseModel):
+    """Result of rlm_list_templates tool."""
+
+    templates: list[PromptTemplateInfo] = Field(
+        default_factory=list, description="Available prompt templates"
+    )
+    total_count: int = Field(default=0, ge=0, description="Total templates found")
+    categories: list[str] = Field(
+        default_factory=list, description="Available categories"
+    )
+
+
+class GetTemplateParams(BaseModel):
+    """Parameters for rlm_get_template tool."""
+
+    template_id: str | None = Field(default=None, description="Template ID")
+    slug: str | None = Field(default=None, description="Template slug")
+    variables: dict[str, str] = Field(
+        default_factory=dict,
+        description="Variable values to substitute in the template",
+    )
+
+
+class GetTemplateResult(BaseModel):
+    """Result of rlm_get_template tool."""
+
+    template: PromptTemplateInfo | None = Field(
+        default=None, description="The template info"
+    )
+    rendered_prompt: str | None = Field(
+        default=None, description="Prompt with variables substituted"
+    )
+    missing_variables: list[str] = Field(
+        default_factory=list, description="Variables that weren't provided"
+    )
+
+
+# ============ AGENT MEMORY MODELS (Phase 8.2) ============
+
+
+class AgentMemoryType(str, Enum):
+    """Type of agent memory."""
+
+    FACT = "fact"  # Objective information
+    DECISION = "decision"  # Choice made with rationale
+    LEARNING = "learning"  # Pattern or insight discovered
+    PREFERENCE = "preference"  # User/team preference
+    TODO = "todo"  # Deferred task or reminder
+    CONTEXT = "context"  # General session context
+
+
+class AgentMemoryScope(str, Enum):
+    """Scope of agent memory visibility."""
+
+    AGENT = "agent"  # Specific to one agent/session
+    PROJECT = "project"  # Shared across project
+    TEAM = "team"  # Shared across team
+    USER = "user"  # Personal across all projects
+
+
+class RememberParams(BaseModel):
+    """Parameters for rlm_remember tool."""
+
+    content: str = Field(..., min_length=1, description="The memory content to store")
+    type: AgentMemoryType = Field(
+        default=AgentMemoryType.FACT, description="Type of memory"
+    )
+    scope: AgentMemoryScope = Field(
+        default=AgentMemoryScope.PROJECT, description="Visibility scope"
+    )
+    category: str | None = Field(default=None, description="Optional grouping category")
+    ttl_days: int | None = Field(
+        default=None, ge=1, le=365, description="Days until memory expires (null = permanent)"
+    )
+    related_to: list[str] = Field(
+        default_factory=list, description="IDs of related memories"
+    )
+    document_refs: list[str] = Field(
+        default_factory=list, description="Referenced document paths"
+    )
+    source: str | None = Field(
+        default=None, description="What created this memory (e.g., 'user', 'agent', 'import')"
+    )
+
+
+class RememberResult(BaseModel):
+    """Result of rlm_remember tool."""
+
+    memory_id: str = Field(..., description="Unique identifier for the stored memory")
+    content: str = Field(..., description="The stored content")
+    type: AgentMemoryType = Field(..., description="Memory type")
+    scope: AgentMemoryScope = Field(..., description="Memory scope")
+    category: str | None = Field(default=None, description="Category if provided")
+    expires_at: datetime | None = Field(default=None, description="When memory expires")
+    created: bool = Field(default=True, description="True if new, False if updated")
+    message: str = Field(..., description="Human-readable status message")
+
+
+class RecallParams(BaseModel):
+    """Parameters for rlm_recall tool - semantic memory retrieval."""
+
+    query: str = Field(..., min_length=1, description="Search query for semantic recall")
+    type: AgentMemoryType | None = Field(default=None, description="Filter by memory type")
+    scope: AgentMemoryScope | None = Field(default=None, description="Filter by scope")
+    category: str | None = Field(default=None, description="Filter by category")
+    limit: int = Field(default=5, ge=1, le=50, description="Maximum memories to return")
+    min_relevance: float = Field(
+        default=0.5, ge=0.0, le=1.0, description="Minimum relevance score (0-1)"
+    )
+    include_expired: bool = Field(
+        default=False, description="Include expired memories in recall"
+    )
+
+
+class RecalledMemory(BaseModel):
+    """A memory recalled with relevance scoring."""
+
+    memory_id: str = Field(..., description="Memory ID")
+    content: str = Field(..., description="Memory content")
+    type: AgentMemoryType = Field(..., description="Memory type")
+    scope: AgentMemoryScope = Field(..., description="Memory scope")
+    category: str | None = Field(default=None, description="Category")
+    relevance: float = Field(..., ge=0.0, le=1.0, description="Relevance score")
+    confidence: float = Field(..., ge=0.0, le=1.0, description="Confidence after decay")
+    created_at: datetime = Field(..., description="When memory was created")
+    last_accessed_at: datetime | None = Field(default=None, description="Last access time")
+    access_count: int = Field(default=0, ge=0, description="Times accessed")
+
+
+class RecallResult(BaseModel):
+    """Result of rlm_recall tool."""
+
+    memories: list[RecalledMemory] = Field(
+        default_factory=list, description="Recalled memories ranked by relevance"
+    )
+    total_searched: int = Field(default=0, ge=0, description="Total memories searched")
+    query: str = Field(..., description="Original query")
+    timing_ms: int = Field(default=0, ge=0, description="Recall latency in milliseconds")
+
+
+class MemoriesParams(BaseModel):
+    """Parameters for rlm_memories tool - list memories with filters."""
+
+    type: AgentMemoryType | None = Field(default=None, description="Filter by type")
+    scope: AgentMemoryScope | None = Field(default=None, description="Filter by scope")
+    category: str | None = Field(default=None, description="Filter by category")
+    search: str | None = Field(default=None, description="Text search in content")
+    limit: int = Field(default=20, ge=1, le=100, description="Maximum memories to return")
+    offset: int = Field(default=0, ge=0, description="Offset for pagination")
+    include_expired: bool = Field(default=False, description="Include expired memories")
+
+
+class MemoryInfo(BaseModel):
+    """Information about a stored memory."""
+
+    memory_id: str = Field(..., description="Memory ID")
+    content: str = Field(..., description="Memory content")
+    type: AgentMemoryType = Field(..., description="Memory type")
+    scope: AgentMemoryScope = Field(..., description="Memory scope")
+    category: str | None = Field(default=None, description="Category")
+    confidence: float = Field(..., ge=0.0, le=1.0, description="Current confidence")
+    source: str | None = Field(default=None, description="Memory source")
+    created_at: datetime = Field(..., description="Creation time")
+    expires_at: datetime | None = Field(default=None, description="Expiration time")
+    access_count: int = Field(default=0, ge=0, description="Access count")
+
+
+class MemoriesResult(BaseModel):
+    """Result of rlm_memories tool."""
+
+    memories: list[MemoryInfo] = Field(
+        default_factory=list, description="List of memories"
+    )
+    total_count: int = Field(default=0, ge=0, description="Total matching memories")
+    has_more: bool = Field(default=False, description="More results available")
+
+
+class ForgetParams(BaseModel):
+    """Parameters for rlm_forget tool."""
+
+    memory_id: str | None = Field(default=None, description="Specific memory ID to delete")
+    type: AgentMemoryType | None = Field(
+        default=None, description="Delete all memories of this type"
+    )
+    category: str | None = Field(
+        default=None, description="Delete all memories in this category"
+    )
+    older_than_days: int | None = Field(
+        default=None, ge=1, description="Delete memories older than N days"
+    )
+
+
+class ForgetResult(BaseModel):
+    """Result of rlm_forget tool."""
+
+    deleted_count: int = Field(default=0, ge=0, description="Number of memories deleted")
+    message: str = Field(..., description="Human-readable status message")
+
+
+# ============ MULTI-AGENT SWARM MODELS (Phase 9.1) ============
+
+
+class SwarmCreateParams(BaseModel):
+    """Parameters for rlm_swarm_create tool."""
+
+    name: str = Field(..., min_length=1, max_length=100, description="Swarm name")
+    description: str | None = Field(default=None, description="Swarm description")
+    max_agents: int = Field(default=10, ge=2, le=50, description="Maximum agents allowed")
+    task_timeout: int = Field(
+        default=300, ge=60, le=3600, description="Task timeout in seconds"
+    )
+    claim_timeout: int = Field(
+        default=600, ge=60, le=7200, description="Resource claim timeout in seconds"
+    )
+
+
+class SwarmCreateResult(BaseModel):
+    """Result of rlm_swarm_create tool."""
+
+    swarm_id: str = Field(..., description="Unique swarm identifier")
+    name: str = Field(..., description="Swarm name")
+    max_agents: int = Field(..., description="Maximum agents")
+    task_timeout: int = Field(..., description="Task timeout seconds")
+    claim_timeout: int = Field(..., description="Claim timeout seconds")
+    created_at: datetime = Field(..., description="Creation time")
+    message: str = Field(..., description="Human-readable status message")
+
+
+class SwarmJoinParams(BaseModel):
+    """Parameters for rlm_swarm_join tool."""
+
+    swarm_id: str = Field(..., description="ID of swarm to join")
+    agent_id: str = Field(..., description="Unique identifier for this agent")
+    name: str | None = Field(default=None, description="Human-readable agent name")
+
+
+class SwarmJoinResult(BaseModel):
+    """Result of rlm_swarm_join tool."""
+
+    swarm_id: str = Field(..., description="Swarm ID")
+    agent_id: str = Field(..., description="Agent ID")
+    swarm_name: str = Field(..., description="Swarm name")
+    current_agents: int = Field(..., ge=0, description="Current number of agents")
+    max_agents: int = Field(..., description="Maximum agents allowed")
+    message: str = Field(..., description="Human-readable status message")
+
+
+class ClaimParams(BaseModel):
+    """Parameters for rlm_claim tool - claim exclusive resource access."""
+
+    swarm_id: str = Field(..., description="Swarm ID")
+    agent_id: str = Field(..., description="Agent ID making the claim")
+    resource_type: str = Field(
+        ..., description="Resource type: 'file', 'function', 'module', 'custom'"
+    )
+    resource_id: str = Field(..., description="Resource identifier (e.g., 'src/auth.ts')")
+    ttl_seconds: int | None = Field(
+        default=None, ge=60, le=7200, description="Custom TTL (uses swarm default if null)"
+    )
+
+
+class ClaimResult(BaseModel):
+    """Result of rlm_claim tool."""
+
+    claim_id: str = Field(..., description="Unique claim identifier")
+    swarm_id: str = Field(..., description="Swarm ID")
+    agent_id: str = Field(..., description="Agent ID")
+    resource_type: str = Field(..., description="Resource type")
+    resource_id: str = Field(..., description="Resource identifier")
+    acquired: bool = Field(..., description="Whether claim was acquired")
+    expires_at: datetime = Field(..., description="When claim expires")
+    held_by: str | None = Field(
+        default=None, description="If not acquired, agent ID holding the resource"
+    )
+    message: str = Field(..., description="Human-readable status message")
+
+
+class ReleaseParams(BaseModel):
+    """Parameters for rlm_release tool."""
+
+    swarm_id: str = Field(..., description="Swarm ID")
+    agent_id: str = Field(..., description="Agent ID releasing the claim")
+    resource_type: str = Field(..., description="Resource type")
+    resource_id: str = Field(..., description="Resource identifier")
+
+
+class ReleaseResult(BaseModel):
+    """Result of rlm_release tool."""
+
+    released: bool = Field(..., description="Whether resource was released")
+    resource_type: str = Field(..., description="Resource type")
+    resource_id: str = Field(..., description="Resource identifier")
+    message: str = Field(..., description="Human-readable status message")
+
+
+class StateGetParams(BaseModel):
+    """Parameters for rlm_state_get tool."""
+
+    swarm_id: str = Field(..., description="Swarm ID")
+    key: str = Field(..., description="State key to retrieve")
+
+
+class StateGetResult(BaseModel):
+    """Result of rlm_state_get tool."""
+
+    swarm_id: str = Field(..., description="Swarm ID")
+    key: str = Field(..., description="State key")
+    value: Any | None = Field(default=None, description="State value (JSON)")
+    version: int = Field(default=0, ge=0, description="State version for concurrency")
+    exists: bool = Field(..., description="Whether key exists")
+    updated_by: str | None = Field(default=None, description="Agent that last updated")
+    updated_at: datetime | None = Field(default=None, description="Last update time")
+
+
+class StateSetParams(BaseModel):
+    """Parameters for rlm_state_set tool."""
+
+    swarm_id: str = Field(..., description="Swarm ID")
+    agent_id: str = Field(..., description="Agent ID setting the state")
+    key: str = Field(..., description="State key")
+    value: Any = Field(..., description="State value (JSON-serializable)")
+    expected_version: int | None = Field(
+        default=None, ge=0, description="Expected version for optimistic locking (null = overwrite)"
+    )
+
+
+class StateSetResult(BaseModel):
+    """Result of rlm_state_set tool."""
+
+    swarm_id: str = Field(..., description="Swarm ID")
+    key: str = Field(..., description="State key")
+    version: int = Field(..., ge=1, description="New state version")
+    success: bool = Field(..., description="Whether update succeeded")
+    conflict: bool = Field(
+        default=False, description="True if version mismatch (optimistic lock failed)"
+    )
+    message: str = Field(..., description="Human-readable status message")
+
+
+class BroadcastParams(BaseModel):
+    """Parameters for rlm_broadcast tool."""
+
+    swarm_id: str = Field(..., description="Swarm ID")
+    agent_id: str = Field(..., description="Agent ID broadcasting")
+    event_type: str = Field(..., description="Event type (e.g., 'file_changed', 'task_done')")
+    payload: dict[str, Any] = Field(default_factory=dict, description="Event payload")
+
+
+class BroadcastResult(BaseModel):
+    """Result of rlm_broadcast tool."""
+
+    event_id: str = Field(..., description="Unique event identifier")
+    swarm_id: str = Field(..., description="Swarm ID")
+    event_type: str = Field(..., description="Event type")
+    delivered: bool = Field(..., description="Whether event was published")
+    message: str = Field(..., description="Human-readable status message")
+
+
+class TaskCreateParams(BaseModel):
+    """Parameters for rlm_task_create tool."""
+
+    swarm_id: str = Field(..., description="Swarm ID")
+    title: str = Field(..., min_length=1, description="Task title")
+    description: str | None = Field(default=None, description="Task description")
+    priority: int = Field(default=0, ge=0, le=100, description="Priority (higher = more urgent)")
+    depends_on: list[str] = Field(
+        default_factory=list, description="Task IDs that must complete first"
+    )
+
+
+class TaskCreateResult(BaseModel):
+    """Result of rlm_task_create tool."""
+
+    task_id: str = Field(..., description="Unique task identifier")
+    swarm_id: str = Field(..., description="Swarm ID")
+    title: str = Field(..., description="Task title")
+    priority: int = Field(..., description="Task priority")
+    status: str = Field(default="pending", description="Task status")
+    depends_on: list[str] = Field(default_factory=list, description="Dependencies")
+    message: str = Field(..., description="Human-readable status message")
+
+
+class TaskClaimParams(BaseModel):
+    """Parameters for rlm_task_claim tool."""
+
+    swarm_id: str = Field(..., description="Swarm ID")
+    agent_id: str = Field(..., description="Agent ID claiming")
+    task_id: str | None = Field(
+        default=None, description="Specific task ID (null = get next available)"
+    )
+
+
+class TaskClaimResult(BaseModel):
+    """Result of rlm_task_claim tool."""
+
+    task_id: str | None = Field(default=None, description="Claimed task ID (null if none available)")
+    swarm_id: str = Field(..., description="Swarm ID")
+    agent_id: str = Field(..., description="Agent ID")
+    title: str | None = Field(default=None, description="Task title")
+    description: str | None = Field(default=None, description="Task description")
+    priority: int = Field(default=0, description="Task priority")
+    claimed: bool = Field(..., description="Whether a task was claimed")
+    message: str = Field(..., description="Human-readable status message")
+
+
+class TaskCompleteParams(BaseModel):
+    """Parameters for rlm_task_complete tool."""
+
+    swarm_id: str = Field(..., description="Swarm ID")
+    agent_id: str = Field(..., description="Agent ID completing")
+    task_id: str = Field(..., description="Task ID to complete")
+    result: dict[str, Any] | None = Field(default=None, description="Task result data")
+    error: str | None = Field(default=None, description="Error message if task failed")
+
+
+class TaskCompleteResult(BaseModel):
+    """Result of rlm_task_complete tool."""
+
+    task_id: str = Field(..., description="Task ID")
+    swarm_id: str = Field(..., description="Swarm ID")
+    status: str = Field(..., description="Final task status ('completed' or 'failed')")
+    completed: bool = Field(..., description="Whether task was completed successfully")
+    unblocked_tasks: list[str] = Field(
+        default_factory=list, description="Task IDs now unblocked by this completion"
+    )
+    message: str = Field(..., description="Human-readable status message")
+
+
+# ============ PHASE 10: DOCUMENT SYNC MODELS ============
 
 
 class UploadDocumentResult(BaseModel):
@@ -556,11 +1130,10 @@ class SyncDocumentsParams(BaseModel):
     """Parameters for rlm_sync_documents tool."""
 
     documents: list[SyncDocumentItem] = Field(
-        ..., min_length=1, max_length=100, description="Documents to sync"
+        ..., description="Documents to sync", min_length=1, max_length=100
     )
     delete_missing: bool = Field(
-        default=False,
-        description="Delete documents not in the sync list",
+        default=False, description="Delete documents not in list"
     )
 
 
