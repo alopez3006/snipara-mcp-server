@@ -1,8 +1,46 @@
 """
-Streamable HTTP transport for MCP protocol.
+MCP Streamable HTTP Transport for Snipara.
 
-Implements MCP Streamable HTTP transport specification for direct
-connection from MCP clients (Cursor, Claude Code, ChatGPT, Windsurf).
+This module implements the MCP (Model Context Protocol) Streamable HTTP transport
+specification, enabling direct connections from MCP-compatible AI clients.
+
+Supported Clients:
+    - Claude Code (Anthropic)
+    - Cursor IDE
+    - ChatGPT (with MCP support)
+    - Windsurf
+    - Any MCP-compatible client
+
+Protocol:
+    Uses JSON-RPC 2.0 over HTTP with the following methods:
+    - initialize: Establish connection and exchange capabilities
+    - tools/list: List available tools
+    - tools/call: Execute a tool with arguments
+    - ping: Keep-alive check
+
+Endpoints:
+    POST /mcp/{project_id}  - Main JSON-RPC endpoint for tool execution
+    GET  /mcp/{project_id}  - SSE endpoint for server-initiated messages
+
+Authentication:
+    Accepts either:
+    - X-API-Key header: Project API key (rlm_...) or Team API key
+    - Authorization: Bearer header: API key or OAuth token (snipara_at_...)
+
+Example Configuration (Claude Code .mcp.json):
+    {
+        "mcpServers": {
+            "snipara": {
+                "type": "http",
+                "url": "https://api.snipara.com/mcp/{project_slug}",
+                "headers": {"X-API-Key": "rlm_..."}
+            }
+        }
+    }
+
+Note:
+    Team-scoped queries (/mcp/team/{team_id}) are handled in server.py
+    to avoid circular imports with execute_multi_project_query.
 """
 
 import json
@@ -17,11 +55,32 @@ from .models import Plan, ToolName
 from .rlm_engine import RLMEngine
 from .usage import check_rate_limit, check_usage_limits, track_usage
 
+
+# ============ ROUTER CONFIGURATION ============
+
 router = APIRouter(prefix="/mcp", tags=["MCP Transport"])
 
+#: MCP protocol version (spec: 2024-11-05)
 MCP_VERSION = "2024-11-05"
 
-# Tool definitions for MCP list_tools
+
+# ============ TOOL DEFINITIONS ============
+#
+# These definitions are returned by the tools/list method and define
+# the schema for each tool's input parameters.
+#
+# Tool Categories:
+#   - Context Retrieval: rlm_context_query, rlm_ask, rlm_search, rlm_read
+#   - Query Optimization: rlm_decompose, rlm_multi_query, rlm_plan
+#   - Team Queries: rlm_multi_project_query (requires team API key)
+#   - Session Management: rlm_inject, rlm_context, rlm_clear_context
+#   - Metadata: rlm_stats, rlm_sections, rlm_settings
+#   - Summaries: rlm_store_summary, rlm_get_summaries, rlm_delete_summary
+#   - Shared Context: rlm_shared_context, rlm_list_templates, rlm_get_template
+#   - Agent Memory: rlm_remember, rlm_recall, rlm_memories, rlm_forget
+#   - Multi-Agent Swarm: rlm_swarm_*, rlm_claim, rlm_release, rlm_state_*, rlm_task_*
+#   - Document Sync: rlm_upload_document, rlm_sync_documents
+
 TOOL_DEFINITIONS = [
     {
         "name": "rlm_context_query",
@@ -511,16 +570,66 @@ TOOL_DEFINITIONS = [
 ]
 
 
+# ============ JSON-RPC HELPERS ============
+
+
 def jsonrpc_response(id: Any, result: Any) -> dict:
+    """
+    Create a JSON-RPC 2.0 success response.
+
+    Args:
+        id: Request ID (must match the request)
+        result: The result payload
+
+    Returns:
+        JSON-RPC 2.0 response dict
+    """
     return {"jsonrpc": "2.0", "id": id, "result": result}
 
 
 def jsonrpc_error(id: Any, code: int, message: str) -> dict:
+    """
+    Create a JSON-RPC 2.0 error response.
+
+    Standard error codes:
+        -32700: Parse error
+        -32600: Invalid request
+        -32601: Method not found
+        -32602: Invalid params
+        -32603: Internal error
+        -32000 to -32099: Server errors (application-specific)
+
+    Args:
+        id: Request ID (can be None for parse errors)
+        code: Error code (negative integer)
+        message: Human-readable error message
+
+    Returns:
+        JSON-RPC 2.0 error response dict
+    """
     return {"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}}
 
 
+# ============ REQUEST VALIDATION ============
+
+
 async def validate_request(project_id_or_slug: str, api_key: str) -> tuple[dict | None, Plan, str | None, str | None]:
-    """Validate API key or OAuth token and check limits. Returns (auth_info, plan, error, actual_project_id)."""
+    """
+    Validate authentication and check usage limits.
+
+    Supports both API keys (rlm_...) and OAuth tokens (snipara_at_...).
+
+    Args:
+        project_id_or_slug: Project ID or slug from URL
+        api_key: API key or OAuth token from header
+
+    Returns:
+        Tuple of (auth_info, plan, error_message, actual_project_id)
+        - auth_info: Dict with API key info if valid, None otherwise
+        - plan: Subscription plan (FREE, PRO, TEAM, ENTERPRISE)
+        - error_message: Error string if validation failed, None if success
+        - actual_project_id: Database ID (not slug) for operations
+    """
     auth_info = None
 
     # Check if it's an OAuth token
@@ -552,8 +661,26 @@ async def validate_request(project_id_or_slug: str, api_key: str) -> tuple[dict 
     return auth_info, plan, None, actual_project_id
 
 
+# ============ REQUEST HANDLERS ============
+
+
 async def handle_call_tool(id: Any, params: dict, project_id: str, plan: Plan) -> dict:
-    """Handle MCP tools/call request."""
+    """
+    Handle MCP tools/call request.
+
+    Executes a tool through the RLMEngine and tracks usage.
+
+    Args:
+        id: JSON-RPC request ID
+        params: Tool call parameters containing:
+            - name: Tool name (e.g., "rlm_context_query")
+            - arguments: Tool-specific arguments
+        project_id: Database project ID
+        plan: Subscription plan for rate limiting
+
+    Returns:
+        JSON-RPC response with tool result or error
+    """
     tool_name = params.get("name")
     arguments = params.get("arguments", {})
 
@@ -584,7 +711,25 @@ async def handle_call_tool(id: Any, params: dict, project_id: str, plan: Plan) -
 
 
 async def handle_request(body: dict, project_id: str, plan: Plan) -> dict | None:
-    """Handle a single JSON-RPC request."""
+    """
+    Handle a single JSON-RPC request.
+
+    Routes requests to appropriate handlers based on method.
+
+    Supported Methods:
+        - initialize: Returns server info and capabilities
+        - tools/list: Returns available tool definitions
+        - tools/call: Executes a tool
+        - ping: Returns empty response (keep-alive)
+
+    Args:
+        body: JSON-RPC request body
+        project_id: Database project ID
+        plan: Subscription plan
+
+    Returns:
+        JSON-RPC response dict, or None for notifications (requests without id)
+    """
     method, id, params = body.get("method"), body.get("id"), body.get("params", {})
 
     if id is None:  # Notification
@@ -604,6 +749,9 @@ async def handle_request(body: dict, project_id: str, plan: Plan) -> dict | None
         return jsonrpc_response(id, {})
     else:
         return jsonrpc_error(id, -32601, f"Method not found: {method}")
+
+
+# ============ HTTP ENDPOINTS ============
 
 
 @router.post("/{project_id}")
@@ -660,7 +808,22 @@ async def mcp_sse(
     x_api_key: str | None = Header(None, alias="X-API-Key"),
     authorization: str | None = Header(None),
 ):
-    """MCP SSE endpoint for server-initiated messages (keep-alive)."""
+    """
+    MCP Server-Sent Events (SSE) endpoint.
+
+    Provides a persistent connection for server-initiated messages.
+    Currently used for keep-alive pings every 30 seconds.
+
+    Args:
+        project_id: Project ID or slug
+        x_api_key: API key via X-API-Key header
+        authorization: API key via Authorization: Bearer header
+
+    Returns:
+        SSE stream with JSON messages:
+        - {"type": "connected"} on connection
+        - {"type": "ping"} every 30 seconds
+    """
     # Accept X-API-Key header (preferred) or Authorization: Bearer
     if x_api_key:
         api_key = x_api_key
