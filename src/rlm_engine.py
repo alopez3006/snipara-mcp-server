@@ -37,13 +37,16 @@ from .models import (
     PromptTemplateInfo,
     SearchMode,
     SectionInfo,
+    SettingsResult,
     SharedContextResult,
     SharedDocumentInfo,
     StoreSummaryResult,
     SubQuery,
     SummaryInfo,
     SummaryType,
+    SyncDocumentsResult,
     ToolName,
+    UploadDocumentResult,
 )
 from .services.cache import get_cache
 from .services.chunker import get_chunker
@@ -443,6 +446,10 @@ class RLMEngine:
             ToolName.RLM_TASK_CREATE: self._handle_task_create,
             ToolName.RLM_TASK_CLAIM: self._handle_task_claim,
             ToolName.RLM_TASK_COMPLETE: self._handle_task_complete,
+            # Phase 10: Document Sync Tools
+            ToolName.RLM_UPLOAD_DOCUMENT: self._handle_upload_document,
+            ToolName.RLM_SYNC_DOCUMENTS: self._handle_sync_documents,
+            ToolName.RLM_SETTINGS: self._handle_settings,
         }
 
         handler = handlers.get(tool)
@@ -2872,4 +2879,223 @@ class RLMEngine:
             data=result,
             input_tokens=count_tokens(str(task_result) if task_result else ""),
             output_tokens=count_tokens(str(result)),
+        )
+
+    # ============ Phase 10: Document Sync Handlers ============
+
+    async def _handle_upload_document(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_upload_document - upload or update a document.
+
+        Args:
+            params: Dict containing:
+                - path: Document path (e.g., 'docs/api.md')
+                - content: Document content (markdown)
+
+        Returns:
+            ToolResult with upload status
+        """
+        path = params.get("path", "")
+        content = params.get("content", "")
+
+        if not path or not content:
+            return ToolResult(
+                data={"error": "path and content are required"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        # Validate path
+        if not path.endswith((".md", ".txt", ".mdx")):
+            return ToolResult(
+                data={"error": "Only .md, .txt, .mdx files are supported"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        db = await get_db()
+        content_hash = hashlib.sha256(content.encode()).hexdigest()
+        size = len(content.encode())
+
+        # Check if document exists
+        existing = await db.document.find_first(
+            where={"projectId": self.project_id, "path": path}
+        )
+
+        if existing:
+            # Check if content changed
+            if existing.hash == content_hash:
+                result = UploadDocumentResult(
+                    path=path,
+                    action="unchanged",
+                    size=size,
+                    hash=content_hash,
+                    message=f"Document '{path}' is unchanged",
+                )
+            else:
+                # Update existing document
+                await db.document.update(
+                    where={"id": existing.id},
+                    data={"content": content, "hash": content_hash, "size": size},
+                )
+                # Invalidate index cache
+                self.index = None
+                result = UploadDocumentResult(
+                    path=path,
+                    action="updated",
+                    size=size,
+                    hash=content_hash,
+                    message=f"Document '{path}' updated ({size} bytes)",
+                )
+        else:
+            # Create new document
+            await db.document.create(
+                data={
+                    "projectId": self.project_id,
+                    "path": path,
+                    "content": content,
+                    "hash": content_hash,
+                    "size": size,
+                }
+            )
+            # Invalidate index cache
+            self.index = None
+            result = UploadDocumentResult(
+                path=path,
+                action="created",
+                size=size,
+                hash=content_hash,
+                message=f"Document '{path}' created ({size} bytes)",
+            )
+
+        return ToolResult(
+            data=result.model_dump(),
+            input_tokens=count_tokens(content),
+            output_tokens=count_tokens(str(result.model_dump())),
+        )
+
+    async def _handle_sync_documents(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_sync_documents - bulk sync multiple documents.
+
+        Args:
+            params: Dict containing:
+                - documents: List of {path, content} objects
+                - delete_missing: Whether to delete docs not in list
+
+        Returns:
+            ToolResult with sync status
+        """
+        documents = params.get("documents", [])
+        delete_missing = params.get("delete_missing", False)
+
+        if not documents:
+            return ToolResult(
+                data={"error": "documents list is required"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        db = await get_db()
+        created = 0
+        updated = 0
+        unchanged = 0
+        deleted = 0
+        input_tokens = 0
+
+        # Get all existing documents
+        existing_docs = await db.document.find_many(
+            where={"projectId": self.project_id}
+        )
+        existing_by_path = {doc.path: doc for doc in existing_docs}
+        synced_paths = set()
+
+        for doc_data in documents:
+            path = doc_data.get("path", "")
+            content = doc_data.get("content", "")
+
+            if not path or not content:
+                continue
+
+            # Validate path
+            if not path.endswith((".md", ".txt", ".mdx")):
+                continue
+
+            synced_paths.add(path)
+            content_hash = hashlib.sha256(content.encode()).hexdigest()
+            size = len(content.encode())
+            input_tokens += count_tokens(content)
+
+            if path in existing_by_path:
+                existing = existing_by_path[path]
+                if existing.hash == content_hash:
+                    unchanged += 1
+                else:
+                    await db.document.update(
+                        where={"id": existing.id},
+                        data={"content": content, "hash": content_hash, "size": size},
+                    )
+                    updated += 1
+            else:
+                await db.document.create(
+                    data={
+                        "projectId": self.project_id,
+                        "path": path,
+                        "content": content,
+                        "hash": content_hash,
+                        "size": size,
+                    }
+                )
+                created += 1
+
+        # Delete missing documents if requested
+        if delete_missing:
+            for path, doc in existing_by_path.items():
+                if path not in synced_paths:
+                    await db.document.delete(where={"id": doc.id})
+                    deleted += 1
+
+        # Invalidate index cache if any changes
+        if created > 0 or updated > 0 or deleted > 0:
+            self.index = None
+
+        total = created + updated + unchanged
+        result = SyncDocumentsResult(
+            created=created,
+            updated=updated,
+            unchanged=unchanged,
+            deleted=deleted,
+            total=total,
+            message=f"Synced {total} documents: {created} created, {updated} updated, {unchanged} unchanged, {deleted} deleted",
+        )
+
+        return ToolResult(
+            data=result.model_dump(),
+            input_tokens=input_tokens,
+            output_tokens=count_tokens(str(result.model_dump())),
+        )
+
+    async def _handle_settings(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_settings - get project settings.
+
+        Args:
+            params: Dict (no parameters required)
+
+        Returns:
+            ToolResult with project settings
+        """
+        result = SettingsResult(
+            project_id=self.project_id,
+            max_tokens_per_query=self.settings.max_tokens_per_query,
+            search_mode=self.settings.search_mode,
+            include_summaries=self.settings.include_summaries,
+            auto_inject_context=self.settings.auto_inject_context,
+            message=f"Settings for project {self.project_id}",
+        )
+
+        return ToolResult(
+            data=result.model_dump(),
+            input_tokens=0,
+            output_tokens=count_tokens(str(result.model_dump())),
         )
