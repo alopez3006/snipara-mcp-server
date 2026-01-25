@@ -35,6 +35,7 @@ from .models import (
     PlanStep,
     PlanStrategy,
     PromptTemplateInfo,
+    RequestAccessResult,
     SearchMode,
     SectionInfo,
     SettingsResult,
@@ -103,6 +104,60 @@ SUMMARY_STORAGE_PLANS = {Plan.PRO, Plan.TEAM, Plan.ENTERPRISE}
 
 # Plans that have access to shared context features
 SHARED_CONTEXT_PLANS = {Plan.PRO, Plan.TEAM, Plan.ENTERPRISE}
+
+# Tool access level categories for per-project access control
+# READ_TOOLS: Available to VIEWER and above
+READ_TOOLS = {
+    ToolName.RLM_ASK,
+    ToolName.RLM_SEARCH,
+    ToolName.RLM_CONTEXT,
+    ToolName.RLM_STATS,
+    ToolName.RLM_SECTIONS,
+    ToolName.RLM_READ,
+    ToolName.RLM_CONTEXT_QUERY,
+    ToolName.RLM_DECOMPOSE,
+    ToolName.RLM_MULTI_QUERY,
+    ToolName.RLM_PLAN,
+    ToolName.RLM_GET_SUMMARIES,
+    ToolName.RLM_SHARED_CONTEXT,
+    ToolName.RLM_LIST_TEMPLATES,
+    ToolName.RLM_GET_TEMPLATE,
+    ToolName.RLM_RECALL,
+    ToolName.RLM_MEMORIES,
+    ToolName.RLM_STATE_GET,
+    ToolName.RLM_TASK_CLAIM,
+    ToolName.RLM_SETTINGS,
+}
+
+# WRITE_TOOLS: Available to EDITOR and above
+WRITE_TOOLS = {
+    ToolName.RLM_INJECT,
+    ToolName.RLM_CLEAR_CONTEXT,
+    ToolName.RLM_STORE_SUMMARY,
+    ToolName.RLM_DELETE_SUMMARY,
+    ToolName.RLM_REMEMBER,
+    ToolName.RLM_FORGET,
+    ToolName.RLM_UPLOAD_DOCUMENT,
+    ToolName.RLM_SYNC_DOCUMENTS,
+    ToolName.RLM_STATE_SET,
+    ToolName.RLM_BROADCAST,
+    ToolName.RLM_TASK_COMPLETE,
+}
+
+# ADMIN_TOOLS: Available to ADMIN only
+ADMIN_TOOLS = {
+    ToolName.RLM_SWARM_CREATE,
+    ToolName.RLM_SWARM_JOIN,
+    ToolName.RLM_CLAIM,
+    ToolName.RLM_RELEASE,
+    ToolName.RLM_TASK_CREATE,
+    ToolName.RLM_MULTI_PROJECT_QUERY,
+}
+
+# NONE_ALLOWED: Tools that can be used even with NONE access level
+NONE_ALLOWED_TOOLS = {
+    ToolName.RLM_REQUEST_ACCESS,
+}
 
 # Default system instructions injected into every query response
 # This ensures customers use Snipara tools effectively
@@ -192,6 +247,8 @@ class RLMEngine:
         project_id: str,
         plan: Plan = Plan.FREE,
         settings: dict | None = None,
+        user_id: str | None = None,
+        access_level: str = "EDITOR",
     ):
         """Initialize the engine for a project.
 
@@ -199,9 +256,13 @@ class RLMEngine:
             project_id: The project ID
             plan: The user's subscription plan (affects feature access)
             settings: Project automation settings from dashboard (optional)
+            user_id: The user ID for access requests (optional)
+            access_level: The user's access level for this project (NONE, VIEWER, EDITOR, ADMIN)
         """
         self.project_id = project_id
         self.plan = plan
+        self.user_id = user_id
+        self.access_level = access_level
         self.index: DocumentationIndex | None = None
         self.session_context: str = ""
         self._chunks_available: bool | None = None  # Cache for chunk availability check
@@ -451,13 +512,79 @@ class RLMEngine:
             ToolName.RLM_UPLOAD_DOCUMENT: self._handle_upload_document,
             ToolName.RLM_SYNC_DOCUMENTS: self._handle_sync_documents,
             ToolName.RLM_SETTINGS: self._handle_settings,
+            # Phase 11: Access Control Tools
+            ToolName.RLM_REQUEST_ACCESS: self._handle_request_access,
         }
 
         handler = handlers.get(tool)
         if not handler:
             raise ValueError(f"Unknown tool: {tool}")
 
+        # Check tool access level permissions
+        access_error = self._check_tool_access(tool)
+        if access_error:
+            return access_error
+
         return await handler(params)
+
+    def _check_tool_access(self, tool: ToolName) -> ToolResult | None:
+        """
+        Check if the user has access to execute the tool based on their access level.
+
+        Returns:
+            ToolResult with error if access denied, None if access allowed
+        """
+        access_level = self.access_level
+
+        # ADMIN has access to all tools
+        if access_level == "ADMIN":
+            return None
+
+        # EDITOR has access to READ + WRITE tools
+        if access_level == "EDITOR":
+            if tool in READ_TOOLS or tool in WRITE_TOOLS:
+                return None
+            return ToolResult(
+                data={
+                    "error": f"Access denied: {tool.value} requires ADMIN access",
+                    "access_level": access_level,
+                    "required_level": "ADMIN",
+                },
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        # VIEWER has access to READ tools only
+        if access_level == "VIEWER":
+            if tool in READ_TOOLS:
+                return None
+            required = "EDITOR" if tool in WRITE_TOOLS else "ADMIN"
+            return ToolResult(
+                data={
+                    "error": f"Access denied: {tool.value} requires {required} access",
+                    "access_level": access_level,
+                    "required_level": required,
+                },
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        # NONE access level - only allowed tools
+        if access_level == "NONE":
+            if tool in NONE_ALLOWED_TOOLS:
+                return None
+            return ToolResult(
+                data={
+                    "error": "Access denied to this project. Use rlm_request_access to request access.",
+                    "access_level": access_level,
+                    "tool": "rlm_request_access",
+                },
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        # Unknown access level - default to EDITOR for backward compatibility
+        return None
 
     async def _handle_ask(self, params: dict[str, Any]) -> ToolResult:
         """Handle rlm_ask - query documentation with natural language."""
@@ -3121,6 +3248,126 @@ class RLMEngine:
             include_summaries=self.settings.include_summaries,
             auto_inject_context=self.settings.auto_inject_context,
             message=f"Settings for project {self.project_id}",
+        )
+
+        return ToolResult(
+            data=result.model_dump(),
+            input_tokens=0,
+            output_tokens=count_tokens(str(result.model_dump())),
+        )
+
+    # ============ PHASE 11: ACCESS CONTROL HANDLERS ============
+
+    async def _handle_request_access(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_request_access - request access to a project.
+
+        This tool allows team members with NONE access level to request
+        higher access levels (VIEWER, EDITOR, ADMIN) from project admins.
+
+        Args:
+            params: Dict containing:
+                - requested_level: The access level to request (VIEWER, EDITOR, ADMIN)
+                - reason: Optional reason for requesting access
+
+        Returns:
+            ToolResult with RequestAccessResult containing request status
+        """
+        requested_level = params.get("requested_level", "VIEWER").upper()
+        reason = params.get("reason", "")
+
+        # Validate requested level
+        valid_levels = {"VIEWER", "EDITOR", "ADMIN"}
+        if requested_level not in valid_levels:
+            return ToolResult(
+                data={
+                    "error": f"Invalid level. Must be one of: {', '.join(valid_levels)}",
+                    "valid_levels": list(valid_levels),
+                },
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        # Check if user_id is available (needed for access requests)
+        if not self.user_id:
+            return ToolResult(
+                data={
+                    "error": "User context required for access requests. This typically means you're using a project API key which already has access.",
+                },
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        db = await get_db()
+
+        # Get project info
+        project = await db.project.find_first(
+            where={"id": self.project_id},
+            select={"id": True, "name": True, "slug": True, "teamId": True},
+        )
+
+        if not project:
+            return ToolResult(
+                data={"error": "Project not found"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        # Get team member ID for the user
+        team_member = await db.teammember.find_first(
+            where={
+                "userId": self.user_id,
+                "teamId": project.teamId,
+            },
+            select={"id": True},
+        )
+
+        if not team_member:
+            return ToolResult(
+                data={"error": "You must be a team member to request project access"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        # Check for existing pending request
+        existing = await db.accessrequest.find_first(
+            where={
+                "projectId": project.id,
+                "teamMemberId": team_member.id,
+                "status": "PENDING",
+            },
+        )
+
+        if existing:
+            return ToolResult(
+                data={
+                    "error": "You already have a pending access request for this project",
+                    "request_id": existing.id,
+                    "status": "pending",
+                },
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        # Create access request
+        access_request = await db.accessrequest.create(
+            data={
+                "projectId": project.id,
+                "teamMemberId": team_member.id,
+                "requestedLevel": requested_level,
+                "reason": reason[:500] if reason else None,
+                "status": "PENDING",
+            },
+        )
+
+        result = RequestAccessResult(
+            request_id=access_request.id,
+            project_id=project.id,
+            project_name=project.name,
+            requested_level=requested_level,
+            status="pending",
+            message="Access request submitted. A project admin will review your request.",
+            dashboard_url=f"https://app.snipara.com/team/projects/{project.slug}/access-requests",
         )
 
         return ToolResult(

@@ -249,12 +249,19 @@ async def validate_and_rate_limit(
         if not auth_info:
             raise HTTPException(status_code=401, detail="Invalid API key")
 
-    # 2. Get project with team subscription
+    # 2. Check for access denial (team keys with NONE access level)
+    if auth_info.get("access_denied"):
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied to this project. Use rlm_request_access tool to request access.",
+        )
+
+    # 3. Get project with team subscription
     project = await get_project_with_team(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    # 3. Check rate limit
+    # 4. Check rate limit
     rate_ok = await check_rate_limit(auth_info["id"])
     if not rate_ok:
         raise HTTPException(
@@ -262,10 +269,10 @@ async def validate_and_rate_limit(
             detail=f"Rate limit exceeded: {settings.rate_limit_requests} requests per minute",
         )
 
-    # 4. Determine plan
+    # 5. Determine plan
     plan = Plan(project.team.subscription.plan if project.team.subscription else "FREE")
 
-    # 5. Get project automation settings (from dashboard)
+    # 6. Get project automation settings (from dashboard)
     project_settings = await get_project_settings(project_id)
 
     return auth_info, project, plan, project_settings
@@ -374,7 +381,10 @@ async def execute_multi_project_query(
         start_time = time.perf_counter()
 
         try:
-            engine = RLMEngine(project.id, plan=plan, settings=project_settings)
+            engine = RLMEngine(
+                project.id, plan=plan, settings=project_settings,
+                user_id=None, access_level="EDITOR"  # Multi-project uses team key
+            )
             result = await engine.execute(ToolName.RLM_CONTEXT_QUERY, tool_params)
 
             latency_ms = int((time.perf_counter() - start_time) * 1000)
@@ -538,7 +548,11 @@ async def mcp_endpoint(
 
     # Execute the tool with project settings from dashboard
     try:
-        engine = RLMEngine(project_id, plan=plan, settings=project_settings)
+        engine = RLMEngine(
+            project_id, plan=plan, settings=project_settings,
+            user_id=api_key_info.get("user_id"),
+            access_level=api_key_info.get("access_level", "EDITOR"),
+        )
         result = await engine.execute(request.tool, request.params)
 
         latency_ms = int((time.perf_counter() - start_time) * 1000)
@@ -784,9 +798,13 @@ async def get_context(
         Current session context
     """
     # Validate API key, project, and rate limit
-    _, _, _, _ = await validate_and_rate_limit(project_id, api_key)
+    api_key_info, _, _, _ = await validate_and_rate_limit(project_id, api_key)
 
-    engine = RLMEngine(project_id)
+    engine = RLMEngine(
+        project_id,
+        user_id=api_key_info.get("user_id"),
+        access_level=api_key_info.get("access_level", "EDITOR"),
+    )
     await engine.load_session_context()
 
     return {
@@ -849,6 +867,8 @@ async def sse_event_generator(
     tool: ToolName,
     params: dict,
     plan: Plan,
+    user_id: str | None = None,
+    access_level: str = "EDITOR",
 ) -> AsyncGenerator[str, None]:
     """
     Generate Server-Sent Events for MCP tool execution.
@@ -865,7 +885,10 @@ async def sse_event_generator(
 
     try:
         # Execute the tool
-        engine = RLMEngine(project_id, plan=plan)
+        engine = RLMEngine(
+            project_id, plan=plan,
+            user_id=user_id, access_level=access_level
+        )
         result = await engine.execute(tool, params)
 
         latency_ms = int((time.perf_counter() - start_time) * 1000)
@@ -927,7 +950,7 @@ async def mcp_sse_endpoint(
         SSE stream with tool execution events
     """
     # Validate API key, project, and rate limit
-    _, _, plan, _ = await validate_and_rate_limit(project_id, api_key)
+    api_key_info, _, plan, _ = await validate_and_rate_limit(project_id, api_key)
 
     # Check usage limits
     limits = await check_usage_limits(project_id, plan)
@@ -964,7 +987,11 @@ async def mcp_sse_endpoint(
 
     # Return SSE stream
     return StreamingResponse(
-        sse_event_generator(project_id, tool_name, parsed_params, plan),
+        sse_event_generator(
+            project_id, tool_name, parsed_params, plan,
+            user_id=api_key_info.get("user_id"),
+            access_level=api_key_info.get("access_level", "EDITOR"),
+        ),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -994,7 +1021,7 @@ async def mcp_sse_endpoint_post(
         SSE stream with tool execution events
     """
     # Validate API key, project, and rate limit
-    _, _, plan, _ = await validate_and_rate_limit(project_id, api_key)
+    api_key_info, _, plan, _ = await validate_and_rate_limit(project_id, api_key)
 
     # Check usage limits
     limits = await check_usage_limits(project_id, plan)
@@ -1006,7 +1033,11 @@ async def mcp_sse_endpoint_post(
 
     # Return SSE stream
     return StreamingResponse(
-        sse_event_generator(project_id, request.tool, request.params, plan),
+        sse_event_generator(
+            project_id, request.tool, request.params, plan,
+            user_id=api_key_info.get("user_id"),
+            access_level=api_key_info.get("access_level", "EDITOR"),
+        ),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

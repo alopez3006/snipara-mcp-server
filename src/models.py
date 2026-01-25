@@ -55,6 +55,8 @@ class ToolName(str, Enum):
     RLM_UPLOAD_DOCUMENT = "rlm_upload_document"
     RLM_SYNC_DOCUMENTS = "rlm_sync_documents"
     RLM_SETTINGS = "rlm_settings"
+    # Phase 11: Access Control Tools
+    RLM_REQUEST_ACCESS = "rlm_request_access"
 
 
 class SearchMode(str, Enum):
@@ -197,7 +199,7 @@ class HealthResponse(BaseModel):
     """Health check response."""
 
     status: str = Field(default="healthy")
-    version: str = Field(default="1.2.0")
+    version: str = Field(default="1.0.0")
     timestamp: datetime = Field(default_factory=datetime.utcnow)
 
 
@@ -1157,3 +1159,32 @@ class SettingsResult(BaseModel):
     include_summaries: bool = Field(..., description="Include summaries in queries")
     auto_inject_context: bool = Field(..., description="Auto-inject context")
     message: str = Field(..., description="Human-readable status message")
+
+
+# ============ ACCESS REQUEST MODELS ============
+
+
+class RequestAccessParams(BaseModel):
+    """Parameters for rlm_request_access tool."""
+
+    requested_level: str = Field(
+        default="VIEWER",
+        description="Requested access level: VIEWER, EDITOR, or ADMIN",
+    )
+    reason: str | None = Field(
+        default=None,
+        max_length=500,
+        description="Optional reason for requesting access",
+    )
+
+
+class RequestAccessResult(BaseModel):
+    """Result of rlm_request_access tool."""
+
+    request_id: str = Field(..., description="Access request ID")
+    project_id: str = Field(..., description="Project ID")
+    project_name: str = Field(..., description="Project name")
+    requested_level: str = Field(..., description="Requested access level")
+    status: str = Field(default="pending", description="Request status")
+    message: str = Field(..., description="Human-readable status message")
+    dashboard_url: str = Field(..., description="URL to view request status")
