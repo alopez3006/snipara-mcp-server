@@ -37,6 +37,13 @@ RUN groupadd --gid 1000 appgroup && \
 COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
+# Copy Prisma binaries cache from builder and set ownership for appuser
+COPY --from=builder /root/.cache/prisma-python /home/appuser/.cache/prisma-python
+RUN chown -R appuser:appgroup /home/appuser/.cache
+
+# Set PRISMA_HOME to use appuser's cache
+ENV PRISMA_PY_HOME="/home/appuser/.cache/prisma-python"
+
 # Copy application code
 COPY src ./src
 
