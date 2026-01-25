@@ -890,10 +890,13 @@ async def recall_memories(
         List of relevant memories with content and metadata
     """
     # Validate API key, project, and rate limit
-    _, _, _, _ = await validate_and_rate_limit(project_id, api_key)
+    _, project, _, _ = await validate_and_rate_limit(project_id, api_key)
+
+    # Use resolved project ID, not the slug from URL
+    resolved_project_id = project.id
 
     result = await semantic_recall(
-        project_id=project_id,
+        project_id=resolved_project_id,
         query=query,
         memory_type=type,
         category=category,
@@ -902,7 +905,7 @@ async def recall_memories(
     )
 
     return {
-        "project_id": project_id,
+        "project_id": resolved_project_id,
         "query": query,
         "memories": result.get("memories", []),
         "total_searched": result.get("total_searched", 0),
@@ -932,12 +935,15 @@ async def create_memory(
         Created memory with ID and metadata
     """
     # Validate API key, project, and rate limit
-    _, _, _, _ = await validate_and_rate_limit(project_id, api_key)
+    _, project, _, _ = await validate_and_rate_limit(project_id, api_key)
 
     body = await request.json()
 
+    # Use resolved project ID, not the slug from URL
+    resolved_project_id = project.id
+
     result = await store_memory(
-        project_id=project_id,
+        project_id=resolved_project_id,
         content=body.get("content", ""),
         memory_type=body.get("type", "learning"),
         scope=body.get("scope", "project"),
@@ -947,7 +953,7 @@ async def create_memory(
     )
 
     return {
-        "project_id": project_id,
+        "project_id": resolved_project_id,
         "memory_id": result.get("memory_id"),
         "type": result.get("type"),
         "created": result.get("created", False),
