@@ -778,19 +778,13 @@ async def claim_task(
         data={
             "status": "IN_PROGRESS",
             "agent": {"connect": {"id": agent.id}},
+            "assignedTo": agent.id,  # Also set string field for lookups
             "startedAt": datetime.now(timezone.utc),
+            "claimedAt": datetime.now(timezone.utc),
         },
     )
 
     logger.info(f"Agent {agent_id} claimed task {task.id}")
-
-    # Parse metadata
-    metadata = None
-    if task.metadata:
-        try:
-            metadata = json.loads(task.metadata)
-        except json.JSONDecodeError:
-            metadata = task.metadata
 
     return {
         "success": True,
@@ -798,7 +792,6 @@ async def claim_task(
         "title": task.title,
         "description": task.description,
         "priority": task.priority,
-        "metadata": metadata,
         "deadline": deadline.isoformat(),
         "message": "Task claimed",
     }
@@ -858,13 +851,12 @@ async def complete_task(
 
     # Update task
     status = "COMPLETED" if success else "FAILED"
-    result_str = json.dumps(result) if result is not None else None
 
     await db.swarmtask.update(
         where={"id": task.id},
         data={
             "status": status,
-            "result": result_str,
+            "result": result,  # Json field accepts dict/list directly
             "completedAt": datetime.now(timezone.utc),
         },
     )
