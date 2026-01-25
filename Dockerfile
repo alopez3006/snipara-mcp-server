@@ -39,10 +39,10 @@ ENV PATH="/opt/venv/bin:$PATH"
 
 # Copy Prisma binaries cache from builder and set ownership for appuser
 COPY --from=builder /root/.cache/prisma-python /home/appuser/.cache/prisma-python
-RUN chown -R appuser:appgroup /home/appuser/.cache
+RUN chown -R appuser:appgroup /home/appuser
 
-# Set PRISMA_HOME to use appuser's cache
-ENV PRISMA_PY_HOME="/home/appuser/.cache/prisma-python"
+# Set HOME for appuser so prisma-python finds the cache in ~/.cache/prisma-python
+ENV HOME="/home/appuser"
 
 # Copy application code
 COPY src ./src
