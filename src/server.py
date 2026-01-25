@@ -24,6 +24,7 @@ from .auth import (
 )
 from .config import settings
 from .db import close_db, get_db
+from .services.agent_memory import semantic_recall, store_memory
 from .models import (
     HealthResponse,
     LimitsInfo,
@@ -857,6 +858,101 @@ async def get_stats(
 
     stats = await get_usage_stats(project_id, days)
     return {"project_id": project_id, **stats}
+
+
+# ============ MEMORY REST API (Automation Hooks) ============
+
+
+@app.get("/v1/{project_id}/memories/recall", tags=["Memories"])
+async def recall_memories(
+    project_id: str,
+    api_key: Annotated[str, Depends(get_api_key)],
+    query: str = Query(..., description="Search query for semantic recall"),
+    type: str | None = Query(default=None, description="Filter by memory type"),
+    category: str | None = Query(default=None, description="Filter by category"),
+    limit: int = Query(default=10, ge=1, le=50, description="Max memories to return"),
+    min_relevance: float = Query(default=0.3, ge=0, le=1, description="Minimum relevance"),
+):
+    """
+    Recall memories semantically based on a query.
+
+    Used by SessionStart hooks to inject relevant memories into new sessions.
+
+    Args:
+        project_id: The project ID
+        query: Search query for semantic matching
+        type: Filter by memory type (fact, decision, learning, preference, todo, context)
+        category: Filter by category
+        limit: Maximum memories to return
+        min_relevance: Minimum relevance score (0-1)
+
+    Returns:
+        List of relevant memories with content and metadata
+    """
+    # Validate API key, project, and rate limit
+    _, _, _, _ = await validate_and_rate_limit(project_id, api_key)
+
+    result = await semantic_recall(
+        project_id=project_id,
+        query=query,
+        memory_type=type,
+        category=category,
+        limit=limit,
+        min_relevance=min_relevance,
+    )
+
+    return {
+        "project_id": project_id,
+        "query": query,
+        "memories": result.get("memories", []),
+        "total_searched": result.get("total_searched", 0),
+        "timing_ms": result.get("timing_ms", 0),
+    }
+
+
+@app.post("/v1/{project_id}/memories", tags=["Memories"])
+async def create_memory(
+    project_id: str,
+    api_key: Annotated[str, Depends(get_api_key)],
+    request: Request,
+):
+    """
+    Store a new memory for later recall.
+
+    Used by PreCompact hooks or directly by Claude to persist learnings.
+
+    Request body:
+        content: str - The memory content
+        type: str - Memory type (fact, decision, learning, preference, todo, context)
+        category: str - Optional grouping category
+        ttl_days: int - Days until expiration (null = permanent)
+        source: str - What created this memory (e.g., "hook", "claude", "manual")
+
+    Returns:
+        Created memory with ID and metadata
+    """
+    # Validate API key, project, and rate limit
+    _, _, _, _ = await validate_and_rate_limit(project_id, api_key)
+
+    body = await request.json()
+
+    result = await store_memory(
+        project_id=project_id,
+        content=body.get("content", ""),
+        memory_type=body.get("type", "learning"),
+        scope=body.get("scope", "project"),
+        category=body.get("category"),
+        ttl_days=body.get("ttl_days"),
+        source=body.get("source", "hook"),
+    )
+
+    return {
+        "project_id": project_id,
+        "memory_id": result.get("memory_id"),
+        "type": result.get("type"),
+        "created": result.get("created", False),
+        "message": result.get("message"),
+    }
 
 
 # ============ SSE ENDPOINTS (Continue.dev Integration) ============
