@@ -51,6 +51,16 @@ async def broadcast_event(
     db = await get_db()
     redis = await get_redis()
 
+    # Parse payload if it's a string (from MCP)
+    parsed_payload = payload
+    if isinstance(payload, str):
+        try:
+            parsed_payload = json.loads(payload)
+        except json.JSONDecodeError:
+            parsed_payload = {"raw": payload}
+    elif payload is None:
+        parsed_payload = {}
+
     # Look up SwarmAgent by external agent_id
     swarm_agent = await db.swarmagent.find_first(
         where={
@@ -65,7 +75,7 @@ async def broadcast_event(
         "type": event_type,
         "agent_id": agent_id,
         "swarm_id": swarm_id,
-        "payload": payload or {},
+        "payload": parsed_payload,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -73,7 +83,7 @@ async def broadcast_event(
     create_data: dict[str, Any] = {
         "swarm": {"connect": {"id": swarm_id}},
         "eventType": event_type,
-        "payload": payload or {},
+        "payload": parsed_payload,
     }
     # Only connect agent if found
     if swarm_agent:

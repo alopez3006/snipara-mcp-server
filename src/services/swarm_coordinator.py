@@ -583,8 +583,13 @@ async def set_state(
     """
     db = await get_db()
 
-    # Serialize value
-    value_str = json.dumps(value) if not isinstance(value, str) else value
+    # Parse value if it's a string (from MCP)
+    parsed_value = value
+    if isinstance(value, str):
+        try:
+            parsed_value = json.loads(value)
+        except json.JSONDecodeError:
+            parsed_value = {"raw": value}
 
     # Check existing state
     existing = await db.sharedstate.find_first(
@@ -609,7 +614,7 @@ async def set_state(
         await db.sharedstate.update(
             where={"id": existing.id},
             data={
-                "value": value,  # Json field accepts dict/list directly
+                "value": parsed_value,  # Json field accepts dict/list directly
                 "version": new_version,
                 "updatedBy": agent_id,
             },
@@ -627,7 +632,7 @@ async def set_state(
             data={
                 "swarm": {"connect": {"id": swarm_id}},
                 "key": key,
-                "value": value,  # Json field accepts dict/list directly
+                "value": parsed_value,  # Json field accepts dict/list directly
                 "version": 1,
                 "updatedBy": agent_id,
             }
@@ -851,11 +856,19 @@ async def complete_task(
     # Update task
     status = "COMPLETED" if success else "FAILED"
 
+    # Handle result - parse if string, use directly if dict/list
+    parsed_result = result
+    if isinstance(result, str):
+        try:
+            parsed_result = json.loads(result)
+        except json.JSONDecodeError:
+            parsed_result = {"raw": result}
+
     await db.swarmtask.update(
         where={"id": task.id},
         data={
             "status": status,
-            "result": result,  # Json field accepts dict/list directly
+            "result": parsed_result if parsed_result is not None else None,
             "completedAt": datetime.now(timezone.utc),
         },
     )
