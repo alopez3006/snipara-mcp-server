@@ -9,7 +9,7 @@ import json
 from typing import Any
 
 from fastapi import APIRouter, Header, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from .auth import get_project_with_team, validate_api_key, validate_oauth_token
 from .config import settings
@@ -651,7 +651,7 @@ async def mcp_endpoint(
         return JSONResponse(responses)
 
     response = await handle_request(body, actual_project_id, plan)
-    return JSONResponse(response) if response else JSONResponse({}, status_code=204)
+    return JSONResponse(response) if response else Response(status_code=204)
 
 
 @router.get("/{project_id}")

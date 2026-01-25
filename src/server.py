@@ -594,6 +594,144 @@ async def team_mcp_endpoint(
         )
 
 
+# ============ TEAM MCP TRANSPORT (JSON-RPC) ============
+
+
+def _jsonrpc_response(id: any, result: dict) -> dict:
+    """Create a JSON-RPC 2.0 response."""
+    return {"jsonrpc": "2.0", "id": id, "result": result}
+
+
+def _jsonrpc_error(id: any, code: int, message: str) -> dict:
+    """Create a JSON-RPC 2.0 error response."""
+    return {"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}}
+
+
+# Tool definition for team endpoint (only rlm_multi_project_query)
+TEAM_TOOL_DEFINITION = {
+    "name": "rlm_multi_project_query",
+    "description": "Query across all projects in a team. Returns ranked context from multiple documentation sets.",
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "The question to answer"},
+            "max_tokens": {"type": "integer", "default": 16000, "description": "Total token budget across all projects"},
+            "per_project_limit": {"type": "integer", "default": 10, "description": "Max sections per project"},
+            "project_ids": {"type": "array", "items": {"type": "string"}, "default": [], "description": "Filter to specific projects (empty = all)"},
+            "exclude_project_ids": {"type": "array", "items": {"type": "string"}, "default": [], "description": "Projects to exclude"},
+        },
+        "required": ["query"],
+    },
+}
+
+
+@app.post("/mcp/team/{team_id}", tags=["MCP Transport"])
+async def team_mcp_transport_endpoint(
+    team_id: str,
+    request: Request,
+    x_api_key: str | None = Header(None, alias="X-API-Key"),
+    authorization: str | None = Header(None),
+):
+    """
+    Team MCP Streamable HTTP endpoint (JSON-RPC format).
+
+    This endpoint supports the MCP protocol for team-scoped queries.
+    Only the rlm_multi_project_query tool is available.
+
+    Config example (Claude Code):
+    ```json
+    {"mcpServers": {"snipara-team": {"type": "http", "url": "https://api.snipara.com/mcp/team/{team_id}", "headers": {"X-API-Key": "rlm_team_..."}}}}
+    ```
+    """
+    # Accept X-API-Key header (preferred) or Authorization: Bearer
+    if x_api_key:
+        api_key = x_api_key
+    elif authorization:
+        api_key = authorization[7:] if authorization.startswith("Bearer ") else authorization
+    else:
+        raise HTTPException(status_code=401, detail="Missing authentication: X-API-Key or Authorization header required")
+
+    # Validate team and API key
+    team = await get_team_by_slug_or_id(team_id)
+    if not team:
+        raise HTTPException(status_code=404, detail="Team not found")
+
+    api_key_info = await validate_team_api_key(api_key, team.id)
+    if not api_key_info:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    if not await check_rate_limit(api_key_info["id"]):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
+
+    plan = Plan(team.subscription.plan if team.subscription else "FREE")
+
+    # Parse JSON-RPC request
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(_jsonrpc_error(None, -32700, "Parse error"), status_code=400)
+
+    # Handle batch requests
+    if isinstance(body, list):
+        responses = []
+        for req in body:
+            resp = await _handle_team_request(req, team, plan)
+            if resp:  # Skip notifications (no id)
+                responses.append(resp)
+        return JSONResponse(responses)
+
+    # Handle single request
+    response = await _handle_team_request(body, team, plan)
+    return JSONResponse(response) if response else Response(status_code=204)
+
+
+async def _handle_team_request(body: dict, team: any, plan: Plan) -> dict | None:
+    """Handle a single JSON-RPC request for team endpoint."""
+    method = body.get("method")
+    id = body.get("id")
+    params = body.get("params", {})
+
+    if id is None:  # Notification - no response
+        return None
+
+    if method == "initialize":
+        return _jsonrpc_response(id, {
+            "protocolVersion": "2024-11-05",
+            "serverInfo": {"name": "snipara-team", "version": "1.0.0"},
+            "capabilities": {"tools": {}},
+        })
+    elif method == "tools/list":
+        return _jsonrpc_response(id, {"tools": [TEAM_TOOL_DEFINITION]})
+    elif method == "tools/call":
+        return await _handle_team_call_tool(id, params, team, plan)
+    elif method == "ping":
+        return _jsonrpc_response(id, {})
+    else:
+        return _jsonrpc_error(id, -32601, f"Method not found: {method}")
+
+
+async def _handle_team_call_tool(id: any, params: dict, team: any, plan: Plan) -> dict:
+    """Handle MCP tools/call request for team endpoint."""
+    tool_name = params.get("name")
+    arguments = params.get("arguments", {})
+
+    if tool_name != "rlm_multi_project_query":
+        return _jsonrpc_error(id, -32602, f"Tool not available on team endpoint: {tool_name}. Only rlm_multi_project_query is supported.")
+
+    try:
+        result_payload, input_tokens, output_tokens = await execute_multi_project_query(
+            team, plan, arguments
+        )
+
+        return _jsonrpc_response(id, {
+            "content": [{"type": "text", "text": json.dumps(result_payload, indent=2, default=str)}],
+        })
+    except HTTPException as e:
+        return _jsonrpc_error(id, -32000, e.detail)
+    except Exception as e:
+        return _jsonrpc_error(id, -32000, str(e))
+
+
 @app.get("/v1/{project_id}/context", tags=["MCP"])
 async def get_context(
     project_id: str,
