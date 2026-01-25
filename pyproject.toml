@@ -1,11 +1,11 @@
 [project]
-name = "snipara-fastapi"
-version = "1.7.6"
-description = "Snipara FastAPI Server - Context Optimization as a Service backend"
+name = "rlm-mcp-server"
+version = "1.0.0"
+description = "Hosted MCP server for RLM SaaS - Context-efficient documentation queries"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
-authors = [{ name = "Snipara", email = "support@snipara.com" }]
+authors = [{ name = "RLM SaaS Team" }]
 
 dependencies = [
     "fastapi>=0.109.0",
@@ -20,6 +20,7 @@ dependencies = [
     "tiktoken>=0.5.0",
     "sentence-transformers>=2.2.0",
     "numpy>=1.24.0",
+    "sentry-sdk[fastapi]>=1.40.0",
 ]
 
 [project.optional-dependencies]
@@ -31,10 +32,17 @@ dev = [
     "ruff>=0.1.0",
     "mypy>=1.8.0",
 ]
+benchmark = [
+    "anthropic>=0.40.0",
+    "tiktoken>=0.5.0",
+]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
 
 [tool.ruff]
 line-length = 100
@@ -44,13 +52,13 @@ target-version = "py311"
 select = ["E", "F", "I", "N", "W", "UP"]
 ignore = ["E501"]
 
+[project.scripts]
+snipara-benchmark = "benchmarks.runner:main"
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-testpaths = ["tests"]
+testpaths = ["tests", "benchmarks"]
 
 [tool.mypy]
 python_version = "3.11"
 strict = true
-
-[tool.hatch.build.targets.wheel]
-packages = ["src"]
