@@ -48,6 +48,9 @@ RUN chown -R appuser:appgroup /home/appuser
 # Set HOME for appuser (must match build stage HOME)
 ENV HOME="/home/appuser"
 
+# Copy Prisma schema (needed by client at runtime)
+COPY --from=builder /app/prisma ./prisma
+
 # Copy application code
 COPY src ./src
 
