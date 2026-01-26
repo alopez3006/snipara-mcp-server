@@ -75,12 +75,5 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD python -c "import httpx; httpx.get('http://localhost:8000/health')" || exit 1
 
-# Run the server with Gunicorn + Uvicorn workers for better concurrency
-# Workers = 2 (optimized for 512MB RAM limit)
-CMD ["gunicorn", "src.server:app", \
-     "-w", "2", \
-     "-k", "uvicorn.workers.UvicornWorker", \
-     "-b", "0.0.0.0:8000", \
-     "--timeout", "120", \
-     "--graceful-timeout", "30"]
-# Build cache bust: Tue Jan 27 00:45:12 CET 2026
+# Use entrypoint script (runs prisma generate then uvicorn)
+ENTRYPOINT ["./entrypoint.sh"]
