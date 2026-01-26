@@ -70,6 +70,67 @@ class SharedContext:
     collection_versions: dict[str, int] = field(default_factory=dict)
 
 
+async def load_team_context_for_project(project_id: str) -> list[SharedDocument]:
+    """
+    Load team-level context that applies to all projects in the team.
+
+    Team contexts are simpler than SharedContextCollections - they're just
+    key-value pairs with content that gets auto-included for all team projects.
+
+    Args:
+        project_id: The project ID
+
+    Returns:
+        List of SharedDocument from team contexts
+    """
+    db = await get_db()
+
+    # Get project's team
+    project = await db.project.find_unique(
+        where={"id": project_id},
+        select={"teamId": True}
+    )
+
+    if not project or not project.teamId:
+        return []
+
+    # Get active team contexts
+    team_contexts = await db.teamcontext.find_many(
+        where={
+            "teamId": project.teamId,
+            "isActive": True,
+        },
+        order={"priority": "desc"},
+    )
+
+    documents: list[SharedDocument] = []
+
+    for ctx in team_contexts:
+        # Estimate token count (rough: 4 chars per token)
+        token_count = len(ctx.value) // 4
+
+        # Create a content hash
+        content_hash = hashlib.sha256(ctx.value.encode()).hexdigest()[:16]
+
+        doc = SharedDocument(
+            id=f"team_ctx_{ctx.id}",
+            title=ctx.name,
+            slug=ctx.key,
+            content=ctx.value,
+            category=DocumentCategory.BEST_PRACTICES,
+            tags=[],
+            priority=ctx.priority,
+            token_count=token_count,
+            content_hash=content_hash,
+            collection_id=f"team_{project.teamId}",
+            collection_name="Team Context",
+            collection_priority=-1,  # Higher priority than project collections
+        )
+        documents.append(doc)
+
+    return documents
+
+
 async def load_project_shared_context(project_id: str) -> SharedContext:
     """
     Load all shared context linked to a project.
@@ -106,6 +167,11 @@ async def load_project_shared_context(project_id: str) -> SharedContext:
     documents: list[SharedDocument] = []
     collection_versions: dict[str, int] = {}
     total_tokens = 0
+
+    # Load team-level context first (highest priority, auto-applies to all projects)
+    team_documents = await load_team_context_for_project(project_id)
+    documents.extend(team_documents)
+    total_tokens += sum(d.token_count for d in team_documents)
 
     for ctx in project_contexts:
         collection = ctx.collection
