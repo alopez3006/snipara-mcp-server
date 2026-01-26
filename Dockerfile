@@ -33,6 +33,10 @@ FROM python:3.12-slim AS runtime
 
 WORKDIR /app
 
+# Install bash for entrypoint script
+RUN apt-get update && apt-get install -y --no-install-recommends bash \
+    && rm -rf /var/lib/apt/lists/*
+
 # Create non-root user
 RUN groupadd --gid 1000 appgroup && \
     useradd --uid 1000 --gid appgroup --shell /bin/bash appuser
@@ -53,6 +57,10 @@ COPY --from=builder /app/prisma ./prisma
 
 # Copy application code
 COPY src ./src
+
+# Copy entrypoint script
+COPY entrypoint.sh ./entrypoint.sh
+RUN chmod +x ./entrypoint.sh
 
 # Set ownership
 RUN chown -R appuser:appgroup /app
