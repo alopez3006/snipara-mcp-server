@@ -138,8 +138,8 @@ def _subscription_to_dict(sub: Any) -> dict[str, Any]:
         "swarm_limit": sub.swarmLimit,
         "agents_per_swarm_limit": sub.agentsPerSwarmLimit,
         "cache_ttl_seconds": sub.cacheTtlSeconds,
-        "grace_period_end": sub.gracePeriodEnd,
-        "grace_period_reason": sub.gracePeriodReason,
+        "grace_period_end": getattr(sub, "gracePeriodEnd", None),
+        "grace_period_reason": getattr(sub, "gracePeriodReason", None),
     }
 
 
