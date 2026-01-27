@@ -1,7 +1,7 @@
 """Embeddings service for semantic search.
 
 Uses sentence-transformers with lazy model loading to avoid startup cost.
-Model: all-MiniLM-L6-v2 (384 dimensions, fast and efficient)
+Model: BAAI/bge-base-en-v1.5 (768 dimensions, high quality)
 """
 
 from __future__ import annotations
@@ -19,8 +19,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Model configuration
-MODEL_NAME = "all-MiniLM-L6-v2"
-EMBEDDING_DIMENSION = 384
+MODEL_NAME = "BAAI/bge-base-en-v1.5"
+EMBEDDING_DIMENSION = 768
 
 # Timeout configuration (in seconds)
 # Note: First request may take longer due to model cold-start (loading into memory)

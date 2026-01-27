@@ -65,7 +65,7 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD python -c "import httpx; httpx.get('http://localhost:8000/health')" || exit 1
 
 # Run the server with Gunicorn + Uvicorn workers for better concurrency
-# Workers = 2 (optimized for 512MB RAM limit)
+# Workers = 2 (optimized for Hobby plan with 8GB RAM)
 CMD ["gunicorn", "src.server:app", \
      "-w", "2", \
      "-k", "uvicorn.workers.UvicornWorker", \
