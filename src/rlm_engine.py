@@ -58,6 +58,7 @@ from .services.shared_context import (
     create_shared_document,
     DocumentCategory,
     get_shared_prompt_templates,
+    list_shared_collections,
     load_project_shared_context,
     merge_shared_context_with_project_docs,
 )
@@ -572,6 +573,7 @@ class RLMEngine:
             ToolName.RLM_SHARED_CONTEXT: self._handle_shared_context,
             ToolName.RLM_LIST_TEMPLATES: self._handle_list_templates,
             ToolName.RLM_GET_TEMPLATE: self._handle_get_template,
+            ToolName.RLM_LIST_COLLECTIONS: self._handle_list_collections,
             ToolName.RLM_UPLOAD_SHARED_DOCUMENT: self._handle_upload_shared_document,
             # Phase 8.2: Agent Memory Tools
             ToolName.RLM_REMEMBER: self._handle_remember,
@@ -2605,6 +2607,43 @@ class RLMEngine:
             input_tokens=0,
             output_tokens=count_tokens(rendered_prompt),
         )
+
+    async def _handle_list_collections(
+        self, params: dict[str, Any]
+    ) -> ToolResult:
+        """
+        Handle rlm_list_collections - list accessible shared context collections.
+
+        Args:
+            params: Dict containing:
+                - include_public: Whether to include public collections (default True)
+
+        Returns:
+            ToolResult with list of collection info
+        """
+        include_public = params.get("include_public", True)
+
+        try:
+            collections = await list_shared_collections(
+                user_id=self.user_id,
+                include_public=include_public,
+            )
+
+            return ToolResult(
+                data={
+                    "collections": collections,
+                    "count": len(collections),
+                },
+                input_tokens=0,
+                output_tokens=0,
+            )
+        except Exception as e:
+            logger.error(f"Error listing collections: {e}")
+            return ToolResult(
+                data={"error": f"Failed to list collections: {str(e)}"},
+                input_tokens=0,
+                output_tokens=0,
+            )
 
     async def _handle_upload_shared_document(
         self, params: dict[str, Any]

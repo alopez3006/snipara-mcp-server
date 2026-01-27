@@ -528,6 +528,72 @@ async def get_shared_prompt_templates(
     return templates
 
 
+async def list_shared_collections(
+    user_id: str,
+    include_public: bool = True,
+) -> list[dict]:
+    """
+    List all shared context collections accessible to a user.
+
+    Returns collections where:
+    - User owns the collection directly
+    - User is a member of the team that owns the collection
+    - Collection is public (if include_public=True)
+
+    Args:
+        user_id: The user ID
+        include_public: Whether to include public collections (default True)
+
+    Returns:
+        List of collection dicts with id, name, slug, description, scope, document count
+    """
+    db = await get_db()
+
+    # Build the OR conditions for access
+    or_conditions = [
+        {"ownerId": user_id},
+        {"team": {"members": {"some": {"userId": user_id}}}},
+    ]
+
+    if include_public:
+        or_conditions.append({"isPublic": True})
+
+    collections = await db.sharedcontextcollection.find_many(
+        where={"OR": or_conditions},
+        include={
+            "team": {"select": {"name": True}},
+            "_count": {"select": {"documents": True, "projectLinks": True}},
+        },
+        order={"updatedAt": "desc"},
+    )
+
+    result = []
+    for col in collections:
+        # Determine access type for clarity
+        if col.ownerId == user_id:
+            access_type = "owner"
+        elif col.teamId:
+            access_type = "team_member"
+        else:
+            access_type = "public"
+
+        result.append({
+            "id": col.id,
+            "name": col.name,
+            "slug": col.slug,
+            "description": col.description,
+            "scope": col.scope,
+            "is_public": col.isPublic,
+            "team_name": col.team.name if col.team else None,
+            "document_count": col._count["documents"] if col._count else 0,
+            "project_count": col._count["projectLinks"] if col._count else 0,
+            "access_type": access_type,
+            "version": col.version,
+        })
+
+    return result
+
+
 async def create_shared_document(
     collection_id: str,
     user_id: str,

@@ -328,6 +328,21 @@ TOOL_DEFINITIONS = [
         },
     },
     {
+        "name": "rlm_list_collections",
+        "description": "List all shared context collections accessible to you. Returns collections you own, team collections you're a member of, and public collections. Use this to find collection IDs for uploading documents.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "include_public": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Include public collections in the results",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
         "name": "rlm_upload_shared_document",
         "description": "Upload or update a document in a shared context collection. Use for team best practices, coding standards, and guidelines. Requires Team plan or higher.",
         "inputSchema": {
