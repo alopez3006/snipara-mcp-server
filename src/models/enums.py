@@ -51,6 +51,7 @@ class ToolName(StrEnum):
     RLM_TASK_BULK_CREATE = "rlm_task_bulk_create"
     RLM_TASK_CLAIM = "rlm_task_claim"
     RLM_TASK_COMPLETE = "rlm_task_complete"
+    RLM_TASKS = "rlm_tasks"
     # Phase 10: Document Sync Tools
     RLM_UPLOAD_DOCUMENT = "rlm_upload_document"
     RLM_SYNC_DOCUMENTS = "rlm_sync_documents"

@@ -50,6 +50,7 @@ from .swarm import (
     handle_task_claim,
     handle_task_complete,
     handle_task_create,
+    handle_tasks,
 )
 
 __all__ = [
@@ -74,6 +75,7 @@ __all__ = [
     "handle_task_create",
     "handle_task_claim",
     "handle_task_complete",
+    "handle_tasks",
     # Session handlers
     "handle_inject",
     "handle_context",

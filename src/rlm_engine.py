@@ -888,6 +888,7 @@ class RLMEngine:
             ToolName.RLM_TASK_BULK_CREATE: self._handle_task_bulk_create,
             ToolName.RLM_TASK_CLAIM: self._handle_task_claim,
             ToolName.RLM_TASK_COMPLETE: self._handle_task_complete,
+            ToolName.RLM_TASKS: self._handle_tasks,
             # Phase 10: Document Sync Tools
             ToolName.RLM_UPLOAD_DOCUMENT: self._handle_upload_document,
             ToolName.RLM_SYNC_DOCUMENTS: self._handle_sync_documents,
@@ -5050,6 +5051,47 @@ class RLMEngine:
         return ToolResult(
             data=result,
             input_tokens=count_tokens(str(task_result) if task_result else ""),
+            output_tokens=count_tokens(str(result)),
+        )
+
+    async def _handle_tasks(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_tasks - list tasks in a swarm's task queue.
+
+        Args:
+            params: Dict containing:
+                - swarm_id: Swarm ID (required)
+                - status: Filter by status (optional)
+                - assigned_to: Filter by assigned agent (optional)
+                - limit: Max tasks to return (default 50)
+
+        Returns:
+            ToolResult with list of tasks
+        """
+        from .services.swarm import list_tasks
+
+        swarm_id = params.get("swarm_id", "")
+        status = params.get("status")
+        assigned_to = params.get("assigned_to")
+        limit = params.get("limit", 50)
+
+        if not swarm_id:
+            return ToolResult(
+                data={"error": "rlm_tasks: missing required parameter 'swarm_id'"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        result = await list_tasks(
+            swarm_id=swarm_id,
+            status=status,
+            assigned_to=assigned_to,
+            limit=limit,
+        )
+
+        return ToolResult(
+            data=result,
+            input_tokens=0,
             output_tokens=count_tokens(str(result)),
         )
 

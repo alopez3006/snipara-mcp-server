@@ -11,6 +11,7 @@ Handles:
 - rlm_task_create: Create a task in the queue
 - rlm_task_claim: Claim a task from the queue
 - rlm_task_complete: Mark a task as complete
+- rlm_tasks: List tasks in a swarm
 """
 
 from typing import Any
@@ -25,6 +26,7 @@ from ...services.swarm import (
     create_task,
     get_state,
     join_swarm,
+    list_tasks,
     release_claim,
     set_state,
 )
@@ -525,5 +527,47 @@ async def handle_task_complete(
     return ToolResult(
         data=result,
         input_tokens=count_tokens(str(result_data) if result_data else ""),
+        output_tokens=count_tokens(str(result)),
+    )
+
+
+async def handle_tasks(
+    params: dict[str, Any],
+    ctx: HandlerContext,
+) -> ToolResult:
+    """List tasks in a swarm's task queue.
+
+    Args:
+        params: Dict containing:
+            - swarm_id: Swarm ID
+            - status: Optional filter by status (pending, claimed, completed, failed)
+            - assigned_to: Optional filter by assigned agent ID
+            - limit: Max tasks to return (default 50)
+
+    Returns:
+        ToolResult with list of tasks
+    """
+    swarm_id = params.get("swarm_id", "")
+    status = params.get("status")
+    assigned_to = params.get("assigned_to")
+    limit = params.get("limit", 50)
+
+    if not swarm_id:
+        return ToolResult(
+            data={"error": "rlm_tasks: missing required parameter 'swarm_id'"},
+            input_tokens=0,
+            output_tokens=0,
+        )
+
+    result = await list_tasks(
+        swarm_id=swarm_id,
+        status=status,
+        assigned_to=assigned_to,
+        limit=limit,
+    )
+
+    return ToolResult(
+        data=result,
+        input_tokens=0,
         output_tokens=count_tokens(str(result)),
     )

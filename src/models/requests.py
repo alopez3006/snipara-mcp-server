@@ -422,6 +422,23 @@ class TaskCompleteParams(BaseModel):
     error: str | None = Field(default=None, description="Error message if task failed")
 
 
+class TasksParams(BaseModel):
+    """Parameters for rlm_tasks tool - list tasks in a swarm."""
+
+    swarm_id: str = Field(..., description="Swarm ID")
+    status: str | None = Field(
+        default=None,
+        description="Filter by status: pending, claimed, completed, failed",
+    )
+    assigned_to: str | None = Field(
+        default=None,
+        description="Filter by assigned agent ID (for task affinity)",
+    )
+    limit: int = Field(
+        default=50, ge=1, le=100, description="Maximum tasks to return"
+    )
+
+
 # ============ DOCUMENT SYNC PARAMS (Phase 10) ============
 
 

@@ -90,6 +90,7 @@ TOOL_TIERS: dict[str, ToolTier] = {
     "rlm_task_create": ToolTier.ADVANCED,
     "rlm_task_claim": ToolTier.ADVANCED,
     "rlm_task_complete": ToolTier.ADVANCED,
+    "rlm_tasks": ToolTier.ADVANCED,
 }
 
 
@@ -941,6 +942,33 @@ TOOL_DEFINITIONS: list[dict] = [
                 "result": {"description": "Task result data"},
             },
             "required": ["swarm_id", "agent_id", "task_id"],
+        },
+    },
+    {
+        "name": "rlm_tasks",
+        "description": "List tasks in a swarm's task queue. Filter by status or assigned agent.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "swarm_id": {"type": "string", "description": "Swarm ID"},
+                "status": {
+                    "type": "string",
+                    "enum": ["pending", "claimed", "completed", "failed"],
+                    "description": "Filter by task status",
+                },
+                "assigned_to": {
+                    "type": "string",
+                    "description": "Filter by assigned agent ID (for task affinity)",
+                },
+                "limit": {
+                    "type": "integer",
+                    "default": 50,
+                    "minimum": 1,
+                    "maximum": 100,
+                    "description": "Maximum tasks to return",
+                },
+            },
+            "required": ["swarm_id"],
         },
     },
     # ============ Document Sync Tools ============
