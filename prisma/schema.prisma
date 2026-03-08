@@ -392,6 +392,7 @@ model Document {
   content   String   @db.Text
   hash      String
   size      Int
+  source    String   @default("manual") // github, manual, api, mcp
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -404,6 +405,7 @@ model Document {
 
   @@unique([projectId, path])
   @@index([projectId])
+  @@index([source])
   @@map("documents")
   @@schema("tenant_snipara")
 }

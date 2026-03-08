@@ -5148,7 +5148,7 @@ class RLMEngine:
                 # Update existing document
                 await db.document.update(
                     where={"id": existing.id},
-                    data={"content": content, "hash": content_hash, "size": size},
+                    data={"content": content, "hash": content_hash, "size": size, "source": "mcp"},
                 )
                 # Invalidate index cache
                 self.index = None
@@ -5168,6 +5168,7 @@ class RLMEngine:
                     "content": content,
                     "hash": content_hash,
                     "size": size,
+                    "source": "mcp",
                 }
             )
             # Invalidate index cache
@@ -5243,7 +5244,7 @@ class RLMEngine:
                 else:
                     await db.document.update(
                         where={"id": existing.id},
-                        data={"content": content, "hash": content_hash, "size": size},
+                        data={"content": content, "hash": content_hash, "size": size, "source": "mcp"},
                     )
                     updated += 1
             else:
@@ -5254,6 +5255,7 @@ class RLMEngine:
                         "content": content,
                         "hash": content_hash,
                         "size": size,
+                        "source": "mcp",
                     }
                 )
                 created += 1
