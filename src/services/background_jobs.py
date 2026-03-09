@@ -327,13 +327,14 @@ async def _process_index_job(db: Prisma, job: dict) -> None:
     indexer = DocumentIndexer(db)
 
     if index_mode == "INCREMENTAL":
-        # Get only documents without chunks
+        # Get only documents without chunks (exclude soft-deleted)
         documents = await db.query_raw(
             """
             SELECT d.id, d.path
             FROM documents d
             LEFT JOIN document_chunks dc ON d.id = dc."documentId"
             WHERE d."projectId" = $1
+              AND d."deletedAt" IS NULL
             GROUP BY d.id, d.path
             HAVING COUNT(dc.id) = 0
             ORDER BY d.path
@@ -343,8 +344,8 @@ async def _process_index_job(db: Prisma, job: dict) -> None:
         # Convert to list of dicts with id/path
         documents = [{"id": doc["id"], "path": doc["path"]} for doc in documents]
     else:
-        # Get all documents
-        docs = await db.document.find_many(where={"projectId": project_id})
+        # Get all documents (exclude soft-deleted)
+        docs = await db.document.find_many(where={"projectId": project_id, "deletedAt": None})
         documents = [{"id": doc.id, "path": doc.path} for doc in docs]
 
     total_docs = len(documents)

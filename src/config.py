@@ -71,6 +71,14 @@ class Settings(BaseSettings):
         "ENTERPRISE": -1,  # unlimited
     }
 
+    # Trash retention days per plan (0 = no trash, hard delete)
+    trash_retention_days: dict[str, int] = {
+        "FREE": 0,  # No trash - hard delete immediately
+        "PRO": 7,  # 7-day trash retention
+        "TEAM": 30,  # 30-day trash retention
+        "ENTERPRISE": 90,  # 90-day trash retention
+    }
+
     # Self-hosted license key (optional)
     snipara_license_key: str = ""
 

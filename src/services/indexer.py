@@ -116,7 +116,8 @@ class DocumentIndexer:
         if incremental:
             return await self._index_unindexed_documents(project_id)
 
-        documents = await self.db.document.find_many(where={"projectId": project_id})
+        # Exclude soft-deleted documents
+        documents = await self.db.document.find_many(where={"projectId": project_id, "deletedAt": None})
 
         results: dict[str, int] = {}
         for doc in documents:

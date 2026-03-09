@@ -12,8 +12,10 @@ import re
 import time
 import uuid
 from collections import deque
+from datetime import datetime, timezone
 from typing import Any
 
+from .config import settings
 from .db import get_db
 
 # Phase 4 Refactor: Import from extracted core module
@@ -518,8 +520,9 @@ class RLMEngine:
         project = await db.project.find_unique(where={"id": self.project_id})
         project_slug = project.slug if project else None
 
+        # Exclude soft-deleted documents
         documents = await db.document.find_many(
-            where={"projectId": self.project_id},
+            where={"projectId": self.project_id, "deletedAt": None},
             order={"path": "asc"},
         )
 
@@ -5131,12 +5134,35 @@ class RLMEngine:
         content_hash = hashlib.sha256(content.encode()).hexdigest()
         size = len(content.encode())
 
-        # Check if document exists
+        # Check if document exists (including soft-deleted)
         existing = await db.document.find_first(where={"projectId": self.project_id, "path": path})
 
         if existing:
+            # Check if soft-deleted - if so, restore it
+            if existing.deletedAt is not None:
+                # Restore soft-deleted document with new content
+                await db.document.update(
+                    where={"id": existing.id},
+                    data={
+                        "content": content,
+                        "hash": content_hash,
+                        "size": size,
+                        "source": "mcp",
+                        "deletedAt": None,
+                        "deletedBy": None,
+                    },
+                )
+                # Invalidate index cache
+                self.index = None
+                result = UploadDocumentResult(
+                    path=path,
+                    action="restored",
+                    size=size,
+                    hash=content_hash,
+                    message=f"Document '{path}' restored from trash ({size} bytes)",
+                )
             # Check if content changed
-            if existing.hash == content_hash:
+            elif existing.hash == content_hash:
                 result = UploadDocumentResult(
                     path=path,
                     action="unchanged",
@@ -5216,8 +5242,8 @@ class RLMEngine:
         deleted = 0
         input_tokens = 0
 
-        # Get all existing documents
-        existing_docs = await db.document.find_many(where={"projectId": self.project_id})
+        # Get all existing documents (exclude soft-deleted)
+        existing_docs = await db.document.find_many(where={"projectId": self.project_id, "deletedAt": None})
         existing_by_path = {doc.path: doc for doc in existing_docs}
         synced_paths = set()
 
@@ -5262,9 +5288,27 @@ class RLMEngine:
 
         # Delete missing documents if requested
         if delete_missing:
+            # Get trash retention days for this plan
+            plan_name = self.plan.value if hasattr(self.plan, "value") else str(self.plan)
+            trash_retention_days = settings.trash_retention_days.get(plan_name, 0)
+
             for path, doc in existing_by_path.items():
                 if path not in synced_paths:
-                    await db.document.delete(where={"id": doc.id})
+                    if trash_retention_days > 0:
+                        # Soft delete - move to trash (plan supports retention)
+                        await db.document.update(
+                            where={"id": doc.id},
+                            data={
+                                "deletedAt": datetime.now(timezone.utc),
+                                "deletedBy": self.user_id,
+                            },
+                        )
+                        # Delete chunks to free up space (can be regenerated on restore)
+                        await db.documentchunk.delete_many(where={"documentId": doc.id})
+                    else:
+                        # Hard delete - FREE plan has no trash retention
+                        await db.documentchunk.delete_many(where={"documentId": doc.id})
+                        await db.document.delete(where={"id": doc.id})
                     deleted += 1
 
         # Invalidate index cache if any changes

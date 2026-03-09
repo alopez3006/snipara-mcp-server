@@ -396,6 +396,10 @@ model Document {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  // Soft delete fields
+  deletedAt DateTime? // null = active, set = soft deleted
+  deletedBy String?   // user ID who deleted (null for system deletions)
+
   // Relations
   projectId String
   project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
@@ -406,6 +410,7 @@ model Document {
   @@unique([projectId, path])
   @@index([projectId])
   @@index([source])
+  @@index([deletedAt])
   @@map("documents")
   @@schema("tenant_snipara")
 }
