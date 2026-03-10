@@ -91,6 +91,15 @@ TOOL_TIERS: dict[str, ToolTier] = {
     "rlm_task_claim": ToolTier.ADVANCED,
     "rlm_task_complete": ToolTier.ADVANCED,
     "rlm_tasks": ToolTier.ADVANCED,
+    # POWER_USER - Decision Log
+    "rlm_decision_create": ToolTier.POWER_USER,
+    "rlm_decision_query": ToolTier.POWER_USER,
+    "rlm_decision_supersede": ToolTier.POWER_USER,
+    # POWER_USER - Index Health & Analytics (Sprint 3)
+    "rlm_index_health": ToolTier.POWER_USER,
+    "rlm_index_recommendations": ToolTier.POWER_USER,
+    "rlm_search_analytics": ToolTier.POWER_USER,
+    "rlm_query_trends": ToolTier.POWER_USER,
 }
 
 
@@ -130,6 +139,11 @@ TOOL_DEFINITIONS: list[dict] = [
                     "type": "boolean",
                     "default": True,
                     "description": "Auto-decompose complex queries into sub-queries (Pro+ only). Complex queries (50+ words, multiple questions, comparisons) are automatically broken down and results merged. Set to False to disable.",
+                },
+                "include_all_tiers": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Include all context tiers including COLD and ARCHIVE. By default, searches only HOT and WARM tiers for faster, more relevant results.",
                 },
             },
             "required": ["query"],
@@ -1134,6 +1148,253 @@ Returns context_data (files + sections), setup_code (helper functions), and usag
                 },
             },
             "required": ["chunk_id"],
+        },
+    },
+    # ============ Decision Log Tools ============
+    {
+        "name": "rlm_decision_create",
+        "description": """Create a structured decision record (ADR-style) for architectural or technical decisions.
+
+Records decisions with context, rationale, alternatives considered, and revert plans.
+Auto-generates DEC-XXX IDs. Supports tags for categorization.
+
+Use for:
+- Architectural decisions (database choice, framework selection)
+- Technical trade-offs (performance vs maintainability)
+- Process decisions (deployment strategy, testing approach)""",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "Short title for the decision (e.g., 'Use Redis for caching')",
+                },
+                "owner": {
+                    "type": "string",
+                    "description": "Who made or is responsible for this decision",
+                },
+                "scope": {
+                    "type": "string",
+                    "description": "Scope/area affected (e.g., 'backend', 'authentication', 'database')",
+                },
+                "impact": {
+                    "type": "string",
+                    "enum": ["LOW", "MEDIUM", "HIGH", "CRITICAL"],
+                    "default": "MEDIUM",
+                    "description": "Impact level of this decision",
+                },
+                "context": {
+                    "type": "string",
+                    "description": "Background and context for why this decision was needed",
+                },
+                "decision": {
+                    "type": "string",
+                    "description": "The actual decision made (what was chosen)",
+                },
+                "rationale": {
+                    "type": "string",
+                    "description": "Why this option was chosen over alternatives",
+                },
+                "alternatives": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of alternatives that were considered",
+                },
+                "revert_plan": {
+                    "type": "string",
+                    "description": "How to revert this decision if needed (optional)",
+                },
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Tags for categorization (e.g., ['architecture', 'caching', 'performance'])",
+                },
+            },
+            "required": ["title", "owner", "scope", "context", "decision", "rationale"],
+        },
+    },
+    {
+        "name": "rlm_decision_query",
+        "description": """Query project decisions with filters.
+
+Search by status, impact, scope, tags, or text query.
+Returns decisions sorted by recency with supersession chain info.""",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Text search in title, context, decision, rationale",
+                },
+                "status": {
+                    "type": "string",
+                    "enum": ["ACTIVE", "SUPERSEDED", "REVERTED", "DRAFT"],
+                    "description": "Filter by decision status",
+                },
+                "impact": {
+                    "type": "string",
+                    "enum": ["LOW", "MEDIUM", "HIGH", "CRITICAL"],
+                    "description": "Filter by impact level",
+                },
+                "scope": {
+                    "type": "string",
+                    "description": "Filter by scope/area",
+                },
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Filter by tags (OR logic)",
+                },
+                "limit": {
+                    "type": "integer",
+                    "default": 10,
+                    "description": "Maximum decisions to return",
+                },
+                "include_superseded": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Include superseded decisions in results",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "rlm_decision_supersede",
+        "description": """Supersede an existing decision with a new one.
+
+Creates a new decision that replaces an old one, maintaining the chain of evolution.
+The old decision is marked as SUPERSEDED with a link to the new decision.""",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "old_decision_id": {
+                    "type": "string",
+                    "description": "The DEC-XXX ID of the decision being superseded",
+                },
+                "title": {
+                    "type": "string",
+                    "description": "Title for the new decision",
+                },
+                "owner": {
+                    "type": "string",
+                    "description": "Who made this new decision",
+                },
+                "scope": {
+                    "type": "string",
+                    "description": "Scope/area affected",
+                },
+                "impact": {
+                    "type": "string",
+                    "enum": ["LOW", "MEDIUM", "HIGH", "CRITICAL"],
+                    "description": "Impact level",
+                },
+                "context": {
+                    "type": "string",
+                    "description": "Why the original decision is being changed",
+                },
+                "decision": {
+                    "type": "string",
+                    "description": "The new decision",
+                },
+                "rationale": {
+                    "type": "string",
+                    "description": "Why this change is being made",
+                },
+                "alternatives": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Alternatives considered for the new decision",
+                },
+                "revert_plan": {
+                    "type": "string",
+                    "description": "How to revert this decision if needed",
+                },
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Tags for the new decision",
+                },
+            },
+            "required": ["old_decision_id", "title", "owner", "context", "decision", "rationale"],
+        },
+    },
+    # ============ Index Health & Analytics Tools (Sprint 3) ============
+    {
+        "name": "rlm_index_health",
+        "description": """Get comprehensive index health metrics for your project.
+
+Returns coverage, quality scores, tier distribution, stale document detection, and overall health score.
+Use this to monitor the health of your documentation index and identify issues.""",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "stale_threshold_days": {
+                    "type": "integer",
+                    "default": 30,
+                    "minimum": 1,
+                    "maximum": 365,
+                    "description": "Days after which content is considered stale",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "rlm_index_recommendations",
+        "description": """Get actionable recommendations to improve your index health.
+
+Returns prioritized list of recommendations based on current index health metrics.
+Recommendations include actions like reindexing, improving coverage, and reviewing quality.""",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+    {
+        "name": "rlm_search_analytics",
+        "description": """Get comprehensive search analytics for your project.
+
+Returns query counts, success rates, latency percentiles, tool usage breakdown,
+daily trends, and error analysis for the specified time period.""",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "days": {
+                    "type": "integer",
+                    "default": 30,
+                    "minimum": 1,
+                    "maximum": 90,
+                    "description": "Number of days to analyze",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "rlm_query_trends",
+        "description": """Get query trends over time with configurable granularity.
+
+Returns time-bucketed query counts, success rates, and latency for trend analysis.""",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "days": {
+                    "type": "integer",
+                    "default": 7,
+                    "minimum": 1,
+                    "maximum": 30,
+                    "description": "Number of days to analyze",
+                },
+                "granularity": {
+                    "type": "string",
+                    "enum": ["hour", "day"],
+                    "default": "hour",
+                    "description": "Time bucket granularity",
+                },
+            },
+            "required": [],
         },
     },
 ]

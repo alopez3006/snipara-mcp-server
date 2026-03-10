@@ -48,6 +48,7 @@ from .usage import (
     _is_demo_key,
     check_rate_limit,
     check_usage_limits,
+    clear_rate_limit,
     close_redis,
     get_demo_analytics,
     get_usage_stats,
@@ -695,6 +696,56 @@ async def demo_analytics(
 
     analytics = await get_demo_analytics()
     return {"success": True, "data": analytics}
+
+
+@app.post("/v1/admin/clear-rate-limit", tags=["Admin"])
+async def admin_clear_rate_limit(
+    project_slug: str = Query(description="Project slug to clear rate limits for"),
+    x_internal_secret: Annotated[str | None, Header(alias="X-Internal-Secret")] = None,
+):
+    """
+    Clear rate limits for all API keys associated with a project.
+
+    This admin endpoint removes rate limit counters from Redis, allowing
+    immediate recovery from rate limit exceeded states.
+
+    Requires X-Internal-Secret header for authentication.
+
+    Args:
+        project_slug: The project slug (e.g., "vutler")
+
+    Returns:
+        List of cleared API key IDs and count
+    """
+    if not settings.internal_api_secret:
+        raise HTTPException(status_code=500, detail="Internal API secret not configured")
+    if not x_internal_secret or x_internal_secret != settings.internal_api_secret:
+        raise HTTPException(status_code=401, detail="Invalid or missing internal secret")
+
+    db = await get_db()
+
+    # Find project by slug
+    project = await db.project.find_first(where={"slug": project_slug})
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project '{project_slug}' not found")
+
+    # Get all API keys for this project
+    api_keys = await db.apikey.find_many(where={"projectId": project.id})
+
+    cleared = []
+    for key in api_keys:
+        success = await clear_rate_limit(key.id)
+        if success:
+            cleared.append(key.id[:12] + "...")
+
+    logger.info(f"Admin cleared rate limits for project {project_slug}: {len(cleared)} keys")
+
+    return {
+        "success": True,
+        "project": project_slug,
+        "cleared_count": len(cleared),
+        "cleared_keys": cleared,
+    }
 
 
 @app.post("/v1/{project_id}/reindex", tags=["MCP"])

@@ -58,6 +58,36 @@ async def close_redis() -> None:
     _redis_available = None
 
 
+async def clear_rate_limit(api_key_id: str) -> bool:
+    """
+    Clear rate limit counter for a specific API key.
+
+    Args:
+        api_key_id: The API key ID to clear rate limits for
+
+    Returns:
+        True if cleared successfully, False if Redis unavailable
+    """
+    global _local_rate_limits
+
+    r = await get_redis()
+    if r is not None:
+        try:
+            key = f"rate_limit:{api_key_id}"
+            await r.delete(key)
+            logger.info(f"Cleared rate limit for {api_key_id[:12]}...")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to clear rate limit in Redis: {e}")
+
+    # Also clear in-memory fallback
+    if api_key_id in _local_rate_limits:
+        del _local_rate_limits[api_key_id]
+        logger.info(f"Cleared in-memory rate limit for {api_key_id[:12]}...")
+
+    return r is not None
+
+
 def _is_demo_key(api_key_id: str) -> bool:
     """Check if an API key ID is a demo key (public, stricter limits)."""
     if not settings.demo_api_key_ids:

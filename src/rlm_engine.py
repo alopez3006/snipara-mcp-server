@@ -277,6 +277,13 @@ READ_TOOLS = {
     ToolName.RLM_REPL_CONTEXT,
     # Phase 14: Pass-by-Reference
     ToolName.RLM_GET_CHUNK,
+    # Phase 15: Decision Log
+    ToolName.RLM_DECISION_QUERY,
+    # Phase 16: Index Health & Analytics (Sprint 3)
+    ToolName.RLM_INDEX_HEALTH,
+    ToolName.RLM_INDEX_RECOMMENDATIONS,
+    ToolName.RLM_SEARCH_ANALYTICS,
+    ToolName.RLM_QUERY_TRENDS,
 }
 
 # WRITE_TOOLS: Available to EDITOR and above
@@ -292,6 +299,9 @@ WRITE_TOOLS = {
     ToolName.RLM_STATE_SET,
     ToolName.RLM_BROADCAST,
     ToolName.RLM_TASK_COMPLETE,
+    # Phase 15: Decision Log
+    ToolName.RLM_DECISION_CREATE,
+    ToolName.RLM_DECISION_SUPERSEDE,
 }
 
 # ADMIN_TOOLS: Available to ADMIN only
@@ -773,7 +783,11 @@ class RLMEngine:
         return self._chunks_available
 
     async def _calculate_semantic_scores_from_chunks(
-        self, query: str, limit: int = 50, min_similarity: float = 0.3
+        self,
+        query: str,
+        limit: int = 50,
+        min_similarity: float = 0.3,
+        tier_filter: list[str] | None = None,
     ) -> dict[str, float]:
         """Calculate semantic scores using pre-computed chunk embeddings via pgvector.
 
@@ -784,6 +798,8 @@ class RLMEngine:
             query: The search query string.
             limit: Maximum number of chunks to retrieve.
             min_similarity: Minimum cosine similarity threshold (0-1).
+            tier_filter: Optional list of tiers to include (e.g., ["HOT", "WARM"]).
+                         If None, searches all tiers.
 
         Returns:
             Dictionary mapping section IDs to their semantic similarity scores (0-1).
@@ -802,6 +818,7 @@ class RLMEngine:
                 query=query,
                 limit=limit,
                 min_similarity=min_similarity,
+                tier_filter=tier_filter,
             )
 
             # Map chunk results back to section IDs by line overlap
@@ -906,6 +923,15 @@ class RLMEngine:
             ToolName.RLM_REPL_CONTEXT: self._handle_repl_context,
             # Phase 14: Pass-by-Reference
             ToolName.RLM_GET_CHUNK: self._handle_get_chunk,
+            # Phase 15: Decision Log
+            ToolName.RLM_DECISION_CREATE: self._handle_decision_create,
+            ToolName.RLM_DECISION_QUERY: self._handle_decision_query,
+            ToolName.RLM_DECISION_SUPERSEDE: self._handle_decision_supersede,
+            # Phase 16: Index Health & Search Analytics (Sprint 3)
+            ToolName.RLM_INDEX_HEALTH: self._handle_index_health,
+            ToolName.RLM_INDEX_RECOMMENDATIONS: self._handle_index_recommendations,
+            ToolName.RLM_SEARCH_ANALYTICS: self._handle_search_analytics,
+            ToolName.RLM_QUERY_TRENDS: self._handle_query_trends,
         }
 
         handler = handlers.get(tool)
@@ -1510,6 +1536,11 @@ class RLMEngine:
         # Disable by setting auto_decompose=False in params
         auto_decompose = params.get("auto_decompose", True)
 
+        # Tier filtering: by default only search HOT and WARM tiers
+        # Set include_all_tiers=True to include COLD and ARCHIVE
+        include_all_tiers = params.get("include_all_tiers", False)
+        tier_filter = None if include_all_tiers else ["HOT", "WARM"]
+
         # Check if we should auto-decompose this query (Pro+ only)
         decomposed = False
         sub_queries_used: list[str] = []
@@ -1762,9 +1793,69 @@ class RLMEngine:
             except Exception as e:
                 logger.warning(f"Failed to load shared context: {e}")
 
+        # ============ ACTIVE DECISIONS ============
+        # Auto-include active CRITICAL/HIGH impact decisions in context
+        # This ensures architectural decisions are always visible when querying
+        decision_sections: list[ContextSection] = []
+        decision_tokens = 0
+
+        try:
+            from src.engine.handlers.decisions import handle_decision_query
+            from src.models.decision import DecisionQueryParams
+
+            # Query active decisions with HIGH or CRITICAL impact
+            for impact in ["CRITICAL", "HIGH"]:
+                query_params = DecisionQueryParams(
+                    status="ACTIVE",
+                    impact=impact,
+                    limit=5,  # Max 5 per impact level
+                    include_superseded=False,
+                )
+                decision_result = await handle_decision_query(
+                    self.db, self.project_id, query_params
+                )
+
+                for decision in decision_result.decisions:
+                    # Format decision as context section
+                    decision_content = f"""**{decision.title}** (DEC-{decision.id[-3:]})
+Impact: {decision.impact} | Scope: {decision.scope} | Owner: {decision.owner}
+
+Context: {decision.context}
+
+Decision: {decision.decision}
+
+Rationale: {decision.rationale}"""
+
+                    if decision.alternatives:
+                        decision_content += f"\n\nAlternatives considered: {', '.join(decision.alternatives)}"
+
+                    section_tokens = count_tokens(decision_content)
+                    if decision_tokens + section_tokens <= remaining_budget * 0.1:  # Max 10% for decisions
+                        decision_sections.append(
+                            ContextSection(
+                                title=f"[DECISION:{decision.impact}] {decision.title}",
+                                content=decision_content,
+                                file="decisions",
+                                lines=(0, 0),
+                                relevance_score=1.0,  # Decisions always high priority
+                                token_count=section_tokens,
+                                truncated=False,
+                            )
+                        )
+                        decision_tokens += section_tokens
+
+            if decision_sections:
+                remaining_budget -= decision_tokens
+                logger.info(
+                    f"Loaded {len(decision_sections)} active decisions "
+                    f"({decision_tokens} tokens), {remaining_budget} tokens remaining"
+                )
+        except Exception as e:
+            logger.warning(f"Failed to load decisions for context: {e}")
+
         # ============ LOCAL PROJECT SCOPE ============
         # Score and rank sections from local project
-        scored_sections = await self._score_sections(query, search_mode)
+        scored_sections = await self._score_sections(query, search_mode, tier_filter=tier_filter)
 
         # ============ CONFIDENCE-BASED EXPANSION ============
         # If top results have low scores, expand token budget and add grounding.
@@ -1997,8 +2088,8 @@ class RLMEngine:
                 removed = selected_sections.pop()
                 total_tokens -= removed.token_count
 
-        # Build result - shared context sections come FIRST
-        all_sections = shared_context_sections + selected_sections
+        # Build result - shared context sections come FIRST, then decisions, then local
+        all_sections = shared_context_sections + decision_sections + selected_sections
         search_mode_downgraded = original_search_mode != search_mode
 
         # Include system instructions (custom from project or default)
@@ -2089,6 +2180,9 @@ class RLMEngine:
             shared_context_included=len(shared_context_sections) > 0,
             shared_context_tokens=shared_context_tokens,
             first_query_tips_included=is_first_query and session_context_included,
+            # Decision log metadata
+            decisions_included=len(decision_sections),
+            decision_tokens=decision_tokens,
             # Smart routing hints
             routing_recommendation=routing_decision.mode.value,
             routing_confidence=routing_decision.confidence,
@@ -2201,7 +2295,10 @@ class RLMEngine:
         return sections
 
     async def _score_sections(
-        self, query: str, search_mode: SearchMode
+        self,
+        query: str,
+        search_mode: SearchMode,
+        tier_filter: list[str] | None = None,
     ) -> list[tuple[Section, float]]:
         """
         Score sections by relevance to the query.
@@ -2213,7 +2310,17 @@ class RLMEngine:
 
         Uses pre-computed chunks with pgvector for fast semantic search when available,
         falling back to on-the-fly embedding generation if chunks don't exist.
+
+        Args:
+            query: The search query string.
+            search_mode: The search mode to use.
+            tier_filter: Optional list of tiers to include in semantic search.
+                         Defaults to ["HOT", "WARM"] to exclude cold/archived content.
+                         Pass None to include all tiers.
         """
+        # Default tier filter: exclude COLD and ARCHIVE for faster, more relevant results
+        if tier_filter is None:
+            tier_filter = ["HOT", "WARM"]
         if not self.index:
             return []
 
@@ -2311,9 +2418,12 @@ class RLMEngine:
             use_chunks = await self._has_precomputed_chunks()
 
             if use_chunks:
-                semantic_scores = await self._calculate_semantic_scores_from_chunks(query)
+                semantic_scores = await self._calculate_semantic_scores_from_chunks(
+                    query, tier_filter=tier_filter
+                )
                 logger.info(
-                    f"Using pre-computed chunks for semantic search (project: {self.project_id})"
+                    f"Using pre-computed chunks for semantic search (project: {self.project_id}, "
+                    f"tiers={tier_filter})"
                 )
             else:
                 semantic_scores = await self._calculate_semantic_scores(query)
@@ -2340,9 +2450,12 @@ class RLMEngine:
             use_chunks = await self._has_precomputed_chunks()
 
             if use_chunks:
-                semantic_scores = await self._calculate_semantic_scores_from_chunks(query)
+                semantic_scores = await self._calculate_semantic_scores_from_chunks(
+                    query, tier_filter=tier_filter
+                )
                 logger.info(
-                    f"Using pre-computed chunks for hybrid search (project: {self.project_id})"
+                    f"Using pre-computed chunks for hybrid search (project: {self.project_id}, "
+                    f"tiers={tier_filter})"
                 )
             else:
                 # Pre-filter to top keyword candidates to avoid embedding all sections.
@@ -6208,4 +6321,218 @@ print(f"[Snipara] {len(context.get('files', {}))} files loaded. Helpers: peek, g
             data=result.model_dump(),
             input_tokens=0,
             output_tokens=result.token_count,
+        )
+
+    # ============ PHASE 15: DECISION LOG HANDLERS ============
+
+    async def _handle_decision_create(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_decision_create - create a structured decision record.
+
+        Creates an ADR-style decision record with context, rationale, alternatives,
+        and revert plans. Auto-generates DEC-XXX IDs.
+        """
+        from src.engine.handlers.decisions import handle_decision_create
+        from src.models.decision import DecisionCreateParams
+
+        try:
+            create_params = DecisionCreateParams(
+                title=params.get("title", ""),
+                owner=params.get("owner", ""),
+                scope=params.get("scope", ""),
+                impact=params.get("impact", "MEDIUM"),
+                context=params.get("context", ""),
+                decision=params.get("decision", ""),
+                rationale=params.get("rationale", ""),
+                alternatives=params.get("alternatives", []),
+                revert_plan=params.get("revert_plan"),
+                tags=params.get("tags", []),
+            )
+
+            result = await handle_decision_create(self.db, self.project_id, create_params)
+
+            return ToolResult(
+                data=result.model_dump(),
+                input_tokens=count_tokens(params.get("context", "") + params.get("decision", "")),
+                output_tokens=count_tokens(result.model_dump_json()),
+            )
+        except ValueError as e:
+            return ToolResult(
+                data={"error": str(e)},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+    async def _handle_decision_query(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_decision_query - query project decisions with filters.
+
+        Search by status, impact, scope, tags, or text query.
+        """
+        from src.engine.handlers.decisions import handle_decision_query
+        from src.models.decision import DecisionQueryParams
+
+        query_params = DecisionQueryParams(
+            query=params.get("query"),
+            status=params.get("status"),
+            impact=params.get("impact"),
+            scope=params.get("scope"),
+            tags=params.get("tags"),
+            limit=params.get("limit", 10),
+            include_superseded=params.get("include_superseded", False),
+        )
+
+        result = await handle_decision_query(self.db, self.project_id, query_params)
+
+        return ToolResult(
+            data=result.model_dump(),
+            input_tokens=count_tokens(params.get("query", "")),
+            output_tokens=count_tokens(result.model_dump_json()),
+        )
+
+    async def _handle_decision_supersede(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_decision_supersede - supersede an existing decision with a new one.
+
+        Creates a new decision that replaces an old one, maintaining the chain of evolution.
+        """
+        from src.engine.handlers.decisions import handle_decision_supersede
+        from src.models.decision import DecisionCreateParams
+
+        old_decision_id = params.get("old_decision_id", "")
+        if not old_decision_id:
+            return ToolResult(
+                data={"error": "old_decision_id is required"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        try:
+            new_params = DecisionCreateParams(
+                title=params.get("title", ""),
+                owner=params.get("owner", ""),
+                scope=params.get("scope", ""),
+                impact=params.get("impact", "MEDIUM"),
+                context=params.get("context", ""),
+                decision=params.get("decision", ""),
+                rationale=params.get("rationale", ""),
+                alternatives=params.get("alternatives", []),
+                revert_plan=params.get("revert_plan"),
+                tags=params.get("tags", []),
+            )
+
+            result = await handle_decision_supersede(
+                self.db, self.project_id, old_decision_id, new_params
+            )
+
+            return ToolResult(
+                data=result.model_dump(),
+                input_tokens=count_tokens(params.get("context", "") + params.get("decision", "")),
+                output_tokens=count_tokens(result.model_dump_json()),
+            )
+        except ValueError as e:
+            return ToolResult(
+                data={"error": str(e)},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+    # =========================================================================
+    # Phase 16: Index Health & Search Analytics (Sprint 3)
+    # =========================================================================
+
+    async def _handle_index_health(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_index_health - get comprehensive index health metrics.
+
+        Returns coverage, tier distribution, quality scores, stale documents,
+        and overall health score for the project.
+        """
+        from src.services.index_health import compute_index_health
+
+        stale_threshold_days = params.get("stale_threshold_days", 30)
+
+        health = await compute_index_health(
+            self.db,
+            self.project_id,
+            stale_threshold_days=stale_threshold_days,
+        )
+
+        return ToolResult(
+            data=health.to_dict(),
+            input_tokens=0,
+            output_tokens=count_tokens(str(health.to_dict())),
+        )
+
+    async def _handle_index_recommendations(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_index_recommendations - get actionable recommendations.
+
+        Returns prioritized list of recommendations to improve index health.
+        """
+        from src.services.index_health import compute_index_health, get_index_recommendations
+
+        # Compute health first if not cached
+        health = await compute_index_health(self.db, self.project_id)
+        recommendations = await get_index_recommendations(self.db, self.project_id, health)
+
+        return ToolResult(
+            data={
+                "recommendations": recommendations,
+                "health_score": health.health_score,
+                "health_status": health.health_status,
+            },
+            input_tokens=0,
+            output_tokens=count_tokens(str(recommendations)),
+        )
+
+    async def _handle_search_analytics(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_search_analytics - get comprehensive search performance metrics.
+
+        Returns query counts, success rates, latency percentiles, tool usage,
+        daily trends, and error breakdown.
+        """
+        from src.services.search_analytics import compute_search_analytics
+
+        days = params.get("days", 30)
+
+        analytics = await compute_search_analytics(
+            self.db,
+            self.project_id,
+            days=days,
+        )
+
+        return ToolResult(
+            data=analytics.to_dict(),
+            input_tokens=0,
+            output_tokens=count_tokens(str(analytics.to_dict())),
+        )
+
+    async def _handle_query_trends(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_query_trends - get query volume trends over time.
+
+        Returns time-bucketed query statistics for visualization.
+        """
+        from src.services.search_analytics import get_query_trends
+
+        days = params.get("days", 7)
+        granularity = params.get("granularity", "hour")
+
+        trends = await get_query_trends(
+            self.db,
+            self.project_id,
+            days=days,
+            granularity=granularity,
+        )
+
+        return ToolResult(
+            data={
+                "trends": trends,
+                "granularity": granularity,
+                "period_days": days,
+            },
+            input_tokens=0,
+            output_tokens=count_tokens(str(trends)),
         )

@@ -66,6 +66,15 @@ class ToolName(StrEnum):
     RLM_REPL_CONTEXT = "rlm_repl_context"
     # Phase 14: Pass-by-Reference (reduce hallucination)
     RLM_GET_CHUNK = "rlm_get_chunk"
+    # Phase 15: Decision Log
+    RLM_DECISION_CREATE = "rlm_decision_create"
+    RLM_DECISION_QUERY = "rlm_decision_query"
+    RLM_DECISION_SUPERSEDE = "rlm_decision_supersede"
+    # Phase 16: Index Health & Search Analytics (Sprint 3)
+    RLM_INDEX_HEALTH = "rlm_index_health"
+    RLM_INDEX_RECOMMENDATIONS = "rlm_index_recommendations"
+    RLM_SEARCH_ANALYTICS = "rlm_search_analytics"
+    RLM_QUERY_TRENDS = "rlm_query_trends"
 
 
 class SearchMode(StrEnum):
@@ -149,3 +158,35 @@ class IndexJobStatus(StrEnum):
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+
+
+class ChunkTier(StrEnum):
+    """Tier for context optimization based on access patterns."""
+
+    HOT = "HOT"  # Accessed < 24h, high relevance (>0.7 avg)
+    WARM = "WARM"  # Accessed < 7d, medium relevance (default)
+    COLD = "COLD"  # Accessed < 30d, low relevance
+    ARCHIVE = "ARCHIVE"  # Accessed > 30d, rarely used
+
+    @classmethod
+    def from_str(cls, value: str) -> "ChunkTier":
+        """Convert string to ChunkTier enum."""
+        return cls(value.upper())
+
+
+class DecisionStatus(StrEnum):
+    """Status of a decision."""
+
+    ACTIVE = "ACTIVE"
+    SUPERSEDED = "SUPERSEDED"
+    REVERTED = "REVERTED"
+    DRAFT = "DRAFT"
+
+
+class DecisionImpact(StrEnum):
+    """Impact level of a decision."""
+
+    LOW = "LOW"
+    MEDIUM = "MEDIUM"
+    HIGH = "HIGH"
+    CRITICAL = "CRITICAL"
