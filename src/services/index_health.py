@@ -170,9 +170,10 @@ async def compute_index_health(
     )
 
     # Get documents with their chunk IDs (for counting)
+    # Note: Prisma Python doesn't support nested select in include, just use True
     docs_with_chunks = await db.document.find_many(
         where={"projectId": project_id, "deletedAt": None},
-        include={"chunks": {"select": {"id": True}}},
+        include={"chunks": True},
     )
 
     indexed_docs = sum(1 for d in docs_with_chunks if len(d.chunks) > 0)
