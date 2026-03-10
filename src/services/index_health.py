@@ -180,15 +180,9 @@ async def compute_index_health(
     unindexed_docs = total_docs - indexed_docs
 
     # Get all chunks for this project
+    # Note: Prisma Python doesn't support select like Prisma JS, just query all fields
     chunks = await db.documentchunk.find_many(
         where={"document": {"projectId": project_id, "deletedAt": None}},
-        select={
-            "id": True,
-            "tier": True,
-            "qualityScore": True,
-            "createdAt": True,
-            "documentId": True,
-        },
     )
 
     total_chunks = len(chunks)
