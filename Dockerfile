@@ -91,4 +91,4 @@ CMD ["gunicorn", "src.server:app", \
      "-b", "0.0.0.0:8000", \
      "--timeout", "120", \
      "--graceful-timeout", "30"]
-# Force rebuild Mon Feb 16 22:31:56 CET 2026
+# Force rebuild Tue Mar 11 11:55:00 CET 2026 - fix order_by
