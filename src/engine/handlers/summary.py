@@ -236,7 +236,7 @@ async def handle_get_summaries(
     summaries = await db.documentsummary.find_many(
         where=where_clause,
         include={"document": True},
-        order_by={"createdAt": "desc"},
+        order={"createdAt": "desc"},
     )
 
     # Build response

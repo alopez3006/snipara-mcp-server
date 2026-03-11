@@ -172,7 +172,7 @@ async def get_recent_events(
 
     events = await db.swarmevent.find_many(
         where=where,
-        order_by={"createdAt": "desc"},
+        order={"createdAt": "desc"},
         take=limit,
     )
 
@@ -275,7 +275,7 @@ async def _cleanup_old_events(swarm_id: str):
             # Find cutoff event
             events_to_keep = await db.swarmevent.find_many(
                 where={"swarmId": swarm_id},
-                order_by={"createdAt": "desc"},
+                order={"createdAt": "desc"},
                 take=MAX_EVENTS_PER_SWARM,
                 select={"id": True},
             )

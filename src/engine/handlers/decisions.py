@@ -99,7 +99,7 @@ async def handle_decision_query(
     # Query with count
     records = await db.projectdecision.find_many(
         where=where,
-        order_by={"createdAt": "desc"},
+        order={"createdAt": "desc"},
         take=params.limit + 1,  # +1 to check has_more
     )
 

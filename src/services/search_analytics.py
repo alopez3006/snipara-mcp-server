@@ -188,7 +188,7 @@ async def compute_search_analytics(
             "projectId": project_id,
             "createdAt": {"gte": period_start},
         },
-        order_by={"createdAt": "desc"},
+        order={"createdAt": "desc"},
     )
 
     total_queries = len(queries)
