@@ -1184,6 +1184,7 @@ async def list_tasks(
         where=where,
         order=[{"priority": "desc"}, {"createdAt": "asc"}],
         take=limit,
+        include={"agent": True},  # Include agent relation to get agentId
     )
 
     return {
@@ -1195,6 +1196,7 @@ async def list_tasks(
                 "status": t.status.lower(),
                 "priority": t.priority,
                 "depends_on": t.dependsOn,
+                "assigned_to": t.agent.agentId if t.agent else None,  # External agent ID
                 "created_at": t.createdAt.isoformat() if t.createdAt else None,
                 "deadline": t.dueAt.isoformat() if t.dueAt else None,
             }
