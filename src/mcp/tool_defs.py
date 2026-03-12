@@ -91,6 +91,7 @@ TOOL_TIERS: dict[str, ToolTier] = {
     "rlm_task_claim": ToolTier.ADVANCED,
     "rlm_task_complete": ToolTier.ADVANCED,
     "rlm_tasks": ToolTier.ADVANCED,
+    "rlm_agent_status": ToolTier.ADVANCED,  # Swarm agent discovery tool
     # POWER_USER - Decision Log
     "rlm_decision_create": ToolTier.POWER_USER,
     "rlm_decision_query": ToolTier.POWER_USER,
@@ -983,6 +984,32 @@ TOOL_DEFINITIONS: list[dict] = [
                 },
             },
             "required": ["swarm_id"],
+        },
+    },
+    {
+        "name": "rlm_agent_status",
+        "description": """Get swarm agent status with pending tasks and clear instructions.
+
+Call this at session start to discover tasks assigned to you. Returns:
+- Pending tasks assigned to your agent (use rlm_task_claim to start)
+- Active swarms you've joined
+- Current task you're working on (if any)
+- Clear instructions on what to do next
+
+This is THE discovery tool for swarm agents - tells you what work is waiting.""",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "swarm_id": {
+                    "type": "string",
+                    "description": "Swarm ID to check status for",
+                },
+                "agent_id": {
+                    "type": "string",
+                    "description": "Your agent identifier in the swarm",
+                },
+            },
+            "required": ["swarm_id", "agent_id"],
         },
     },
     # ============ Document Sync Tools ============

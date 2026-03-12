@@ -302,16 +302,19 @@ WRITE_TOOLS = {
     # Phase 15: Decision Log
     ToolName.RLM_DECISION_CREATE,
     ToolName.RLM_DECISION_SUPERSEDE,
-}
-
-# ADMIN_TOOLS: Available to ADMIN only
-ADMIN_TOOLS = {
-    ToolName.RLM_SWARM_CREATE,
+    # Swarm worker tools - agents need EDITOR to participate in swarms
     ToolName.RLM_SWARM_JOIN,
     ToolName.RLM_CLAIM,
     ToolName.RLM_RELEASE,
     ToolName.RLM_TASK_CREATE,
     ToolName.RLM_TASK_BULK_CREATE,
+    ToolName.RLM_AGENT_STATUS,  # Agents need EDITOR to check their status
+}
+
+# ADMIN_TOOLS: Available to ADMIN only
+# Only swarm creation and cross-project queries require ADMIN
+ADMIN_TOOLS = {
+    ToolName.RLM_SWARM_CREATE,
     ToolName.RLM_MULTI_PROJECT_QUERY,
 }
 
@@ -343,6 +346,7 @@ AGENT_TOOLS = {
     ToolName.RLM_TASK_BULK_CREATE,
     ToolName.RLM_TASK_CLAIM,
     ToolName.RLM_TASK_COMPLETE,
+    ToolName.RLM_AGENT_STATUS,
 }
 
 # Default system instructions injected into every query response
@@ -909,6 +913,7 @@ class RLMEngine:
             ToolName.RLM_TASK_CLAIM: self._handle_task_claim,
             ToolName.RLM_TASK_COMPLETE: self._handle_task_complete,
             ToolName.RLM_TASKS: self._handle_tasks,
+            ToolName.RLM_AGENT_STATUS: self._handle_agent_status,
             # Phase 10: Document Sync Tools
             ToolName.RLM_UPLOAD_DOCUMENT: self._handle_upload_document,
             ToolName.RLM_SYNC_DOCUMENTS: self._handle_sync_documents,
@@ -5204,6 +5209,118 @@ Rationale: {decision.rationale}"""
             assigned_to=assigned_to,
             limit=limit,
         )
+
+        return ToolResult(
+            data=result,
+            input_tokens=0,
+            output_tokens=count_tokens(str(result)),
+        )
+
+    async def _handle_agent_status(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_agent_status - get swarm agent status with pending tasks.
+
+        This is THE discovery tool for swarm agents. Call it at session start
+        to find out what work is waiting for you.
+
+        Args:
+            params: Dict containing:
+                - swarm_id: Swarm ID to check (required)
+                - agent_id: Your agent identifier (required)
+
+        Returns:
+            ToolResult with:
+                - pending_tasks: Tasks assigned to you waiting to be claimed
+                - current_task: Task you're currently working on (if any)
+                - swarm_info: Basic swarm information
+                - instructions: Clear instructions on what to do next
+        """
+        from .services.swarm import list_tasks, get_swarm_info
+
+        swarm_id = params.get("swarm_id", "")
+        agent_id = params.get("agent_id", "")
+
+        if not swarm_id or not agent_id:
+            missing = []
+            if not swarm_id:
+                missing.append("swarm_id")
+            if not agent_id:
+                missing.append("agent_id")
+            return ToolResult(
+                data={"error": f"rlm_agent_status: missing required parameter(s): {', '.join(missing)}"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        # Get swarm info
+        swarm_info = await get_swarm_info(swarm_id)
+        if not swarm_info:
+            return ToolResult(
+                data={"error": f"Swarm '{swarm_id}' not found"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        # Get tasks assigned to this agent (pending status)
+        pending_tasks = await list_tasks(
+            swarm_id=swarm_id,
+            status="pending",
+            assigned_to=agent_id,
+            limit=20,
+        )
+
+        # Get task this agent is currently working on (claimed status)
+        claimed_tasks = await list_tasks(
+            swarm_id=swarm_id,
+            status="claimed",
+            assigned_to=agent_id,
+            limit=5,
+        )
+
+        # Build clear instructions based on status
+        instructions = []
+        pending_list = pending_tasks.get("tasks", [])
+        claimed_list = claimed_tasks.get("tasks", [])
+
+        if claimed_list:
+            current_task = claimed_list[0]
+            instructions.append(
+                f"⚡ You have a task IN PROGRESS: '{current_task.get('title', 'Unknown')}'"
+            )
+            instructions.append(
+                "   → Complete it with: rlm_task_complete(swarm_id, agent_id, task_id, result)"
+            )
+        elif pending_list:
+            instructions.append(
+                f"📋 You have {len(pending_list)} pending task(s) assigned to you!"
+            )
+            for i, task in enumerate(pending_list[:3], 1):
+                instructions.append(f"   {i}. {task.get('title', 'Untitled')}")
+            instructions.append(
+                "   → Claim one with: rlm_task_claim(swarm_id, agent_id, task_id)"
+            )
+        else:
+            instructions.append("✅ No tasks assigned to you right now.")
+            instructions.append(
+                "   → Check for unassigned tasks with: rlm_tasks(swarm_id)"
+            )
+            instructions.append(
+                "   → Or claim any available task: rlm_task_claim(swarm_id, agent_id)"
+            )
+
+        result = {
+            "swarm": {
+                "id": swarm_info.get("id"),
+                "name": swarm_info.get("name"),
+                "description": swarm_info.get("description"),
+            },
+            "agent_id": agent_id,
+            "pending_tasks": pending_list,
+            "pending_count": len(pending_list),
+            "current_task": claimed_list[0] if claimed_list else None,
+            "has_work": len(pending_list) > 0 or len(claimed_list) > 0,
+            "instructions": "\n".join(instructions),
+        }
 
         return ToolResult(
             data=result,

@@ -52,6 +52,7 @@ class ToolName(StrEnum):
     RLM_TASK_CLAIM = "rlm_task_claim"
     RLM_TASK_COMPLETE = "rlm_task_complete"
     RLM_TASKS = "rlm_tasks"
+    RLM_AGENT_STATUS = "rlm_agent_status"  # Swarm agent status + pending tasks
     # Phase 10: Document Sync Tools
     RLM_UPLOAD_DOCUMENT = "rlm_upload_document"
     RLM_SYNC_DOCUMENTS = "rlm_sync_documents"
