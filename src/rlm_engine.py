@@ -5577,13 +5577,16 @@ Rationale: {decision.rationale}"""
                 )
             assigned_to_id = agent.id
 
-        # Update task assignment
+        # Update task assignment - use Prisma relation syntax
+        update_data: dict[str, Any] = {"status": "PENDING"}  # Reset to pending when reassigned
+        if assigned_to_id:
+            update_data["agent"] = {"connect": {"id": assigned_to_id}}
+        else:
+            update_data["agent"] = {"disconnect": True}
+
         updated = await db.swarmtask.update(
             where={"id": task_id},
-            data={
-                "assignedToId": assigned_to_id,
-                "status": "PENDING",  # Reset to pending when reassigned
-            },
+            data=update_data,
         )
 
         result = {
