@@ -92,6 +92,10 @@ TOOL_TIERS: dict[str, ToolTier] = {
     "rlm_task_complete": ToolTier.ADVANCED,
     "rlm_tasks": ToolTier.ADVANCED,
     "rlm_agent_status": ToolTier.ADVANCED,  # Swarm agent discovery tool
+    "rlm_swarm_leave": ToolTier.ADVANCED,  # Remove agent from swarm
+    "rlm_swarm_members": ToolTier.ADVANCED,  # List agents in swarm
+    "rlm_swarm_update": ToolTier.ADVANCED,  # Update swarm config (ADMIN)
+    "rlm_task_reassign": ToolTier.ADVANCED,  # Reassign task
     # POWER_USER - Decision Log
     "rlm_decision_create": ToolTier.POWER_USER,
     "rlm_decision_query": ToolTier.POWER_USER,
@@ -1010,6 +1014,140 @@ This is THE discovery tool for swarm agents - tells you what work is waiting."""
                 },
             },
             "required": ["swarm_id", "agent_id"],
+        },
+    },
+    {
+        "name": "rlm_swarm_leave",
+        "description": """Remove an agent from a swarm.
+
+Use this to:
+- Clean up inactive/crashed agents
+- Remove yourself from a swarm when done
+- Free up agent slots for others
+
+What happens on removal:
+1. All resource claims held by the agent are released
+2. Pending/claimed tasks assigned to the agent are unassigned
+3. The agent record is deleted from the swarm
+
+The agent can rejoin later with rlm_swarm_join.""",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "swarm_id": {
+                    "type": "string",
+                    "description": "Swarm ID",
+                },
+                "agent_id": {
+                    "type": "string",
+                    "description": "Agent ID to remove (can be yourself or another agent)",
+                },
+            },
+            "required": ["swarm_id", "agent_id"],
+        },
+    },
+    {
+        "name": "rlm_swarm_members",
+        "description": """List all agents in a swarm with their status.
+
+Returns each agent's:
+- agent_id: The agent's identifier
+- role: coordinator, worker, or observer
+- status: active, idle, busy
+- capabilities: What the agent can do
+- current_task: What they're working on (if any)
+- joined_at: When they joined
+
+Use this to:
+- See who's in the swarm
+- Find available agents for task assignment
+- Monitor agent activity""",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "swarm_id": {
+                    "type": "string",
+                    "description": "Swarm ID",
+                },
+            },
+            "required": ["swarm_id"],
+        },
+    },
+    {
+        "name": "rlm_swarm_update",
+        "description": """Update swarm configuration (requires ADMIN access).
+
+Updatable settings:
+- name: Swarm display name
+- description: What the swarm is for
+- max_agents: Maximum agents allowed (plan-limited)
+- task_timeout: Seconds before unclaimed task expires (60-3600)
+- claim_timeout: Seconds a resource claim lasts (60-7200)""",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "swarm_id": {
+                    "type": "string",
+                    "description": "Swarm ID to update",
+                },
+                "name": {
+                    "type": "string",
+                    "description": "New swarm name",
+                },
+                "description": {
+                    "type": "string",
+                    "description": "New description",
+                },
+                "max_agents": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 100,
+                    "description": "Maximum agents allowed",
+                },
+                "task_timeout": {
+                    "type": "integer",
+                    "minimum": 60,
+                    "maximum": 3600,
+                    "description": "Task claim timeout in seconds",
+                },
+                "claim_timeout": {
+                    "type": "integer",
+                    "minimum": 60,
+                    "maximum": 7200,
+                    "description": "Resource claim timeout in seconds",
+                },
+            },
+            "required": ["swarm_id"],
+        },
+    },
+    {
+        "name": "rlm_task_reassign",
+        "description": """Reassign a task to a different agent.
+
+Use this to:
+- Move work from a busy/stuck agent to an available one
+- Rebalance workload across agents
+- Recover tasks from crashed agents
+
+Only PENDING or CLAIMED tasks can be reassigned.
+IN_PROGRESS and COMPLETED tasks cannot be reassigned.""",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "swarm_id": {
+                    "type": "string",
+                    "description": "Swarm ID",
+                },
+                "task_id": {
+                    "type": "string",
+                    "description": "Task ID to reassign",
+                },
+                "new_agent_id": {
+                    "type": "string",
+                    "description": "Agent ID to assign the task to (or null to unassign)",
+                },
+            },
+            "required": ["swarm_id", "task_id"],
         },
     },
     # ============ Document Sync Tools ============

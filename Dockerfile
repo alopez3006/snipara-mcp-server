@@ -91,4 +91,4 @@ CMD ["gunicorn", "src.server:app", \
      "-b", "0.0.0.0:8000", \
      "--timeout", "120", \
      "--graceful-timeout", "30"]
-# Force rebuild Thu Mar 12 11:58:34 CET 2026 - add rlm_agent_status
+# Force rebuild Thu Mar 12 12:06:33 CET 2026 - add swarm tools

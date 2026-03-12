@@ -309,12 +309,16 @@ WRITE_TOOLS = {
     ToolName.RLM_TASK_CREATE,
     ToolName.RLM_TASK_BULK_CREATE,
     ToolName.RLM_AGENT_STATUS,  # Agents need EDITOR to check their status
+    ToolName.RLM_SWARM_LEAVE,  # Remove agent from swarm
+    ToolName.RLM_SWARM_MEMBERS,  # List swarm agents
+    ToolName.RLM_TASK_REASSIGN,  # Reassign tasks
 }
 
 # ADMIN_TOOLS: Available to ADMIN only
-# Only swarm creation and cross-project queries require ADMIN
+# Only swarm creation, config updates, and cross-project queries require ADMIN
 ADMIN_TOOLS = {
     ToolName.RLM_SWARM_CREATE,
+    ToolName.RLM_SWARM_UPDATE,  # Config changes require admin
     ToolName.RLM_MULTI_PROJECT_QUERY,
 }
 
@@ -347,6 +351,10 @@ AGENT_TOOLS = {
     ToolName.RLM_TASK_CLAIM,
     ToolName.RLM_TASK_COMPLETE,
     ToolName.RLM_AGENT_STATUS,
+    ToolName.RLM_SWARM_LEAVE,
+    ToolName.RLM_SWARM_MEMBERS,
+    ToolName.RLM_SWARM_UPDATE,
+    ToolName.RLM_TASK_REASSIGN,
 }
 
 # Default system instructions injected into every query response
@@ -914,6 +922,10 @@ class RLMEngine:
             ToolName.RLM_TASK_COMPLETE: self._handle_task_complete,
             ToolName.RLM_TASKS: self._handle_tasks,
             ToolName.RLM_AGENT_STATUS: self._handle_agent_status,
+            ToolName.RLM_SWARM_LEAVE: self._handle_swarm_leave,
+            ToolName.RLM_SWARM_MEMBERS: self._handle_swarm_members,
+            ToolName.RLM_SWARM_UPDATE: self._handle_swarm_update,
+            ToolName.RLM_TASK_REASSIGN: self._handle_task_reassign,
             # Phase 10: Document Sync Tools
             ToolName.RLM_UPLOAD_DOCUMENT: self._handle_upload_document,
             ToolName.RLM_SYNC_DOCUMENTS: self._handle_sync_documents,
@@ -5320,6 +5332,259 @@ Rationale: {decision.rationale}"""
             "current_task": claimed_list[0] if claimed_list else None,
             "has_work": len(pending_list) > 0 or len(claimed_list) > 0,
             "instructions": "\n".join(instructions),
+        }
+
+        return ToolResult(
+            data=result,
+            input_tokens=0,
+            output_tokens=count_tokens(str(result)),
+        )
+
+    async def _handle_swarm_leave(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_swarm_leave - remove an agent from a swarm.
+
+        Args:
+            params: Dict containing:
+                - swarm_id: Swarm ID (required)
+                - agent_id: Agent ID to remove (required)
+
+        Returns:
+            ToolResult with removal status
+        """
+        from .services.swarm import leave_swarm
+
+        swarm_id = params.get("swarm_id", "")
+        agent_id = params.get("agent_id", "")
+
+        if not swarm_id or not agent_id:
+            missing = []
+            if not swarm_id:
+                missing.append("swarm_id")
+            if not agent_id:
+                missing.append("agent_id")
+            return ToolResult(
+                data={"error": f"rlm_swarm_leave: missing required parameter(s): {', '.join(missing)}"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        result = await leave_swarm(swarm_id=swarm_id, agent_id=agent_id)
+
+        return ToolResult(
+            data=result,
+            input_tokens=0,
+            output_tokens=count_tokens(str(result)),
+        )
+
+    async def _handle_swarm_members(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_swarm_members - list all agents in a swarm.
+
+        Args:
+            params: Dict containing:
+                - swarm_id: Swarm ID (required)
+
+        Returns:
+            ToolResult with list of agents
+        """
+        from .services.swarm import get_swarm_info
+
+        swarm_id = params.get("swarm_id", "")
+
+        if not swarm_id:
+            return ToolResult(
+                data={"error": "rlm_swarm_members: missing required parameter 'swarm_id'"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        swarm_info = await get_swarm_info(swarm_id)
+        if not swarm_info:
+            return ToolResult(
+                data={"error": f"Swarm '{swarm_id}' not found"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        # Get agents list from swarm info
+        agents = swarm_info.get("agents", [])
+
+        result = {
+            "swarm_id": swarm_id,
+            "swarm_name": swarm_info.get("name"),
+            "agent_count": len(agents),
+            "max_agents": swarm_info.get("maxAgents", 10),
+            "agents": agents,
+        }
+
+        return ToolResult(
+            data=result,
+            input_tokens=0,
+            output_tokens=count_tokens(str(result)),
+        )
+
+    async def _handle_swarm_update(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_swarm_update - update swarm configuration.
+
+        Args:
+            params: Dict containing:
+                - swarm_id: Swarm ID (required)
+                - name: New name (optional)
+                - description: New description (optional)
+                - max_agents: New max agents (optional)
+                - task_timeout: New task timeout (optional)
+                - claim_timeout: New claim timeout (optional)
+
+        Returns:
+            ToolResult with updated swarm info
+        """
+        swarm_id = params.get("swarm_id", "")
+
+        if not swarm_id:
+            return ToolResult(
+                data={"error": "rlm_swarm_update: missing required parameter 'swarm_id'"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        # Build update data from params
+        update_data = {}
+        if "name" in params:
+            update_data["name"] = params["name"]
+        if "description" in params:
+            update_data["description"] = params["description"]
+        if "max_agents" in params:
+            update_data["maxAgents"] = params["max_agents"]
+        if "task_timeout" in params:
+            update_data["taskTimeout"] = params["task_timeout"]
+        if "claim_timeout" in params:
+            update_data["claimTimeout"] = params["claim_timeout"]
+
+        if not update_data:
+            return ToolResult(
+                data={"error": "rlm_swarm_update: no fields to update provided"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        db = await get_db()
+
+        # Update swarm
+        try:
+            updated = await db.agentswarm.update(
+                where={"id": swarm_id},
+                data=update_data,
+            )
+
+            result = {
+                "success": True,
+                "swarm_id": swarm_id,
+                "updated_fields": list(update_data.keys()),
+                "swarm": {
+                    "id": updated.id,
+                    "name": updated.name,
+                    "description": updated.description,
+                    "maxAgents": updated.maxAgents,
+                    "taskTimeout": updated.taskTimeout,
+                    "claimTimeout": updated.claimTimeout,
+                },
+            }
+        except Exception as e:
+            result = {"error": f"Failed to update swarm: {str(e)}"}
+
+        return ToolResult(
+            data=result,
+            input_tokens=0,
+            output_tokens=count_tokens(str(result)),
+        )
+
+    async def _handle_task_reassign(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_task_reassign - reassign a task to a different agent.
+
+        Args:
+            params: Dict containing:
+                - swarm_id: Swarm ID (required)
+                - task_id: Task ID to reassign (required)
+                - new_agent_id: Agent to assign to (optional, null to unassign)
+
+        Returns:
+            ToolResult with reassignment status
+        """
+        swarm_id = params.get("swarm_id", "")
+        task_id = params.get("task_id", "")
+        new_agent_id = params.get("new_agent_id")
+
+        if not swarm_id or not task_id:
+            missing = []
+            if not swarm_id:
+                missing.append("swarm_id")
+            if not task_id:
+                missing.append("task_id")
+            return ToolResult(
+                data={"error": f"rlm_task_reassign: missing required parameter(s): {', '.join(missing)}"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        db = await get_db()
+
+        # Get the task
+        task = await db.swarmtask.find_first(
+            where={"id": task_id, "swarmId": swarm_id}
+        )
+
+        if not task:
+            return ToolResult(
+                data={"error": f"Task '{task_id}' not found in swarm '{swarm_id}'"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        # Check task status - can only reassign PENDING or CLAIMED tasks
+        if task.status not in ["PENDING", "CLAIMED"]:
+            return ToolResult(
+                data={"error": f"Cannot reassign task with status '{task.status}'. Only PENDING or CLAIMED tasks can be reassigned."},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        # If assigning to a new agent, verify agent exists in swarm
+        assigned_to_id = None
+        if new_agent_id:
+            agent = await db.swarmagent.find_first(
+                where={"swarmId": swarm_id, "agentId": new_agent_id}
+            )
+            if not agent:
+                return ToolResult(
+                    data={"error": f"Agent '{new_agent_id}' not found in swarm '{swarm_id}'"},
+                    input_tokens=0,
+                    output_tokens=0,
+                )
+            assigned_to_id = agent.id
+
+        # Update task assignment
+        updated = await db.swarmtask.update(
+            where={"id": task_id},
+            data={
+                "assignedToId": assigned_to_id,
+                "status": "PENDING",  # Reset to pending when reassigned
+            },
+        )
+
+        result = {
+            "success": True,
+            "task_id": task_id,
+            "previous_status": task.status,
+            "new_status": "PENDING",
+            "assigned_to": new_agent_id or "(unassigned)",
+            "task": {
+                "id": updated.id,
+                "title": updated.title,
+                "status": updated.status,
+            },
         }
 
         return ToolResult(

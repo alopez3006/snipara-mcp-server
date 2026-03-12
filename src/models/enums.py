@@ -53,6 +53,10 @@ class ToolName(StrEnum):
     RLM_TASK_COMPLETE = "rlm_task_complete"
     RLM_TASKS = "rlm_tasks"
     RLM_AGENT_STATUS = "rlm_agent_status"  # Swarm agent status + pending tasks
+    RLM_SWARM_LEAVE = "rlm_swarm_leave"  # Remove agent from swarm
+    RLM_SWARM_MEMBERS = "rlm_swarm_members"  # List agents in swarm
+    RLM_SWARM_UPDATE = "rlm_swarm_update"  # Update swarm config
+    RLM_TASK_REASSIGN = "rlm_task_reassign"  # Reassign task to different agent
     # Phase 10: Document Sync Tools
     RLM_UPLOAD_DOCUMENT = "rlm_upload_document"
     RLM_SYNC_DOCUMENTS = "rlm_sync_documents"
