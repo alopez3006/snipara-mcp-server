@@ -1283,9 +1283,9 @@ async def get_task_stats(swarm_id: str) -> dict[str, Any]:
     db = await get_db()
 
     # Get all tasks for this swarm
+    # Note: Python Prisma doesn't support 'select', fetch all fields
     tasks = await db.swarmtask.find_many(
         where={"swarmId": swarm_id},
-        select={"id": True, "status": True, "dependsOn": True},
     )
 
     # Count by status
