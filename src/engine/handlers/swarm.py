@@ -25,8 +25,11 @@ from ...services.swarm import (
     create_swarm,
     create_task,
     get_state,
+    get_task_events,
+    get_task_stats,
     join_swarm,
     list_tasks,
+    list_tasks_enhanced,
     release_claim,
     set_state,
 )
@@ -563,6 +566,118 @@ async def handle_tasks(
         swarm_id=swarm_id,
         status=status,
         assigned_to=assigned_to,
+        limit=limit,
+    )
+
+    return ToolResult(
+        data=result,
+        input_tokens=0,
+        output_tokens=count_tokens(str(result)),
+    )
+
+
+async def handle_task_list(
+    params: dict[str, Any],
+    ctx: HandlerContext,
+) -> ToolResult:
+    """List tasks with cursor-based pagination.
+
+    Args:
+        params: Dict containing:
+            - swarm_id: Swarm ID (required)
+            - status: Optional filter by status (pending, in_progress, completed, failed, cancelled)
+            - limit: Max tasks to return (default 50, max 100)
+            - cursor: Cursor for pagination (task ID to start after)
+
+    Returns:
+        ToolResult with tasks: [{id, status, updated_at, owner}], has_more, next_cursor
+    """
+    swarm_id = params.get("swarm_id", "")
+    status = params.get("status")
+    limit = params.get("limit", 50)
+    cursor = params.get("cursor")
+
+    if not swarm_id:
+        return ToolResult(
+            data={"error": "rlm_task_list: missing required parameter 'swarm_id'"},
+            input_tokens=0,
+            output_tokens=0,
+        )
+
+    result = await list_tasks_enhanced(
+        swarm_id=swarm_id,
+        status=status,
+        limit=limit,
+        cursor=cursor,
+    )
+
+    return ToolResult(
+        data=result,
+        input_tokens=0,
+        output_tokens=count_tokens(str(result)),
+    )
+
+
+async def handle_task_stats(
+    params: dict[str, Any],
+    ctx: HandlerContext,
+) -> ToolResult:
+    """Get aggregated task statistics for a swarm.
+
+    Args:
+        params: Dict containing:
+            - swarm_id: Swarm ID (required)
+
+    Returns:
+        ToolResult with {done, in_progress, blocked, pending, failed, cancelled, total}
+    """
+    swarm_id = params.get("swarm_id", "")
+
+    if not swarm_id:
+        return ToolResult(
+            data={"error": "rlm_task_stats: missing required parameter 'swarm_id'"},
+            input_tokens=0,
+            output_tokens=0,
+        )
+
+    result = await get_task_stats(swarm_id=swarm_id)
+
+    return ToolResult(
+        data=result,
+        input_tokens=0,
+        output_tokens=count_tokens(str(result)),
+    )
+
+
+async def handle_task_events(
+    params: dict[str, Any],
+    ctx: HandlerContext,
+) -> ToolResult:
+    """Get task status change events for a swarm.
+
+    Args:
+        params: Dict containing:
+            - swarm_id: Swarm ID (required)
+            - since: ISO timestamp - only return events after this time
+            - limit: Max events to return (default 100)
+
+    Returns:
+        ToolResult with task events: [{event_id, event_type, task_id, timestamp}]
+    """
+    swarm_id = params.get("swarm_id", "")
+    since = params.get("since")
+    limit = params.get("limit", 100)
+
+    if not swarm_id:
+        return ToolResult(
+            data={"error": "rlm_task_events: missing required parameter 'swarm_id'"},
+            input_tokens=0,
+            output_tokens=0,
+        )
+
+    result = await get_task_events(
+        swarm_id=swarm_id,
+        since=since,
         limit=limit,
     )
 

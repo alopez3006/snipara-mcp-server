@@ -52,6 +52,9 @@ class ToolName(StrEnum):
     RLM_TASK_CLAIM = "rlm_task_claim"
     RLM_TASK_COMPLETE = "rlm_task_complete"
     RLM_TASKS = "rlm_tasks"
+    RLM_TASK_LIST = "rlm_task_list"  # Enhanced list with cursor pagination
+    RLM_TASK_STATS = "rlm_task_stats"  # Aggregated task counts by status
+    RLM_TASK_EVENTS = "rlm_task_events"  # Task status change events
     RLM_AGENT_STATUS = "rlm_agent_status"  # Swarm agent status + pending tasks
     RLM_SWARM_LEAVE = "rlm_swarm_leave"  # Remove agent from swarm
     RLM_SWARM_MEMBERS = "rlm_swarm_members"  # List agents in swarm

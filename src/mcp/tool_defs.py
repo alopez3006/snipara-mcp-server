@@ -91,6 +91,9 @@ TOOL_TIERS: dict[str, ToolTier] = {
     "rlm_task_claim": ToolTier.ADVANCED,
     "rlm_task_complete": ToolTier.ADVANCED,
     "rlm_tasks": ToolTier.ADVANCED,
+    "rlm_task_list": ToolTier.ADVANCED,  # Enhanced list with cursor pagination
+    "rlm_task_stats": ToolTier.ADVANCED,  # Aggregated task counts by status
+    "rlm_task_events": ToolTier.ADVANCED,  # Task status change events
     "rlm_agent_status": ToolTier.ADVANCED,  # Swarm agent discovery tool
     "rlm_swarm_leave": ToolTier.ADVANCED,  # Remove agent from swarm
     "rlm_swarm_members": ToolTier.ADVANCED,  # List agents in swarm
@@ -985,6 +988,91 @@ TOOL_DEFINITIONS: list[dict] = [
                     "minimum": 1,
                     "maximum": 100,
                     "description": "Maximum tasks to return",
+                },
+            },
+            "required": ["swarm_id"],
+        },
+    },
+    {
+        "name": "rlm_task_list",
+        "description": """List tasks with cursor-based pagination for efficient iteration.
+
+Enhanced version of rlm_tasks with:
+- Cursor-based pagination for large task queues
+- Returns owner (agent who claimed/completed)
+- Updated_at timestamp for ordering
+
+Use for building dashboards and progress reports.""",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "swarm_id": {"type": "string", "description": "Swarm ID"},
+                "status": {
+                    "type": "string",
+                    "enum": ["pending", "claimed", "completed", "failed", "cancelled"],
+                    "description": "Filter by task status",
+                },
+                "limit": {
+                    "type": "integer",
+                    "default": 50,
+                    "minimum": 1,
+                    "maximum": 100,
+                    "description": "Maximum tasks to return",
+                },
+                "cursor": {
+                    "type": "string",
+                    "description": "Cursor for pagination (from previous response)",
+                },
+            },
+            "required": ["swarm_id"],
+        },
+    },
+    {
+        "name": "rlm_task_stats",
+        "description": """Get aggregated task statistics for a swarm.
+
+Returns counts by status:
+- done: Completed tasks
+- in_progress: Currently claimed tasks
+- blocked: Pending tasks with unmet dependencies
+- pending: Ready tasks waiting to be claimed
+- failed: Failed tasks
+- cancelled: Cancelled tasks
+- total: Total task count
+
+This is the source of truth for swarm progress tracking.""",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "swarm_id": {"type": "string", "description": "Swarm ID"},
+            },
+            "required": ["swarm_id"],
+        },
+    },
+    {
+        "name": "rlm_task_events",
+        "description": """Get task status change events for a swarm.
+
+Filters to task-related events:
+- task_created, task_claimed, task_completed, task_failed, task_cancelled
+
+Use with 'since' parameter to get incremental updates for
+calculating "tasks closed since last check".""",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "swarm_id": {"type": "string", "description": "Swarm ID"},
+                "since": {
+                    "type": "string",
+                    "format": "date-time",
+                    "description": "Only return events after this timestamp (ISO 8601)",
+                },
+                "limit": {
+                    "type": "integer",
+                    "default": 100,
+                    "minimum": 1,
+                    "maximum": 500,
+                    "description": "Maximum events to return",
                 },
             },
             "required": ["swarm_id"],

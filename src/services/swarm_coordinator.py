@@ -1206,6 +1206,132 @@ async def list_tasks(
     }
 
 
+async def list_tasks_enhanced(
+    swarm_id: str,
+    status: str | None = None,
+    limit: int = 50,
+    cursor: str | None = None,
+) -> dict[str, Any]:
+    """List tasks in a swarm with cursor-based pagination.
+
+    Args:
+        swarm_id: The swarm ID
+        status: Filter by status (pending, in_progress, completed, failed, cancelled)
+        limit: Maximum tasks to return (default 50, max 100)
+        cursor: Cursor for pagination (task ID to start after)
+
+    Returns:
+        Dict with tasks list, pagination info
+    """
+    db = await get_db()
+
+    # Clamp limit
+    limit = min(max(1, limit), 100)
+
+    where: dict[str, Any] = {"swarmId": swarm_id}
+
+    if status:
+        where["status"] = status.upper()
+
+    # Cursor-based pagination
+    if cursor:
+        where["id"] = {"gt": cursor}
+
+    tasks = await db.swarmtask.find_many(
+        where=where,
+        order=[{"createdAt": "asc"}, {"id": "asc"}],
+        take=limit + 1,  # Fetch one extra to check if there's more
+        include={"agent": True},
+    )
+
+    # Check if there are more results
+    has_more = len(tasks) > limit
+    if has_more:
+        tasks = tasks[:limit]
+
+    # Get next cursor
+    next_cursor = tasks[-1].id if tasks and has_more else None
+
+    return {
+        "tasks": [
+            {
+                "id": t.id,
+                "title": t.title,
+                "status": t.status.lower() if hasattr(t.status, "lower") else str(t.status).lower(),
+                "updated_at": (t.completedAt or t.startedAt or t.createdAt).isoformat()
+                if (t.completedAt or t.startedAt or t.createdAt)
+                else None,
+                "owner": t.agent.agentId if t.agent else None,
+            }
+            for t in tasks
+        ],
+        "total": len(tasks),
+        "has_more": has_more,
+        "next_cursor": next_cursor,
+    }
+
+
+async def get_task_stats(swarm_id: str) -> dict[str, Any]:
+    """Get aggregated task statistics for a swarm.
+
+    Args:
+        swarm_id: The swarm ID
+
+    Returns:
+        Dict with counts by status: done, in_progress, blocked, pending
+    """
+    db = await get_db()
+
+    # Get all tasks for this swarm
+    tasks = await db.swarmtask.find_many(
+        where={"swarmId": swarm_id},
+        select={"id": True, "status": True, "dependsOn": True},
+    )
+
+    # Count by status
+    counts = {
+        "done": 0,  # COMPLETED
+        "in_progress": 0,  # IN_PROGRESS or CLAIMED
+        "blocked": 0,  # PENDING with unmet dependencies
+        "pending": 0,  # PENDING with no dependencies or all deps complete
+        "failed": 0,  # FAILED
+        "cancelled": 0,  # CANCELLED
+    }
+
+    # Get completed task IDs for dependency checking
+    completed_ids = {t.id for t in tasks if str(t.status).upper() == "COMPLETED"}
+
+    for task in tasks:
+        status = str(task.status).upper()
+
+        if status == "COMPLETED":
+            counts["done"] += 1
+        elif status == "FAILED":
+            counts["failed"] += 1
+        elif status == "CANCELLED":
+            counts["cancelled"] += 1
+        elif status in ("IN_PROGRESS", "CLAIMED"):
+            counts["in_progress"] += 1
+        elif status == "PENDING":
+            # Check if blocked by dependencies
+            deps = task.dependsOn or []
+            if deps and not all(dep_id in completed_ids for dep_id in deps):
+                counts["blocked"] += 1
+            else:
+                counts["pending"] += 1
+
+    return {
+        "swarm_id": swarm_id,
+        "done": counts["done"],
+        "in_progress": counts["in_progress"],
+        "blocked": counts["blocked"],
+        "pending": counts["pending"],
+        "failed": counts["failed"],
+        "cancelled": counts["cancelled"],
+        "total": len(tasks),
+    }
+
+
 async def _get_available_task(swarm_id: str, agent_db_id: str | None = None):
     """Get highest priority task with all dependencies completed.
 

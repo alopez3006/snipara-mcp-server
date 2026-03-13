@@ -13,9 +13,11 @@ from .swarm_coordinator import (
     create_task,
     get_state,
     get_swarm_info,
+    get_task_stats,
     join_swarm,
     leave_swarm,
     list_tasks,
+    list_tasks_enhanced,
     release_claim,
     set_state,
 )
@@ -26,6 +28,7 @@ from .swarm_events import (
     broadcast_state_event,
     broadcast_task_event,
     get_recent_events,
+    get_task_events,
     subscribe_to_swarm,
     unsubscribe_from_swarm,
 )
@@ -45,6 +48,8 @@ __all__ = [
     "claim_task",
     "complete_task",
     "list_tasks",
+    "list_tasks_enhanced",
+    "get_task_stats",
     # Event functions
     "broadcast_event",
     "broadcast_task_event",
@@ -52,6 +57,7 @@ __all__ = [
     "broadcast_agent_event",
     "broadcast_state_event",
     "get_recent_events",
+    "get_task_events",
     "subscribe_to_swarm",
     "unsubscribe_from_swarm",
 ]

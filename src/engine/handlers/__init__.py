@@ -6,6 +6,7 @@ This package contains extracted tool handlers organized by domain:
 - session: Session context management (inject, context, clear_context)
 - summary: Summary storage (store_summary, get_summaries, delete_summary)
 - document: Document management (upload_document, sync_documents, settings, request_access)
+- decisions: Decision log (decision_create, decision_query, decision_supersede)
 
 Each handler is a standalone async function that takes:
 - params: dict[str, Any] - Tool parameters from MCP call
@@ -50,7 +51,15 @@ from .swarm import (
     handle_task_claim,
     handle_task_complete,
     handle_task_create,
+    handle_task_events,
+    handle_task_list,
+    handle_task_stats,
     handle_tasks,
+)
+from .decisions import (
+    handle_decision_create,
+    handle_decision_query,
+    handle_decision_supersede,
 )
 
 __all__ = [
@@ -76,6 +85,9 @@ __all__ = [
     "handle_task_claim",
     "handle_task_complete",
     "handle_tasks",
+    "handle_task_list",
+    "handle_task_stats",
+    "handle_task_events",
     # Session handlers
     "handle_inject",
     "handle_context",
@@ -89,4 +101,8 @@ __all__ = [
     "handle_sync_documents",
     "handle_settings",
     "handle_request_access",
+    # Decision handlers
+    "handle_decision_create",
+    "handle_decision_query",
+    "handle_decision_supersede",
 ]
