@@ -52,6 +52,7 @@ class SharedDocument:
     slug: str
     content: str
     category: DocumentCategory
+    is_mandatory: bool  # Non-negotiable rule flag
     tags: list[str]
     priority: int  # Within-category priority
     token_count: int
@@ -117,6 +118,7 @@ async def load_team_context_for_project(project_id: str) -> list[SharedDocument]
             slug=ctx.key,
             content=ctx.value,
             category=DocumentCategory.BEST_PRACTICES,
+            is_mandatory=False,
             tags=[],
             priority=ctx.priority,
             token_count=token_count,
@@ -198,6 +200,7 @@ async def load_project_shared_context(project_id: str) -> SharedContext:
                 slug=doc.slug,
                 content=doc.content,
                 category=category,
+                is_mandatory=getattr(doc, "isMandatory", False),
                 tags=doc.tags or [],
                 priority=doc.priority,
                 token_count=doc.tokenCount,
@@ -264,6 +267,7 @@ def _truncate_document(doc: SharedDocument, max_tokens: int) -> SharedDocument:
         slug=doc.slug,
         content=truncated,
         category=doc.category,
+        is_mandatory=doc.is_mandatory,
         tags=doc.tags,
         priority=doc.priority,
         token_count=len(truncated) // 4,
@@ -604,6 +608,16 @@ async def get_shared_prompt_templates(
     return templates
 
 
+async def _get_user_team_ids(user_id: str) -> list[str]:
+    """Get all team IDs where the user is a member."""
+    db = await get_db()
+    memberships = await db.teammember.find_many(
+        where={"userId": user_id},
+        select={"teamId": True},
+    )
+    return [m.teamId for m in memberships]
+
+
 async def list_shared_collections(
     user_id: str,
     include_public: bool = True,
@@ -625,20 +639,28 @@ async def list_shared_collections(
     """
     db = await get_db()
 
+    # First, get all team IDs where user is a member
+    user_team_ids = await _get_user_team_ids(user_id)
+
     # Build the OR conditions for access
-    or_conditions = [
+    or_conditions: list[dict] = [
         {"ownerId": user_id},
-        {"team": {"members": {"some": {"userId": user_id}}}},
     ]
+
+    # Add team access condition if user is in any teams
+    if user_team_ids:
+        or_conditions.append({"teamId": {"in": user_team_ids}})
 
     if include_public:
         or_conditions.append({"isPublic": True})
 
+    # Query collections without _count (not supported in prisma-client-py)
     collections = await db.sharedcontextcollection.find_many(
         where={"OR": or_conditions},
         include={
             "team": {"select": {"name": True}},
-            "_count": {"select": {"documents": True, "projectLinks": True}},
+            "documents": {"select": {"id": True}},
+            "projectLinks": {"select": {"id": True}},
         },
         order={"updatedAt": "desc"},
     )
@@ -648,10 +670,14 @@ async def list_shared_collections(
         # Determine access type for clarity
         if col.ownerId == user_id:
             access_type = "owner"
-        elif col.teamId:
+        elif col.teamId and col.teamId in user_team_ids:
             access_type = "team_member"
         else:
             access_type = "public"
+
+        # Count documents and project links manually
+        doc_count = len(col.documents) if col.documents else 0
+        project_count = len(col.projectLinks) if col.projectLinks else 0
 
         result.append(
             {
@@ -662,8 +688,8 @@ async def list_shared_collections(
                 "scope": col.scope,
                 "is_public": col.isPublic,
                 "team_name": col.team.name if col.team else None,
-                "document_count": col._count["documents"] if col._count else 0,
-                "project_count": col._count["projectLinks"] if col._count else 0,
+                "document_count": doc_count,
+                "project_count": project_count,
                 "access_type": access_type,
                 "version": col.version,
             }
@@ -703,14 +729,21 @@ async def create_shared_document(
 
     db = await get_db()
 
+    # First, get all team IDs where user is a member
+    user_team_ids = await _get_user_team_ids(user_id)
+
+    # Build access conditions
+    or_conditions: list[dict] = [
+        {"ownerId": user_id},
+    ]
+    if user_team_ids:
+        or_conditions.append({"teamId": {"in": user_team_ids}})
+
     # Check collection exists and user has access
     collection = await db.sharedcontextcollection.find_first(
         where={
             "id": collection_id,
-            "OR": [
-                {"ownerId": user_id},
-                {"team": {"members": {"some": {"userId": user_id}}}},
-            ],
+            "OR": or_conditions,
         },
     )
 
