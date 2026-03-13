@@ -350,6 +350,9 @@ AGENT_TOOLS = {
     ToolName.RLM_TASK_BULK_CREATE,
     ToolName.RLM_TASK_CLAIM,
     ToolName.RLM_TASK_COMPLETE,
+    ToolName.RLM_TASK_LIST,
+    ToolName.RLM_TASK_STATS,
+    ToolName.RLM_TASK_EVENTS,
     ToolName.RLM_AGENT_STATUS,
     ToolName.RLM_SWARM_LEAVE,
     ToolName.RLM_SWARM_MEMBERS,
@@ -921,6 +924,9 @@ class RLMEngine:
             ToolName.RLM_TASK_CLAIM: self._handle_task_claim,
             ToolName.RLM_TASK_COMPLETE: self._handle_task_complete,
             ToolName.RLM_TASKS: self._handle_tasks,
+            ToolName.RLM_TASK_LIST: self._handle_task_list,
+            ToolName.RLM_TASK_STATS: self._handle_task_stats,
+            ToolName.RLM_TASK_EVENTS: self._handle_task_events,
             ToolName.RLM_AGENT_STATUS: self._handle_agent_status,
             ToolName.RLM_SWARM_LEAVE: self._handle_swarm_leave,
             ToolName.RLM_SWARM_MEMBERS: self._handle_swarm_members,
@@ -4031,9 +4037,14 @@ Rationale: {decision.rationale}"""
             )
 
         # Apply category filter if specified
+        # When filtering for MANDATORY, also include documents with is_mandatory=True
         if category_filter:
+            mandatory_in_filter = DocumentCategory.MANDATORY in category_filter
             shared_ctx.documents = [
-                d for d in shared_ctx.documents if d.category in category_filter
+                d
+                for d in shared_ctx.documents
+                if d.category in category_filter
+                or (mandatory_in_filter and d.is_mandatory)
             ]
 
         # Allocate budget
@@ -4052,6 +4063,7 @@ Rationale: {decision.rationale}"""
                     id=doc.id,
                     title=doc.title,
                     category=cat_enum,
+                    is_mandatory=doc.is_mandatory,
                     token_count=doc.token_count,
                     collection_name=doc.collection_name,
                     tags=doc.tags,
@@ -4248,9 +4260,18 @@ Rationale: {decision.rationale}"""
         """
         include_public = params.get("include_public", True)
 
+        # Validate: need user_id for non-public collections
+        user_id = self.user_id if self.user_id else None
+        if not user_id and not include_public:
+            return ToolResult(
+                data={"error": "user_id required when include_public=False"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
         try:
             collections = await list_shared_collections(
-                user_id=self.user_id,
+                user_id=user_id,
                 include_public=include_public,
             )
 
@@ -5219,6 +5240,115 @@ Rationale: {decision.rationale}"""
             swarm_id=swarm_id,
             status=status,
             assigned_to=assigned_to,
+            limit=limit,
+        )
+
+        return ToolResult(
+            data=result,
+            input_tokens=0,
+            output_tokens=count_tokens(str(result)),
+        )
+
+    async def _handle_task_list(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_task_list - list tasks with cursor-based pagination.
+
+        Args:
+            params: Dict containing:
+                - swarm_id: Swarm ID (required)
+                - status: Filter by status (optional)
+                - limit: Max tasks to return (default 50, max 100)
+                - cursor: Cursor for pagination (task ID to start after)
+
+        Returns:
+            ToolResult with tasks: [{id, status, updated_at, owner}], has_more, next_cursor
+        """
+        from .services.swarm import list_tasks_enhanced
+
+        swarm_id = params.get("swarm_id", "")
+        status = params.get("status")
+        limit = params.get("limit", 50)
+        cursor = params.get("cursor")
+
+        if not swarm_id:
+            return ToolResult(
+                data={"error": "rlm_task_list: missing required parameter 'swarm_id'"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        result = await list_tasks_enhanced(
+            swarm_id=swarm_id,
+            status=status,
+            limit=limit,
+            cursor=cursor,
+        )
+
+        return ToolResult(
+            data=result,
+            input_tokens=0,
+            output_tokens=count_tokens(str(result)),
+        )
+
+    async def _handle_task_stats(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_task_stats - get aggregated task statistics.
+
+        Args:
+            params: Dict containing:
+                - swarm_id: Swarm ID (required)
+
+        Returns:
+            ToolResult with {done, in_progress, blocked, pending, failed, cancelled, total}
+        """
+        from .services.swarm import get_task_stats
+
+        swarm_id = params.get("swarm_id", "")
+
+        if not swarm_id:
+            return ToolResult(
+                data={"error": "rlm_task_stats: missing required parameter 'swarm_id'"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        result = await get_task_stats(swarm_id=swarm_id)
+
+        return ToolResult(
+            data=result,
+            input_tokens=0,
+            output_tokens=count_tokens(str(result)),
+        )
+
+    async def _handle_task_events(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_task_events - get task status change events.
+
+        Args:
+            params: Dict containing:
+                - swarm_id: Swarm ID (required)
+                - since: ISO timestamp - only return events after this time (optional)
+                - limit: Max events to return (default 100)
+
+        Returns:
+            ToolResult with task events: [{event_id, event_type, task_id, timestamp}]
+        """
+        from .services.swarm import get_task_events
+
+        swarm_id = params.get("swarm_id", "")
+        since = params.get("since")
+        limit = params.get("limit", 100)
+
+        if not swarm_id:
+            return ToolResult(
+                data={"error": "rlm_task_events: missing required parameter 'swarm_id'"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        result = await get_task_events(
+            swarm_id=swarm_id,
+            since=since,
             limit=limit,
         )
 

@@ -610,8 +610,8 @@ async def get_shared_prompt_templates(
 
 async def _get_user_team_ids(user_id: str | None) -> list[str]:
     """Get all team IDs where the user is a member."""
-    # Early return for None, empty string, or whitespace-only
-    if not user_id or not user_id.strip():
+    # Early return for None or empty string
+    if not user_id:
         return []
     db = await get_db()
     memberships = await db.teammember.find_many(
@@ -642,7 +642,7 @@ async def list_shared_collections(
     db = await get_db()
 
     # Early validation - user_id must be valid for non-public queries
-    has_valid_user = user_id and user_id.strip()
+    has_valid_user = bool(user_id)
 
     # First, get all team IDs where user is a member
     user_team_ids = await _get_user_team_ids(user_id) if has_valid_user else []
@@ -741,7 +741,7 @@ async def create_shared_document(
     db = await get_db()
 
     # Validate user_id
-    if not user_id or not user_id.strip():
+    if not user_id:
         raise ValueError("user_id is required to upload shared documents")
 
     # First, get all team IDs where user is a member
