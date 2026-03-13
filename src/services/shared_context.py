@@ -608,8 +608,10 @@ async def get_shared_prompt_templates(
     return templates
 
 
-async def _get_user_team_ids(user_id: str) -> list[str]:
+async def _get_user_team_ids(user_id: str | None) -> list[str]:
     """Get all team IDs where the user is a member."""
+    if not user_id:
+        return []
     db = await get_db()
     memberships = await db.teammember.find_many(
         where={"userId": user_id},
