@@ -27,10 +27,10 @@ ENV TRANSFORMERS_CACHE="/home/appuser/.cache/huggingface"
 ENV SENTENCE_TRANSFORMERS_HOME="/home/appuser/.cache/torch/sentence_transformers"
 
 # Generate Prisma client (with HOME set so binaries go to /home/appuser/.cache)
-# ARG CACHEBUST forces layer invalidation when schema changes
-ARG CACHEBUST=1
+# BUILD_INFO forces layer invalidation when schema or code changes
+COPY BUILD_INFO ./BUILD_INFO
 COPY prisma ./prisma
-RUN echo "Cache bust: $CACHEBUST" && prisma generate
+RUN cat BUILD_INFO && prisma generate
 
 # Pre-download embedding models to avoid runtime network dependency
 # Models are cached in /home/appuser/.cache/huggingface/
