@@ -1891,10 +1891,10 @@ Returns recursive tree structure with all descendants up to max_depth.""",
                     "default": 4,
                     "description": "Maximum depth to traverse",
                 },
-                "include_archived": {
+                "include_completed": {
                     "type": "boolean",
                     "default": False,
-                    "description": "Include archived tasks",
+                    "description": "Include completed tasks",
                 },
             },
             "required": ["swarm_id"],

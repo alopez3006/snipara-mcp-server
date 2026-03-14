@@ -227,7 +227,7 @@ async def handle_htask_tree(
             - swarm_id: Swarm ID (required)
             - task_id: Root task ID (optional, defaults to all root tasks)
             - max_depth: Maximum depth to traverse (default 4)
-            - include_archived: Include archived tasks (default false)
+            - include_completed: Include completed tasks (default false)
 
     Returns:
         ToolResult with recursive tree structure
@@ -243,9 +243,9 @@ async def handle_htask_tree(
 
     result = await get_htask_tree(
         swarm_id=swarm_id,
-        task_id=params.get("task_id"),
+        root_id=params.get("task_id"),
         max_depth=params.get("max_depth", 4),
-        include_archived=params.get("include_archived", False),
+        include_completed=params.get("include_completed", False),
     )
 
     return ToolResult(
