@@ -520,7 +520,7 @@ class RLMEngine:
             session_context=self.session_context,
             tips_shown=self._tips_shown_this_session,
             index=self.index,
-            db=get_db(),
+            db=None,  # Handlers call await get_db() themselves
         )
 
     def _generate_chunk_id(self, section_id: str) -> str:

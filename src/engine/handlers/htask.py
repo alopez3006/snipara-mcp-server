@@ -163,7 +163,7 @@ async def handle_htask_create_feature(
         description=description,
         owner=owner,
         parent_id=params.get("parent_id"),
-        workstreams=params.get("workstreams"),
+        include_workstreams=params.get("workstreams"),
     )
 
     return ToolResult(
