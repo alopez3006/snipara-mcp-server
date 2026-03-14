@@ -70,6 +70,8 @@ ENV TRANSFORMERS_CACHE="/home/appuser/.cache/huggingface"
 ENV SENTENCE_TRANSFORMERS_HOME="/home/appuser/.cache/torch/sentence_transformers"
 
 # Copy application code
+# BUILD_INFO forces cache invalidation when updated
+COPY BUILD_INFO ./BUILD_INFO
 COPY src ./src
 
 # Set ownership
