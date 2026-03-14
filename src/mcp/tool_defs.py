@@ -1841,13 +1841,15 @@ Tasks have owners, priorities, acceptance criteria, and evidence requirements.""
         "name": "rlm_htask_create_feature",
         "description": """Create a N1 feature with standard workstreams.
 
-Creates a feature (N1) with automatic N2 workstreams: API, FRONTEND, QA, BUGFIX_HARDENING, DEPLOY_PROD_VERIFY.""",
+Creates a feature (N1) with automatic N2 workstreams: API, FRONTEND, QA, BUGFIX_HARDENING, DEPLOY_PROD_VERIFY.
+
+Minimal call: rlm_htask_create_feature(swarm_id, title, owner) - description auto-generated.""",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "swarm_id": {"type": "string", "description": "Swarm ID"},
                 "title": {"type": "string", "description": "Feature title"},
-                "description": {"type": "string", "description": "Feature description"},
+                "description": {"type": "string", "description": "Feature description (auto-generated if not provided)"},
                 "owner": {"type": "string", "description": "Feature owner"},
                 "parent_id": {"type": "string", "description": "Optional N0 parent"},
                 "workstreams": {
@@ -1856,7 +1858,7 @@ Creates a feature (N1) with automatic N2 workstreams: API, FRONTEND, QA, BUGFIX_
                     "description": "Workstream types to create (defaults to standard set)",
                 },
             },
-            "required": ["swarm_id", "title", "description", "owner"],
+            "required": ["swarm_id", "title", "owner"],
         },
     },
     {

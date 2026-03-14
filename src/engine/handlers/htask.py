@@ -127,8 +127,8 @@ async def handle_htask_create_feature(
         params: Dict containing:
             - swarm_id: Swarm ID (required)
             - title: Feature title (required)
-            - description: Feature description (required)
             - owner: Feature owner (required)
+            - description: Feature description (auto-generated if not provided)
             - parent_id: Optional N0 parent
             - workstreams: List of workstream types to create
               Defaults to: API, FRONTEND, QA, BUGFIX_HARDENING, DEPLOY_PROD_VERIFY
@@ -138,17 +138,15 @@ async def handle_htask_create_feature(
     """
     swarm_id = params.get("swarm_id", "")
     title = params.get("title", "")
-    description = params.get("description", "")
     owner = params.get("owner", "")
 
-    if not swarm_id or not title or not description or not owner:
+    # Validate only truly required fields
+    if not swarm_id or not title or not owner:
         missing = []
         if not swarm_id:
             missing.append("swarm_id")
         if not title:
             missing.append("title")
-        if not description:
-            missing.append("description")
         if not owner:
             missing.append("owner")
         return ToolResult(
@@ -156,6 +154,9 @@ async def handle_htask_create_feature(
             input_tokens=0,
             output_tokens=0,
         )
+
+    # Auto-generate description if not provided
+    description = params.get("description") or f"Feature: {title}"
 
     result = await create_feature_with_workstreams(
         swarm_id=swarm_id,
