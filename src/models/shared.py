@@ -11,6 +11,7 @@ class SharedDocumentInfo(BaseModel):
     id: str = Field(..., description="Document ID")
     title: str = Field(..., description="Document title")
     category: DocumentCategoryEnum = Field(..., description="Document category")
+    is_mandatory: bool = Field(default=False, description="Non-negotiable rule flag")
     token_count: int = Field(..., ge=0, description="Token count")
     collection_name: str = Field(..., description="Source collection name")
     tags: list[str] = Field(default_factory=list, description="Document tags")

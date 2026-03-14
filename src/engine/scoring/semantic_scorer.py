@@ -55,6 +55,8 @@ class SemanticScorer:
         limit: int = 50,
         min_similarity: float = 0.3,
         sections: list[SectionProtocol] | None = None,
+        tier_filter: list[str] | None = None,
+        track_access: bool = True,
     ) -> dict[str, float]:
         """Calculate semantic scores using pre-computed chunk embeddings via pgvector.
 
@@ -67,6 +69,9 @@ class SemanticScorer:
             limit: Maximum number of chunks to retrieve.
             min_similarity: Minimum cosine similarity threshold (0-1).
             sections: Optional sections to map chunks back to.
+            tier_filter: Optional list of tiers to include (e.g., ["HOT", "WARM"]).
+                         If None, searches all tiers. Default search excludes ARCHIVE.
+            track_access: Whether to update chunk access stats for tier promotion.
 
         Returns:
             Dictionary mapping section IDs to their semantic similarity scores (0-1).
@@ -82,6 +87,8 @@ class SemanticScorer:
                 query=query,
                 limit=limit,
                 min_similarity=min_similarity,
+                tier_filter=tier_filter,
+                track_access=track_access,
             )
 
             # If no sections provided, return chunk scores directly

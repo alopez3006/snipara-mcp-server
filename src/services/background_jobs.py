@@ -30,12 +30,15 @@ JOB_STALE_TIMEOUT = 300  # 5 min - reclaim if worker crashed
 MAX_CONCURRENT_JOBS = 2  # per worker
 AUTO_DISCOVERY_INTERVAL = 300  # 5 min - scan for unindexed documents
 STATE_CLEANUP_INTERVAL = 300  # 5 min - clean up expired shared states
+TIER_DEMOTION_INTERVAL = 3600  # 1 hour - demote chunks based on age
+TIER_DEMOTION_BATCH_SIZE = 100  # chunks per tier per cycle
 
 # Global state
 _running = False
 _processor_task: asyncio.Task | None = None
 _discovery_task: asyncio.Task | None = None
 _state_cleanup_task: asyncio.Task | None = None
+_tier_demotion_task: asyncio.Task | None = None
 _active_jobs: set[str] = set()
 _worker_id: str = f"worker-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 _last_discovery: datetime | None = None
@@ -43,7 +46,7 @@ _last_discovery: datetime | None = None
 
 async def start_job_processor() -> None:
     """Start the background job processor loop."""
-    global _running, _processor_task, _discovery_task, _state_cleanup_task
+    global _running, _processor_task, _discovery_task, _state_cleanup_task, _tier_demotion_task
 
     if _running:
         logger.warning("Job processor already running")
@@ -53,15 +56,16 @@ async def start_job_processor() -> None:
     _processor_task = asyncio.create_task(_job_processor_loop())
     _discovery_task = asyncio.create_task(_auto_discovery_loop())
     _state_cleanup_task = asyncio.create_task(_state_cleanup_loop())
+    _tier_demotion_task = asyncio.create_task(_tier_demotion_loop())
     logger.info(f"Job processor started (worker_id={_worker_id})")
 
 
 async def stop_job_processor() -> None:
     """Stop the background job processor."""
-    global _running, _processor_task, _discovery_task, _state_cleanup_task
+    global _running, _processor_task, _discovery_task, _state_cleanup_task, _tier_demotion_task
 
     _running = False
-    for task in [_processor_task, _discovery_task, _state_cleanup_task]:
+    for task in [_processor_task, _discovery_task, _state_cleanup_task, _tier_demotion_task]:
         if task:
             task.cancel()
             try:
@@ -71,6 +75,7 @@ async def stop_job_processor() -> None:
     _processor_task = None
     _discovery_task = None
     _state_cleanup_task = None
+    _tier_demotion_task = None
     logger.info("Job processor stopped")
 
 
@@ -230,6 +235,88 @@ async def _state_cleanup_loop() -> None:
             logger.error(f"Error in state cleanup loop: {e}")
 
         await asyncio.sleep(STATE_CLEANUP_INTERVAL)
+
+
+async def _tier_demotion_loop() -> None:
+    """
+    Periodically demote chunks to lower tiers based on age.
+
+    Tier demotion rules:
+    - HOT (accessed < 24h) -> WARM if lastAccessed > 24h
+    - WARM (accessed < 7d) -> COLD if lastAccessed > 7d
+    - COLD (accessed < 30d) -> ARCHIVE if lastAccessed > 30d
+
+    This runs every TIER_DEMOTION_INTERVAL seconds (1 hour by default).
+    """
+    from ..db import get_db
+
+    # Wait 2 minutes before first demotion to let server stabilize
+    await asyncio.sleep(120)
+
+    while _running:
+        try:
+            db = await get_db()
+            now = datetime.now(UTC)
+            total_demoted = 0
+
+            # HOT -> WARM: lastAccessed > 24 hours
+            hot_cutoff = now - timedelta(hours=24)
+            hot_to_warm = await db.query_raw(
+                """
+                UPDATE document_chunks
+                SET tier = 'WARM'
+                WHERE tier = 'HOT'
+                  AND "lastAccessed" IS NOT NULL
+                  AND "lastAccessed" < $1
+                RETURNING id
+                """,
+                hot_cutoff.isoformat(),
+            )
+            if hot_to_warm:
+                logger.info(f"Tier demotion: {len(hot_to_warm)} chunks HOT -> WARM")
+                total_demoted += len(hot_to_warm)
+
+            # WARM -> COLD: lastAccessed > 7 days
+            warm_cutoff = now - timedelta(days=7)
+            warm_to_cold = await db.query_raw(
+                """
+                UPDATE document_chunks
+                SET tier = 'COLD'
+                WHERE tier = 'WARM'
+                  AND "lastAccessed" IS NOT NULL
+                  AND "lastAccessed" < $1
+                RETURNING id
+                """,
+                warm_cutoff.isoformat(),
+            )
+            if warm_to_cold:
+                logger.info(f"Tier demotion: {len(warm_to_cold)} chunks WARM -> COLD")
+                total_demoted += len(warm_to_cold)
+
+            # COLD -> ARCHIVE: lastAccessed > 30 days
+            cold_cutoff = now - timedelta(days=30)
+            cold_to_archive = await db.query_raw(
+                """
+                UPDATE document_chunks
+                SET tier = 'ARCHIVE'
+                WHERE tier = 'COLD'
+                  AND "lastAccessed" IS NOT NULL
+                  AND "lastAccessed" < $1
+                RETURNING id
+                """,
+                cold_cutoff.isoformat(),
+            )
+            if cold_to_archive:
+                logger.info(f"Tier demotion: {len(cold_to_archive)} chunks COLD -> ARCHIVE")
+                total_demoted += len(cold_to_archive)
+
+            if total_demoted > 0:
+                logger.info(f"Tier demotion complete: {total_demoted} chunks demoted")
+
+        except Exception as e:
+            logger.error(f"Error in tier demotion loop: {e}")
+
+        await asyncio.sleep(TIER_DEMOTION_INTERVAL)
 
 
 async def _claim_next_job(db: Prisma) -> IndexJob | None:
