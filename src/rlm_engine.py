@@ -40,6 +40,7 @@ from .engine.core import (
 # These are available for integration - handlers are extracted but methods
 # below still use original implementations for backward compatibility.
 # Full migration will replace _handle_* methods with calls to these functions.
+from .engine.handlers.base import HandlerContext
 from .engine.middleware import maybe_auto_remember
 
 # Phase 2 Refactor: Import from extracted scoring module
@@ -507,6 +508,20 @@ class RLMEngine:
             )
         else:
             self.settings = ProjectSettings()
+
+        # Initialize handler context for htask and other extracted handlers
+        self._handler_ctx = HandlerContext(
+            project_id=self.project_id,
+            user_id=self.user_id,
+            team_id=None,  # Will be set from project lookup if needed
+            plan=self.plan,
+            access_level=self.access_level,
+            settings=self.settings,
+            session_context=self.session_context,
+            tips_shown=self._tips_shown_this_session,
+            index=self.index,
+            db=get_db(),
+        )
 
     def _generate_chunk_id(self, section_id: str) -> str:
         """Generate a unique chunk ID for pass-by-reference retrieval.
