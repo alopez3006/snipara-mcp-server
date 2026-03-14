@@ -1,19 +1,13 @@
-// Prisma schema for MCP Server (Python client)
-// IMPORTANT: This MUST mirror the main schema in packages/database exactly.
-// Any drift will cause `prisma db push --accept-data-loss` to DROP columns.
-
 generator client {
-  provider             = "prisma-client-py"
-  interface            = "asyncio"
-  recursive_type_depth = 5
-  previewFeatures      = ["postgresqlExtensions", "multiSchema"]
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+  binaryTargets   = ["native", "rhel-openssl-3.0.x"]
 }
 
 datasource db {
   provider   = "postgresql"
   url        = env("DATABASE_URL")
-  schemas    = ["tenant_snipara", "public"]
-  extensions = [vector(schema: "public")]
+  extensions = [vector]
 }
 
 // ============================================
@@ -68,7 +62,6 @@ model User {
   adminTargets  AdminAuditLog[] @relation("AdminTargets")
 
   @@map("users")
-  @@schema("tenant_snipara")
 }
 
 model Account {
@@ -89,7 +82,6 @@ model Account {
 
   @@unique([provider, providerAccountId])
   @@map("accounts")
-  @@schema("tenant_snipara")
 }
 
 model Session {
@@ -101,7 +93,6 @@ model Session {
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@map("sessions")
-  @@schema("tenant_snipara")
 }
 
 model VerificationToken {
@@ -111,7 +102,6 @@ model VerificationToken {
 
   @@unique([identifier, token])
   @@map("verification_tokens")
-  @@schema("tenant_snipara")
 }
 
 // ============================================
@@ -144,6 +134,7 @@ model Team {
   auditLogs         AuditLog[]
   sharedCollections SharedContextCollection[]
   teamApiKeys       TeamApiKey[]
+  webhooks          Webhook[]
 
   // Permission system (TEAM+ plans only)
   permissionConfig TeamPermissionConfig?
@@ -151,8 +142,10 @@ model Team {
   // Snipara Agents relations
   agentsSubscriptions AgentsSubscription[]
 
+  // Enterprise Admin Tokens (for Enterprise plan teams)
+  enterpriseAdminTokens EnterpriseAdminToken[]
+
   @@map("teams")
-  @@schema("tenant_snipara")
 }
 
 model TeamMember {
@@ -174,7 +167,6 @@ model TeamMember {
 
   @@unique([userId, teamId])
   @@map("team_members")
-  @@schema("tenant_snipara")
 }
 
 model TeamInvite {
@@ -191,20 +183,17 @@ model TeamInvite {
 
   @@unique([email, teamId])
   @@map("team_invites")
-  @@schema("tenant_snipara")
 }
 
 enum Role {
   OWNER
   ADMIN
   MEMBER
-  @@schema("tenant_snipara")
 }
 
 enum PermissionMode {
   SIMPLE   // Role-based defaults only (backward compatible)
   ADVANCED // Fine-grained permissions enabled
-  @@schema("tenant_snipara")
 }
 
 enum ProjectAccessLevel {
@@ -212,7 +201,6 @@ enum ProjectAccessLevel {
   VIEWER // Read-only: view project, query MCP, view docs
   EDITOR // Read-write: manage docs, inject context
   ADMIN  // Full access: API keys, automation, delete
-  @@schema("tenant_snipara")
 }
 
 enum AccessRequestStatus {
@@ -220,7 +208,6 @@ enum AccessRequestStatus {
   APPROVED  // Request approved (ProjectMember created)
   DENIED    // Request denied
   CANCELLED // Requester cancelled
-  @@schema("tenant_snipara")
 }
 
 // Team permission configuration (opt-in toggle for TEAM+ plans)
@@ -240,7 +227,6 @@ model TeamPermissionConfig {
   updatedAt DateTime @updatedAt
 
   @@map("team_permission_configs")
-  @@schema("tenant_snipara")
 }
 
 // Team-level permission overrides per member
@@ -258,7 +244,6 @@ model TeamPermission {
   @@unique([teamMemberId, permission])
   @@index([teamMemberId])
   @@map("team_permissions")
-  @@schema("tenant_snipara")
 }
 
 // Project-level access (junction table for fine-grained control)
@@ -278,7 +263,6 @@ model ProjectMember {
   @@index([projectId])
   @@index([teamMemberId])
   @@map("project_members")
-  @@schema("tenant_snipara")
 }
 
 // Access requests for project-level permissions
@@ -306,7 +290,6 @@ model AccessRequest {
   @@index([projectId, status])
   @@index([teamMemberId, status])
   @@map("access_requests")
-  @@schema("tenant_snipara")
 }
 
 // ============================================
@@ -378,12 +361,132 @@ model Project {
   // Indexing jobs
   indexJobs      IndexJob[]
 
+  // Decision log
+  decisions      ProjectDecision[]
+
   // Integrator client relation (if project is owned by an integrator client)
   integratorClient IntegratorClient?
 
   @@unique([teamId, slug])
   @@map("projects")
-  @@schema("tenant_snipara")
+}
+
+// ============================================
+// Document Indexing Jobs
+// ============================================
+
+enum IndexJobStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+enum IndexJobMode {
+  FULL        // Re-index all documents (delete existing chunks first)
+  INCREMENTAL // Only index documents without existing chunks
+}
+
+enum ChunkTier {
+  HOT      // Accessed < 24h, high relevance (>0.7 avg)
+  WARM     // Accessed < 7d, medium relevance (default)
+  COLD     // Accessed < 30d, low relevance
+  ARCHIVE  // Accessed > 30d, rarely used
+}
+
+enum DecisionStatus {
+  ACTIVE
+  SUPERSEDED
+  REVERTED
+  DRAFT
+}
+
+enum DecisionImpact {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+model IndexJob {
+  id                 String         @id @default(cuid())
+  projectId          String
+  project            Project        @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  // Status tracking
+  status             IndexJobStatus @default(PENDING)
+  progress           Int            @default(0) // 0-100
+  errorMessage       String?
+
+  // Index mode
+  indexMode          IndexJobMode   @default(INCREMENTAL)
+
+  // Results
+  documentsTotal     Int            @default(0)
+  documentsProcessed Int            @default(0)
+  chunksCreated      Int            @default(0)
+
+  // Retry logic
+  retryCount         Int            @default(0)
+  maxRetries         Int            @default(3)
+
+  // Worker tracking (for stale job detection)
+  workerId           String?
+
+  // Timestamps
+  createdAt          DateTime       @default(now())
+  startedAt          DateTime?
+  completedAt        DateTime?
+  updatedAt          DateTime       @updatedAt
+
+  // Triggering info
+  triggeredBy        String? // user_id, "system", "webhook"
+  triggeredVia       String? // "api", "webhook", "dashboard"
+
+  // Results stored as JSON (document_path -> chunk_count)
+  results            Json?
+
+  @@index([projectId, createdAt])
+  @@index([status, createdAt])
+  @@index([workerId])
+  @@map("index_jobs")
+}
+
+// ============================================
+// Project Decisions (Decision Log)
+// ============================================
+
+model ProjectDecision {
+  id            String         @id @default(cuid())
+  decisionId    String         // e.g., "DEC-001"
+  projectId     String
+  project       Project        @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  title         String
+  owner         String
+  scope         String
+  impact        DecisionImpact @default(MEDIUM)
+  status        DecisionStatus @default(ACTIVE)
+
+  context       String         @db.Text
+  decision      String         @db.Text
+  rationale     String         @db.Text
+  alternatives  String[]       // Array of alternatives considered
+  revertPlan    String?        @db.Text
+
+  supersedes    String?        // ID of decision this supersedes
+  supersededBy  String?        // ID of decision that supersedes this
+  tags          String[]
+
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+
+  @@unique([projectId, decisionId])
+  @@index([projectId, scope])
+  @@index([projectId, status])
+  @@index([projectId, impact])
+  @@map("project_decisions")
 }
 
 model Document {
@@ -412,7 +515,6 @@ model Document {
   @@index([source])
   @@index([deletedAt])
   @@map("documents")
-  @@schema("tenant_snipara")
 }
 
 model DocumentVersion {
@@ -430,7 +532,6 @@ model DocumentVersion {
   @@unique([documentId, version])
   @@index([documentId])
   @@map("document_versions")
-  @@schema("tenant_snipara")
 }
 
 model DocumentChunk {
@@ -443,69 +544,25 @@ model DocumentChunk {
   title      String?
   createdAt  DateTime                  @default(now())
 
+  // Context tiering fields (Sprint 1)
+  tier         ChunkTier @default(WARM)
+  lastAccessed DateTime?
+  accessCount  Int       @default(0)
+  avgRelevance Float     @default(0.0)
+
+  // Quality scoring fields (Sprint 2)
+  qualityScore Float     @default(0.5)
+  isComplete   Boolean   @default(true)
+  isTruncated  Boolean   @default(false)
+
   // Relations
   documentId String
   document   Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
 
   @@index([documentId])
+  @@index([tier])
+  @@index([lastAccessed])
   @@map("document_chunks")
-  @@schema("tenant_snipara")
-}
-
-// ============================================
-// Indexing Jobs (Background Processing)
-// ============================================
-
-enum IndexJobStatus {
-  PENDING
-  RUNNING
-  COMPLETED
-  FAILED
-  CANCELLED
-  @@schema("tenant_snipara")
-}
-
-enum IndexJobMode {
-  FULL        // Re-index all documents (delete existing chunks first)
-  INCREMENTAL // Only index documents without existing chunks
-  @@schema("tenant_snipara")
-}
-
-model IndexJob {
-  id                 String         @id @default(cuid())
-  projectId          String
-  project            Project        @relation(fields: [projectId], references: [id], onDelete: Cascade)
-
-  status             IndexJobStatus @default(PENDING)
-  progress           Int            @default(0) // 0-100
-  errorMessage       String?
-
-  indexMode          IndexJobMode   @default(INCREMENTAL)
-
-  documentsTotal     Int            @default(0)
-  documentsProcessed Int            @default(0)
-  chunksCreated      Int            @default(0)
-
-  retryCount         Int            @default(0)
-  maxRetries         Int            @default(3)
-
-  workerId           String?
-
-  createdAt          DateTime       @default(now())
-  startedAt          DateTime?
-  completedAt        DateTime?
-  updatedAt          DateTime       @updatedAt
-
-  triggeredBy        String?
-  triggeredVia       String?
-
-  results            Json?
-
-  @@index([projectId, createdAt])
-  @@index([status, createdAt])
-  @@index([workerId])
-  @@map("index_jobs")
-  @@schema("tenant_snipara")
 }
 
 // ============================================
@@ -547,7 +604,6 @@ model DocumentSummary {
   @@index([documentId])
   @@index([summaryType])
   @@map("document_summaries")
-  @@schema("tenant_snipara")
 }
 
 model SessionContext {
@@ -565,7 +621,6 @@ model SessionContext {
   @@unique([projectId, key])
   @@index([projectId])
   @@map("session_contexts")
-  @@schema("tenant_snipara")
 }
 
 // ============================================
@@ -591,7 +646,6 @@ model SessionCheckpoint {
   @@index([sessionId])
   @@index([expiresAt])
   @@map("session_checkpoints")
-  @@schema("tenant_snipara")
 }
 
 // ============================================
@@ -620,7 +674,6 @@ model ApiKey {
   @@index([projectId])
   @@index([keyHash])
   @@map("api_keys")
-  @@schema("tenant_snipara")
 }
 
 model TeamApiKey {
@@ -642,7 +695,6 @@ model TeamApiKey {
   @@index([teamId])
   @@index([keyHash])
   @@map("team_api_keys")
-  @@schema("tenant_snipara")
 }
 
 // ============================================
@@ -655,7 +707,6 @@ enum DeviceCodeStatus {
   EXPIRED    // Code has expired
   USED       // Token already issued
   DENIED     // User denied authorization
-  @@schema("tenant_snipara")
 }
 
 model DeviceCode {
@@ -686,7 +737,6 @@ model DeviceCode {
   @@index([userCode])
   @@index([expiresAt])
   @@map("device_codes")
-  @@schema("tenant_snipara")
 }
 
 model OAuthToken {
@@ -725,7 +775,6 @@ model OAuthToken {
   @@index([accessTokenHash])
   @@index([refreshTokenHash])
   @@map("oauth_tokens")
-  @@schema("tenant_snipara")
 }
 
 // ============================================
@@ -749,7 +798,6 @@ model Query {
   @@index([projectId, createdAt])
   @@index([createdAt])
   @@map("queries")
-  @@schema("tenant_snipara")
 }
 
 // ============================================
@@ -778,7 +826,6 @@ model TeamContext {
   @@unique([teamId, key])
   @@index([teamId, isActive])
   @@map("team_contexts")
-  @@schema("tenant_snipara")
 }
 
 // ============================================
@@ -806,7 +853,6 @@ model AuditLog {
   @@index([actorId])
   @@index([entityType, entityId])
   @@map("audit_logs")
-  @@schema("tenant_snipara")
 }
 
 // ============================================
@@ -824,8 +870,11 @@ model Subscription {
   currentPeriodStart   DateTime?
   currentPeriodEnd     DateTime?
   cancelAtPeriodEnd    Boolean            @default(false)
+
+  // 30-day PRO boost for new users
   proBoostStartedAt    DateTime?
   proBoostEndsAt       DateTime?
+
   createdAt            DateTime           @default(now())
   updatedAt            DateTime           @updatedAt
 
@@ -834,7 +883,6 @@ model Subscription {
   team   Team   @relation(fields: [teamId], references: [id], onDelete: Cascade)
 
   @@map("subscriptions")
-  @@schema("tenant_snipara")
 }
 
 enum Plan {
@@ -842,7 +890,6 @@ enum Plan {
   PRO
   TEAM
   ENTERPRISE
-  @@schema("tenant_snipara")
 }
 
 enum SubscriptionStatus {
@@ -851,13 +898,11 @@ enum SubscriptionStatus {
   PAST_DUE
   TRIALING
   UNPAID
-  @@schema("tenant_snipara")
 }
 
 enum BillingInterval {
   MONTHLY
   ANNUAL
-  @@schema("tenant_snipara")
 }
 
 // ============================================
@@ -868,7 +913,6 @@ enum SharedContextScope {
   GLOBAL // Public templates anyone can use/fork
   TEAM   // Shared within a team
   USER   // Personal across user's projects
-  @@schema("tenant_snipara")
 }
 
 enum DocumentCategory {
@@ -876,7 +920,6 @@ enum DocumentCategory {
   BEST_PRACTICES  // Recommended patterns
   GUIDELINES      // Nice-to-have suggestions
   REFERENCE       // Background info, examples
-  @@schema("tenant_snipara")
 }
 
 model SharedContextCollection {
@@ -921,7 +964,6 @@ model SharedContextCollection {
   @@index([teamId])
   @@index([ownerId])
   @@map("shared_context_collections")
-  @@schema("tenant_snipara")
 }
 
 model SharedDocument {
@@ -935,8 +977,9 @@ model SharedDocument {
   content String @db.Text
 
   // Classification
-  category DocumentCategory @default(BEST_PRACTICES)
-  tags     String[]
+  category    DocumentCategory @default(BEST_PRACTICES)
+  isMandatory Boolean          @default(false) // Checkbox: non-negotiable rule
+  tags        String[]
 
   // Pre-computed (for performance)
   tokenCount  Int     @default(0)
@@ -953,7 +996,6 @@ model SharedDocument {
   @@index([collectionId, category])
   @@index([collectionId, priority])
   @@map("shared_documents")
-  @@schema("tenant_snipara")
 }
 
 model SharedMcpConfig {
@@ -976,7 +1018,6 @@ model SharedMcpConfig {
   updatedAt DateTime @updatedAt
 
   @@map("shared_mcp_configs")
-  @@schema("tenant_snipara")
 }
 
 model PromptTemplate {
@@ -1002,7 +1043,6 @@ model PromptTemplate {
   @@unique([collectionId, slug])
   @@index([collectionId, category])
   @@map("prompt_templates")
-  @@schema("tenant_snipara")
 }
 
 // Junction table: Project <-> SharedContextCollection
@@ -1031,7 +1071,6 @@ model ProjectSharedContext {
   @@index([projectId, priority])
   @@index([collectionId])
   @@map("project_shared_contexts")
-  @@schema("tenant_snipara")
 }
 
 // ============================================
@@ -1043,7 +1082,6 @@ enum DiscoveryStatus {
   RUNNING
   COMPLETED
   FAILED
-  @@schema("tenant_snipara")
 }
 
 model DiscoveryRun {
@@ -1081,7 +1119,6 @@ model DiscoveryRun {
   @@index([collectionId, createdAt])
   @@index([status])
   @@map("discovery_runs")
-  @@schema("tenant_snipara")
 }
 
 // Track discovered patterns for review
@@ -1114,7 +1151,6 @@ model DiscoveredPattern {
   @@index([collectionId, status])
   @@index([collectionId, adoptionRate])
   @@map("discovered_patterns")
-  @@schema("tenant_snipara")
 }
 
 // ============================================
@@ -1148,7 +1184,6 @@ model QueryCache {
   @@index([projectId, expiresAt])
   @@index([expiresAt])
   @@map("query_caches")
-  @@schema("tenant_snipara")
 }
 
 model CacheStats {
@@ -1171,7 +1206,6 @@ model CacheStats {
   project       Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
 
   @@map("cache_stats")
-  @@schema("tenant_snipara")
 }
 
 // ============================================
@@ -1185,7 +1219,6 @@ enum MemoryType {
   PREFERENCE  // User/team preference
   TODO        // Deferred task or reminder
   CONTEXT     // General session context
-  @@schema("tenant_snipara")
 }
 
 enum MemoryScope {
@@ -1193,7 +1226,6 @@ enum MemoryScope {
   PROJECT     // Shared across project
   TEAM        // Shared across team
   USER        // Personal across all projects
-  @@schema("tenant_snipara")
 }
 
 model AgentMemory {
@@ -1228,7 +1260,6 @@ model AgentMemory {
   @@index([projectId, scope])
   @@index([expiresAt])
   @@map("agent_memories")
-  @@schema("tenant_snipara")
 }
 
 model MemoryStats {
@@ -1249,7 +1280,6 @@ model MemoryStats {
   project       Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
 
   @@map("memory_stats")
-  @@schema("tenant_snipara")
 }
 
 // ============================================
@@ -1260,7 +1290,6 @@ enum ClaimStatus {
   ACTIVE
   RELEASED
   EXPIRED
-  @@schema("tenant_snipara")
 }
 
 enum TaskStatus {
@@ -1270,7 +1299,74 @@ enum TaskStatus {
   COMPLETED
   FAILED
   CANCELLED
-  @@schema("tenant_snipara")
+}
+
+// ============================================
+// Hierarchical Tasks - Enums
+// ============================================
+
+enum HTaskLevel {
+  N0_INITIATIVE
+  N1_FEATURE
+  N2_WORKSTREAM
+  N3_TASK
+}
+
+enum HTaskStatus {
+  PENDING
+  IN_PROGRESS
+  BLOCKED
+  FAILED
+  COMPLETED
+  CANCELLED
+}
+
+enum HTaskPriority {
+  P0
+  P1
+  P2
+}
+
+enum BlockerType {
+  TECH
+  DEPENDENCY
+  ACCESS
+  PRODUCT
+  INFRA
+  SECURITY
+  OTHER
+}
+
+enum WorkstreamType {
+  API
+  FRONTEND
+  QA
+  BUGFIX_HARDENING
+  DEPLOY_PROD_VERIFY
+  DATA
+  SECURITY
+  DOCUMENTATION
+  CUSTOM
+  OTHER
+}
+
+enum ExecutionTarget {
+  LOCAL
+  CLOUD
+  HYBRID
+  EXTERNAL
+}
+
+enum ClosurePolicy {
+  STRICT_ALL_CHILDREN
+  ALLOW_EXCEPTIONS
+}
+
+enum CompatMode {
+  LEGACY
+  DUAL
+  SHADOW
+  HTASK
 }
 
 model AgentSwarm {
@@ -1298,10 +1394,13 @@ model AgentSwarm {
   events        SwarmEvent[]
   tasks         SwarmTask[]
 
+  // Hierarchical tasks
+  htasks        HierarchicalTask[]
+  htaskPolicy   HTaskPolicy?
+
   @@unique([projectId, name])
   @@index([projectId, isActive])
   @@map("agent_swarms")
-  @@schema("tenant_snipara")
 }
 
 model SwarmAgent {
@@ -1329,7 +1428,6 @@ model SwarmAgent {
   @@unique([swarmId, agentId])
   @@index([swarmId, isActive])
   @@map("swarm_agents")
-  @@schema("tenant_snipara")
 }
 
 model ResourceClaim {
@@ -1356,7 +1454,6 @@ model ResourceClaim {
   @@index([swarmId, resourceType, resourceId])
   @@index([expiresAt])
   @@map("resource_claims")
-  @@schema("tenant_snipara")
 }
 
 model SharedState {
@@ -1381,7 +1478,6 @@ model SharedState {
   @@unique([swarmId, key])
   @@index([expiresAt])
   @@map("shared_state")
-  @@schema("tenant_snipara")
 }
 
 model SwarmEvent {
@@ -1400,7 +1496,6 @@ model SwarmEvent {
   @@index([swarmId, eventType])
   @@index([swarmId, createdAt])
   @@map("swarm_events")
-  @@schema("tenant_snipara")
 }
 
 model SwarmTask {
@@ -1436,7 +1531,125 @@ model SwarmTask {
   @@index([swarmId, status])
   @@index([swarmId, priority])
   @@map("swarm_tasks")
-  @@schema("tenant_snipara")
+}
+
+// ============================================
+// Hierarchical Tasks - Models
+// ============================================
+
+model HierarchicalTask {
+  id                    String          @id @default(cuid())
+  swarmId               String
+
+  // Hierarchy
+  level                 HTaskLevel      @default(N3_TASK)
+  parentId              String?
+  sequenceNumber        Int             @default(1)
+  workstreamType        WorkstreamType?
+  customWorkstreamType  String?
+
+  // Core
+  title                 String
+  description           String          @db.Text
+  owner                 String
+  executionTarget       ExecutionTarget?
+  priority              HTaskPriority   @default(P1)
+  etaTarget             DateTime?
+
+  // Acceptance & Evidence
+  acceptanceCriteria    Json?           // [{id, text, checked, checkedAt, checkedBy}]
+  contextRefs           String[]
+  evidenceRequired      Json?           // [{type, description}]
+  evidenceProvided      Json?
+
+  // Status
+  status                HTaskStatus     @default(PENDING)
+  isBlocking            Boolean         @default(true)
+
+  // Blocking payload
+  blockerType           BlockerType?
+  blockerReason         String?         @db.Text
+  blockedByTaskId       String?
+  requiredInput         String?         @db.Text
+  etaRecovery           DateTime?
+  escalationTo          String?
+  blockedAt             DateTime?
+
+  // Waiver (pour ALLOW_EXCEPTIONS)
+  waiverReason          String?         @db.Text
+  waiverApprovedBy      String?
+  waiverApprovedAt      DateTime?
+
+  // Results & Audit
+  result                Json?
+  error                 String?         @db.Text
+  createdAt             DateTime        @default(now())
+  updatedAt             DateTime        @updatedAt
+  startedAt             DateTime?
+  completedAt           DateTime?
+  archivedAt            DateTime?
+
+  // Relations
+  swarm                 AgentSwarm      @relation(fields: [swarmId], references: [id], onDelete: Cascade)
+  parent                HierarchicalTask? @relation("TaskHierarchy", fields: [parentId], references: [id])
+  children              HierarchicalTask[] @relation("TaskHierarchy")
+  blockedByTask         HierarchicalTask? @relation("TaskBlocking", fields: [blockedByTaskId], references: [id])
+  blockingTasks         HierarchicalTask[] @relation("TaskBlocking")
+
+  @@unique([swarmId, parentId, sequenceNumber])
+  @@index([swarmId, level])
+  @@index([swarmId, status])
+  @@index([swarmId, parentId])
+  @@index([owner])
+  @@index([archivedAt])
+  @@map("hierarchical_tasks")
+}
+
+model HTaskPolicy {
+  id                        String        @id @default(cuid())
+  swarmId                   String        @unique
+
+  // Hierarchy
+  maxDepth                  Int           @default(4)
+
+  // Closure
+  closurePolicy             ClosurePolicy @default(STRICT_ALL_CHILDREN)
+  requireEvidenceOnComplete Boolean       @default(true)
+  allowParentCloseWithWaiver Boolean      @default(true)
+
+  // Blocking
+  failedIsBlockingDefault   Boolean       @default(true)
+
+  // Mutations
+  allowStructuralUpdate     Boolean       @default(false)
+  allowHardDelete           Boolean       @default(false)
+
+  // Compatibility
+  compatMode                CompatMode    @default(LEGACY)
+
+  // Timestamps
+  createdAt                 DateTime      @default(now())
+  updatedAt                 DateTime      @updatedAt
+
+  swarm                     AgentSwarm    @relation(fields: [swarmId], references: [id], onDelete: Cascade)
+
+  @@map("htask_policies")
+}
+
+model HTaskEvent {
+  id          String   @id @default(cuid())
+  swarmId     String
+  taskId      String
+  eventType   String   // create, update, block, unblock, complete, close, delete, waiver
+  payload     Json
+  actorId     String?
+
+  createdAt   DateTime @default(now())
+
+  @@index([swarmId, eventType])
+  @@index([swarmId, taskId])
+  @@index([swarmId, createdAt])
+  @@map("htask_events")
 }
 
 // ============================================
@@ -1448,7 +1661,6 @@ enum AgentsPlan {
   PRO         // $39/mo
   TEAM        // $79/mo
   ENTERPRISE  // $199/mo
-  @@schema("tenant_snipara")
 }
 
 model AgentsSubscription {
@@ -1480,7 +1692,7 @@ model AgentsSubscription {
   currentPeriodStart    DateTime?
   currentPeriodEnd      DateTime?
 
-  // Boost
+  // 30-day Agents STARTER boost for new users
   starterBoostEndsAt    DateTime?
 
   // Grace period for Context plan requirement (Agents TEAM/ENTERPRISE needs Context TEAM/ENTERPRISE)
@@ -1496,7 +1708,118 @@ model AgentsSubscription {
   @@unique([userId, teamId])
   @@index([stripeSubscriptionId])
   @@map("agents_subscriptions")
-  @@schema("tenant_snipara")
+}
+
+// ============================================
+// Enterprise Admin Tokens (Self-hosted Enterprise)
+// ============================================
+
+model EnterpriseAdminToken {
+  id          String   @id @default(cuid())
+  name        String
+  tokenHash   String   @unique
+  tokenPrefix String   // First 8 chars for identification
+
+  // Team association (for SaaS multi-tenant)
+  teamId      String?
+  team        Team?    @relation(fields: [teamId], references: [id], onDelete: Cascade)
+
+  // Permissions
+  permissions String[] @default(["*"]) // ["*"] = full access, or specific: ["users.read", "users.write"]
+
+  // Status
+  isActive    Boolean  @default(true)
+  lastUsedAt  DateTime?
+  expiresAt   DateTime?
+  createdAt   DateTime @default(now())
+  revokedAt   DateTime?
+
+  // Audit
+  createdBy   String?  // User ID who created this token
+  revokedBy   String?  // User ID who revoked this token
+
+  @@index([tokenHash])
+  @@index([teamId])
+  @@map("enterprise_admin_tokens")
+}
+
+// ============================================
+// Webhooks (Enterprise)
+// ============================================
+
+enum WebhookStatus {
+  ACTIVE
+  PAUSED
+  FAILED // Auto-paused after too many failures
+}
+
+model Webhook {
+  id          String        @id @default(cuid())
+  name        String?
+
+  // Target
+  url         String
+  secretHash  String        // HMAC secret for signature verification
+
+  // Configuration
+  events      String[]      // ["user.created", "project.indexed", etc.]
+  status      WebhookStatus @default(ACTIVE)
+
+  // Headers (optional custom headers)
+  headers     Json?         // { "X-Custom-Header": "value" }
+
+  // Retry configuration
+  maxRetries  Int           @default(3)
+  retryDelay  Int           @default(60) // seconds
+
+  // Stats
+  successCount Int          @default(0)
+  failureCount Int          @default(0)
+  consecutiveFailures Int   @default(0) // Reset on success, auto-pause at 10
+
+  // Timestamps
+  lastDeliveryAt     DateTime?
+  lastSuccessAt      DateTime?
+  lastFailureAt      DateTime?
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  // Ownership (enterprise-wide or team-scoped)
+  teamId      String?
+  team        Team?    @relation(fields: [teamId], references: [id], onDelete: Cascade)
+
+  // Relations
+  deliveries  WebhookDelivery[]
+
+  @@index([status])
+  @@index([teamId])
+  @@map("webhooks")
+}
+
+model WebhookDelivery {
+  id          String   @id @default(cuid())
+  webhookId   String
+  webhook     Webhook  @relation(fields: [webhookId], references: [id], onDelete: Cascade)
+
+  // Event info
+  eventType   String
+  payload     Json
+
+  // Delivery status
+  status      String   @default("pending") // pending, success, failed
+  statusCode  Int?     // HTTP response code
+  response    String?  @db.Text // Response body (truncated)
+  error       String?  // Error message if failed
+
+  // Timing
+  attemptCount Int     @default(0)
+  nextRetryAt DateTime?
+  deliveredAt DateTime?
+  createdAt   DateTime @default(now())
+
+  @@index([webhookId, createdAt])
+  @@index([status, nextRetryAt])
+  @@map("webhook_deliveries")
 }
 
 // ============================================
@@ -1508,21 +1831,18 @@ enum IntegratorTier {
   GROWTH     // €499/mo, 50 clients
   SCALE      // €999/mo, 200 clients
   ENTERPRISE // Custom
-  @@schema("tenant_snipara")
 }
 
 enum ClientBundle {
   LITE       // €29/mo: 200 queries, 100 memories, 1 swarm, 5 agents
   STANDARD   // €59/mo: 2K queries, 500 memories, 5 swarms, 10 agents
   UNLIMITED  // €129/mo: unlimited
-  @@schema("tenant_snipara")
 }
 
 enum IntegratorWebhookEventStatus {
   PENDING
   DELIVERED
   FAILED
-  @@schema("tenant_snipara")
 }
 
 model Integrator {
@@ -1542,7 +1862,6 @@ model Integrator {
   updatedAt            DateTime         @updatedAt
 
   @@map("integrators")
-  @@schema("tenant_snipara")
 }
 
 model IntegratorWorkspace {
@@ -1558,12 +1877,12 @@ model IntegratorWorkspace {
 
   clients       IntegratorClient[]
   webhookEvents IntegratorWebhookEvent[]
+  apiKeys       IntegratorWorkspaceApiKey[]
 
   createdAt     DateTime      @default(now())
   updatedAt     DateTime      @updatedAt
 
   @@map("integrator_workspaces")
-  @@schema("tenant_snipara")
 }
 
 model IntegratorClient {
@@ -1590,7 +1909,6 @@ model IntegratorClient {
   @@unique([workspaceId, externalId])
   @@index([workspaceId])
   @@map("integrator_clients")
-  @@schema("tenant_snipara")
 }
 
 model ClientApiKey {
@@ -1611,7 +1929,29 @@ model ClientApiKey {
   @@index([keyPrefix])
   @@index([clientId])
   @@map("client_api_keys")
-  @@schema("tenant_snipara")
+}
+
+model IntegratorWorkspaceApiKey {
+  id          String    @id @default(cuid())
+  workspaceId String
+  workspace   IntegratorWorkspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  name        String
+  keyHash     String    @unique
+  keyPrefix   String
+
+  // Permissions
+  scopes      String[]  @default(["clients:read", "clients:write", "keys:read", "keys:write"])
+
+  lastUsedAt  DateTime?
+  expiresAt   DateTime?
+  revokedAt   DateTime?
+
+  createdAt   DateTime  @default(now())
+
+  @@index([keyPrefix])
+  @@index([workspaceId])
+  @@map("integrator_workspace_api_keys")
 }
 
 model IntegratorWebhookEvent {
@@ -1631,7 +1971,46 @@ model IntegratorWebhookEvent {
   @@index([workspaceId, createdAt])
   @@index([status])
   @@map("integrator_webhook_events")
-  @@schema("tenant_snipara")
+}
+
+enum PartnerApplicationStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+model PartnerApplication {
+  id              String                    @id @default(cuid())
+  userId          String?                   // Optional: linked user if authenticated
+
+  // Company information
+  companyName     String
+  website         String?
+
+  // Contact information
+  contactName     String
+  email           String
+  phone           String?
+
+  // Business details
+  expectedClients String
+  tier            String                    // "starter", "growth", "scale", "enterprise"
+  useCase         String                    @db.Text
+  howHeard        String?
+
+  // Status
+  status          PartnerApplicationStatus  @default(PENDING)
+  reviewedAt      DateTime?
+  reviewedBy      String?
+  reviewNotes     String?                   @db.Text
+
+  createdAt       DateTime                  @default(now())
+  updatedAt       DateTime                  @updatedAt
+
+  @@index([email])
+  @@index([status])
+  @@index([createdAt])
+  @@map("partner_applications")
 }
 
 // ============================================
@@ -1655,5 +2034,4 @@ model AdminAuditLog {
   @@index([action])
   @@index([createdAt])
   @@map("admin_audit_logs")
-  @@schema("tenant_snipara")
 }

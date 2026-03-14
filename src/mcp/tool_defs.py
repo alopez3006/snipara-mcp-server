@@ -111,6 +111,24 @@ TOOL_TIERS: dict[str, ToolTier] = {
     "rlm_index_recommendations": ToolTier.POWER_USER,
     "rlm_search_analytics": ToolTier.POWER_USER,
     "rlm_query_trends": ToolTier.POWER_USER,
+    # ADVANCED - Hierarchical Tasks
+    "rlm_htask_create": ToolTier.ADVANCED,
+    "rlm_htask_create_feature": ToolTier.ADVANCED,
+    "rlm_htask_get": ToolTier.ADVANCED,
+    "rlm_htask_tree": ToolTier.ADVANCED,
+    "rlm_htask_update": ToolTier.ADVANCED,
+    "rlm_htask_block": ToolTier.ADVANCED,
+    "rlm_htask_unblock": ToolTier.ADVANCED,
+    "rlm_htask_complete": ToolTier.ADVANCED,
+    "rlm_htask_verify_closure": ToolTier.ADVANCED,
+    "rlm_htask_close": ToolTier.ADVANCED,
+    "rlm_htask_delete": ToolTier.ADVANCED,
+    "rlm_htask_recommend_batch": ToolTier.ADVANCED,
+    "rlm_htask_policy_get": ToolTier.ADVANCED,
+    "rlm_htask_policy_update": ToolTier.ADVANCED,
+    "rlm_htask_metrics": ToolTier.ADVANCED,
+    "rlm_htask_audit_trail": ToolTier.ADVANCED,
+    "rlm_htask_checkpoint_delta": ToolTier.ADVANCED,
 }
 
 
@@ -1755,6 +1773,374 @@ Returns time-bucketed query counts, success rates, and latency for trend analysi
                 },
             },
             "required": [],
+        },
+    },
+    # ============ Hierarchical Task Tools ============
+    {
+        "name": "rlm_htask_create",
+        "description": """Create a hierarchical task at any level (N0-N3).
+
+Supports 4-level hierarchy: N0_INITIATIVE > N1_FEATURE > N2_WORKSTREAM > N3_TASK.
+Tasks have owners, priorities, acceptance criteria, and evidence requirements.""",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "swarm_id": {"type": "string", "description": "Swarm ID"},
+                "level": {
+                    "type": "string",
+                    "enum": ["N0_INITIATIVE", "N1_FEATURE", "N2_WORKSTREAM", "N3_TASK"],
+                    "default": "N3_TASK",
+                    "description": "Task hierarchy level",
+                },
+                "title": {"type": "string", "description": "Task title"},
+                "description": {"type": "string", "description": "Task description"},
+                "owner": {"type": "string", "description": "Task owner (required)"},
+                "parent_id": {"type": "string", "description": "Parent task ID (required for N1-N3)"},
+                "priority": {
+                    "type": "string",
+                    "enum": ["P0", "P1", "P2"],
+                    "default": "P1",
+                    "description": "Priority level",
+                },
+                "eta_target": {"type": "string", "description": "Target completion date (ISO format)"},
+                "execution_target": {
+                    "type": "string",
+                    "enum": ["LOCAL", "CLOUD", "HYBRID", "EXTERNAL"],
+                    "description": "Where the task executes",
+                },
+                "workstream_type": {
+                    "type": "string",
+                    "enum": ["API", "FRONTEND", "QA", "BUGFIX_HARDENING", "DEPLOY_PROD_VERIFY", "DATA", "SECURITY", "DOCUMENTATION", "CUSTOM", "OTHER"],
+                    "description": "Workstream type for N2 tasks",
+                },
+                "acceptance_criteria": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": "List of acceptance criteria [{id, text, checked}]",
+                },
+                "context_refs": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Context references (URLs, file paths)",
+                },
+                "evidence_required": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": "Required evidence [{type, description}]",
+                },
+                "is_blocking": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Whether task blocks parent closure when failed/incomplete",
+                },
+            },
+            "required": ["swarm_id", "title", "description", "owner"],
+        },
+    },
+    {
+        "name": "rlm_htask_create_feature",
+        "description": """Create a N1 feature with standard workstreams.
+
+Creates a feature (N1) with automatic N2 workstreams: API, FRONTEND, QA, BUGFIX_HARDENING, DEPLOY_PROD_VERIFY.""",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "swarm_id": {"type": "string", "description": "Swarm ID"},
+                "title": {"type": "string", "description": "Feature title"},
+                "description": {"type": "string", "description": "Feature description"},
+                "owner": {"type": "string", "description": "Feature owner"},
+                "parent_id": {"type": "string", "description": "Optional N0 parent"},
+                "workstreams": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Workstream types to create (defaults to standard set)",
+                },
+            },
+            "required": ["swarm_id", "title", "description", "owner"],
+        },
+    },
+    {
+        "name": "rlm_htask_get",
+        "description": "Get a hierarchical task with its children.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "swarm_id": {"type": "string", "description": "Swarm ID"},
+                "task_id": {"type": "string", "description": "Task ID"},
+                "include_children": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Include direct children",
+                },
+            },
+            "required": ["swarm_id", "task_id"],
+        },
+    },
+    {
+        "name": "rlm_htask_tree",
+        "description": """Get full hierarchical tree from a node.
+
+Returns recursive tree structure with all descendants up to max_depth.""",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "swarm_id": {"type": "string", "description": "Swarm ID"},
+                "task_id": {"type": "string", "description": "Root task ID (optional, defaults to all roots)"},
+                "max_depth": {
+                    "type": "integer",
+                    "default": 4,
+                    "description": "Maximum depth to traverse",
+                },
+                "include_archived": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Include archived tasks",
+                },
+            },
+            "required": ["swarm_id"],
+        },
+    },
+    {
+        "name": "rlm_htask_update",
+        "description": """Update task fields (whitelist enforced by status).
+
+Different fields are updatable based on task status. Structural fields require admin.""",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "swarm_id": {"type": "string", "description": "Swarm ID"},
+                "task_id": {"type": "string", "description": "Task ID"},
+                "updates": {
+                    "type": "object",
+                    "description": "Fields to update",
+                },
+                "is_admin": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Admin privileges for structural updates",
+                },
+            },
+            "required": ["swarm_id", "task_id", "updates"],
+        },
+    },
+    {
+        "name": "rlm_htask_block",
+        "description": """Block a task with detailed payload.
+
+Requires blocker_type and blocker_reason. Automatically propagates to ancestors if is_blocking=true.""",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "swarm_id": {"type": "string", "description": "Swarm ID"},
+                "task_id": {"type": "string", "description": "Task ID"},
+                "blocker_type": {
+                    "type": "string",
+                    "enum": ["TECH", "DEPENDENCY", "ACCESS", "PRODUCT", "INFRA", "SECURITY", "OTHER"],
+                    "description": "Type of blocker",
+                },
+                "blocker_reason": {"type": "string", "description": "Detailed explanation"},
+                "blocked_by_task_id": {"type": "string", "description": "ID of blocking task"},
+                "required_input": {"type": "string", "description": "What's needed to unblock"},
+                "eta_recovery": {"type": "string", "description": "Expected unblock date (ISO)"},
+                "escalation_to": {"type": "string", "description": "Who to escalate to"},
+            },
+            "required": ["swarm_id", "task_id", "blocker_type", "blocker_reason"],
+        },
+    },
+    {
+        "name": "rlm_htask_unblock",
+        "description": "Unblock a task and re-evaluate ancestor status.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "swarm_id": {"type": "string", "description": "Swarm ID"},
+                "task_id": {"type": "string", "description": "Task ID"},
+                "resolution": {"type": "string", "description": "How the blocker was resolved"},
+            },
+            "required": ["swarm_id", "task_id"],
+        },
+    },
+    {
+        "name": "rlm_htask_complete",
+        "description": """Complete an N3 task with evidence.
+
+Evidence may be required based on policy. Use for leaf tasks (N3_TASK).""",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "swarm_id": {"type": "string", "description": "Swarm ID"},
+                "task_id": {"type": "string", "description": "Task ID"},
+                "evidence": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": "Evidence list [{type, description, ...}]",
+                },
+                "result": {
+                    "type": "object",
+                    "description": "Task result data",
+                },
+            },
+            "required": ["swarm_id", "task_id"],
+        },
+    },
+    {
+        "name": "rlm_htask_verify_closure",
+        "description": """Verify if a parent task can be closed.
+
+Checks all children status against closure policy. Returns blockers and waiver requirements.""",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "swarm_id": {"type": "string", "description": "Swarm ID"},
+                "task_id": {"type": "string", "description": "Task ID"},
+            },
+            "required": ["swarm_id", "task_id"],
+        },
+    },
+    {
+        "name": "rlm_htask_close",
+        "description": """Close a parent task (with optional waiver).
+
+Use waiver_reason and waiver_approved_by when closing with exceptions (if policy allows).""",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "swarm_id": {"type": "string", "description": "Swarm ID"},
+                "task_id": {"type": "string", "description": "Task ID"},
+                "waiver_reason": {"type": "string", "description": "Reason for waiver"},
+                "waiver_approved_by": {"type": "string", "description": "Who approved the waiver"},
+            },
+            "required": ["swarm_id", "task_id"],
+        },
+    },
+    {
+        "name": "rlm_htask_delete",
+        "description": """Delete a task (soft by default, hard with force flag).
+
+Soft delete archives the task. Hard delete removes permanently (requires policy + admin).""",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "swarm_id": {"type": "string", "description": "Swarm ID"},
+                "task_id": {"type": "string", "description": "Task ID"},
+                "force": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Hard delete (requires policy + admin)",
+                },
+                "cascade": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Delete all descendants",
+                },
+                "is_admin": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Admin privileges",
+                },
+            },
+            "required": ["swarm_id", "task_id"],
+        },
+    },
+    {
+        "name": "rlm_htask_recommend_batch",
+        "description": """Get recommended batch of N3 tasks ready to work on.
+
+Returns prioritized list of unblocked, pending N3 tasks.""",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "swarm_id": {"type": "string", "description": "Swarm ID"},
+                "limit": {
+                    "type": "integer",
+                    "default": 5,
+                    "description": "Maximum tasks to return",
+                },
+                "owner": {"type": "string", "description": "Filter by owner"},
+                "exclude_blocked": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Exclude blocked tasks",
+                },
+            },
+            "required": ["swarm_id"],
+        },
+    },
+    {
+        "name": "rlm_htask_policy_get",
+        "description": "Get the htask policy configuration for a swarm.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "swarm_id": {"type": "string", "description": "Swarm ID"},
+            },
+            "required": ["swarm_id"],
+        },
+    },
+    {
+        "name": "rlm_htask_policy_update",
+        "description": """Update the htask policy for a swarm.
+
+Admin-only fields: allowStructuralUpdate, allowHardDelete, compatMode.""",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "swarm_id": {"type": "string", "description": "Swarm ID"},
+                "updates": {
+                    "type": "object",
+                    "description": "Policy fields to update",
+                },
+                "is_admin": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Admin privileges",
+                },
+            },
+            "required": ["swarm_id", "updates"],
+        },
+    },
+    {
+        "name": "rlm_htask_metrics",
+        "description": """Get comprehensive metrics for htasks in a swarm.
+
+Includes throughput, aging by level, blocked/recovered ratio, and top blockers.""",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "swarm_id": {"type": "string", "description": "Swarm ID"},
+                "period_hours": {
+                    "type": "integer",
+                    "default": 24,
+                    "description": "Period for time-based metrics",
+                },
+            },
+            "required": ["swarm_id"],
+        },
+    },
+    {
+        "name": "rlm_htask_audit_trail",
+        "description": "Get complete audit trail for a specific task.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "swarm_id": {"type": "string", "description": "Swarm ID"},
+                "task_id": {"type": "string", "description": "Task ID"},
+            },
+            "required": ["swarm_id", "task_id"],
+        },
+    },
+    {
+        "name": "rlm_htask_checkpoint_delta",
+        "description": """Get delta report since last checkpoint.
+
+Returns events, closures, blocks since the specified timestamp.""",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "swarm_id": {"type": "string", "description": "Swarm ID"},
+                "since": {"type": "string", "description": "ISO timestamp of last checkpoint"},
+            },
+            "required": ["swarm_id", "since"],
         },
     },
 ]

@@ -85,6 +85,24 @@ class ToolName(StrEnum):
     RLM_INDEX_RECOMMENDATIONS = "rlm_index_recommendations"
     RLM_SEARCH_ANALYTICS = "rlm_search_analytics"
     RLM_QUERY_TRENDS = "rlm_query_trends"
+    # Phase 17: Hierarchical Tasks
+    RLM_HTASK_CREATE = "rlm_htask_create"
+    RLM_HTASK_CREATE_FEATURE = "rlm_htask_create_feature"
+    RLM_HTASK_GET = "rlm_htask_get"
+    RLM_HTASK_TREE = "rlm_htask_tree"
+    RLM_HTASK_UPDATE = "rlm_htask_update"
+    RLM_HTASK_BLOCK = "rlm_htask_block"
+    RLM_HTASK_UNBLOCK = "rlm_htask_unblock"
+    RLM_HTASK_COMPLETE = "rlm_htask_complete"
+    RLM_HTASK_VERIFY_CLOSURE = "rlm_htask_verify_closure"
+    RLM_HTASK_CLOSE = "rlm_htask_close"
+    RLM_HTASK_DELETE = "rlm_htask_delete"
+    RLM_HTASK_RECOMMEND_BATCH = "rlm_htask_recommend_batch"
+    RLM_HTASK_POLICY_GET = "rlm_htask_policy_get"
+    RLM_HTASK_POLICY_UPDATE = "rlm_htask_policy_update"
+    RLM_HTASK_METRICS = "rlm_htask_metrics"
+    RLM_HTASK_AUDIT_TRAIL = "rlm_htask_audit_trail"
+    RLM_HTASK_CHECKPOINT_DELTA = "rlm_htask_checkpoint_delta"
 
 
 class SearchMode(StrEnum):

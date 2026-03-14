@@ -61,6 +61,25 @@ from .decisions import (
     handle_decision_query,
     handle_decision_supersede,
 )
+from .htask import (
+    handle_htask_audit_trail,
+    handle_htask_block,
+    handle_htask_checkpoint_delta,
+    handle_htask_close,
+    handle_htask_complete,
+    handle_htask_create,
+    handle_htask_create_feature,
+    handle_htask_delete,
+    handle_htask_get,
+    handle_htask_metrics,
+    handle_htask_policy_get,
+    handle_htask_policy_update,
+    handle_htask_recommend_batch,
+    handle_htask_tree,
+    handle_htask_unblock,
+    handle_htask_update,
+    handle_htask_verify_closure,
+)
 
 __all__ = [
     # Base
@@ -105,4 +124,22 @@ __all__ = [
     "handle_decision_create",
     "handle_decision_query",
     "handle_decision_supersede",
+    # Hierarchical Task handlers
+    "handle_htask_create",
+    "handle_htask_create_feature",
+    "handle_htask_get",
+    "handle_htask_tree",
+    "handle_htask_update",
+    "handle_htask_block",
+    "handle_htask_unblock",
+    "handle_htask_complete",
+    "handle_htask_verify_closure",
+    "handle_htask_close",
+    "handle_htask_delete",
+    "handle_htask_recommend_batch",
+    "handle_htask_policy_get",
+    "handle_htask_policy_update",
+    "handle_htask_metrics",
+    "handle_htask_audit_trail",
+    "handle_htask_checkpoint_delta",
 ]

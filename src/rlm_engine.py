@@ -358,6 +358,24 @@ AGENT_TOOLS = {
     ToolName.RLM_SWARM_MEMBERS,
     ToolName.RLM_SWARM_UPDATE,
     ToolName.RLM_TASK_REASSIGN,
+    # Hierarchical Task tools
+    ToolName.RLM_HTASK_CREATE,
+    ToolName.RLM_HTASK_CREATE_FEATURE,
+    ToolName.RLM_HTASK_GET,
+    ToolName.RLM_HTASK_TREE,
+    ToolName.RLM_HTASK_UPDATE,
+    ToolName.RLM_HTASK_BLOCK,
+    ToolName.RLM_HTASK_UNBLOCK,
+    ToolName.RLM_HTASK_COMPLETE,
+    ToolName.RLM_HTASK_VERIFY_CLOSURE,
+    ToolName.RLM_HTASK_CLOSE,
+    ToolName.RLM_HTASK_DELETE,
+    ToolName.RLM_HTASK_RECOMMEND_BATCH,
+    ToolName.RLM_HTASK_POLICY_GET,
+    ToolName.RLM_HTASK_POLICY_UPDATE,
+    ToolName.RLM_HTASK_METRICS,
+    ToolName.RLM_HTASK_AUDIT_TRAIL,
+    ToolName.RLM_HTASK_CHECKPOINT_DELTA,
 }
 
 # Default system instructions injected into every query response
@@ -957,6 +975,24 @@ class RLMEngine:
             ToolName.RLM_INDEX_RECOMMENDATIONS: self._handle_index_recommendations,
             ToolName.RLM_SEARCH_ANALYTICS: self._handle_search_analytics,
             ToolName.RLM_QUERY_TRENDS: self._handle_query_trends,
+            # Phase 17: Hierarchical Tasks
+            ToolName.RLM_HTASK_CREATE: self._handle_htask_create,
+            ToolName.RLM_HTASK_CREATE_FEATURE: self._handle_htask_create_feature,
+            ToolName.RLM_HTASK_GET: self._handle_htask_get,
+            ToolName.RLM_HTASK_TREE: self._handle_htask_tree,
+            ToolName.RLM_HTASK_UPDATE: self._handle_htask_update,
+            ToolName.RLM_HTASK_BLOCK: self._handle_htask_block,
+            ToolName.RLM_HTASK_UNBLOCK: self._handle_htask_unblock,
+            ToolName.RLM_HTASK_COMPLETE: self._handle_htask_complete,
+            ToolName.RLM_HTASK_VERIFY_CLOSURE: self._handle_htask_verify_closure,
+            ToolName.RLM_HTASK_CLOSE: self._handle_htask_close,
+            ToolName.RLM_HTASK_DELETE: self._handle_htask_delete,
+            ToolName.RLM_HTASK_RECOMMEND_BATCH: self._handle_htask_recommend_batch,
+            ToolName.RLM_HTASK_POLICY_GET: self._handle_htask_policy_get,
+            ToolName.RLM_HTASK_POLICY_UPDATE: self._handle_htask_policy_update,
+            ToolName.RLM_HTASK_METRICS: self._handle_htask_metrics,
+            ToolName.RLM_HTASK_AUDIT_TRAIL: self._handle_htask_audit_trail,
+            ToolName.RLM_HTASK_CHECKPOINT_DELTA: self._handle_htask_checkpoint_delta,
         }
 
         handler = handlers.get(tool)
@@ -7229,3 +7265,107 @@ print(f"[Snipara] {len(context.get('files', {}))} files loaded. Helpers: peek, g
             input_tokens=0,
             output_tokens=count_tokens(str(trends)),
         )
+
+    # ============ PHASE 17: HIERARCHICAL TASK HANDLERS ============
+
+    async def _handle_htask_create(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_htask_create - create a hierarchical task at any level."""
+        from .engine.handlers.htask import handle_htask_create
+
+        return await handle_htask_create(params, self._handler_ctx)
+
+    async def _handle_htask_create_feature(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_htask_create_feature - create N1 feature with workstreams."""
+        from .engine.handlers.htask import handle_htask_create_feature
+
+        return await handle_htask_create_feature(params, self._handler_ctx)
+
+    async def _handle_htask_get(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_htask_get - get task with children."""
+        from .engine.handlers.htask import handle_htask_get
+
+        return await handle_htask_get(params, self._handler_ctx)
+
+    async def _handle_htask_tree(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_htask_tree - get full hierarchical tree."""
+        from .engine.handlers.htask import handle_htask_tree
+
+        return await handle_htask_tree(params, self._handler_ctx)
+
+    async def _handle_htask_update(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_htask_update - update task fields."""
+        from .engine.handlers.htask import handle_htask_update
+
+        return await handle_htask_update(params, self._handler_ctx)
+
+    async def _handle_htask_block(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_htask_block - block task with payload."""
+        from .engine.handlers.htask import handle_htask_block
+
+        return await handle_htask_block(params, self._handler_ctx)
+
+    async def _handle_htask_unblock(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_htask_unblock - unblock task."""
+        from .engine.handlers.htask import handle_htask_unblock
+
+        return await handle_htask_unblock(params, self._handler_ctx)
+
+    async def _handle_htask_complete(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_htask_complete - complete N3 task with evidence."""
+        from .engine.handlers.htask import handle_htask_complete
+
+        return await handle_htask_complete(params, self._handler_ctx)
+
+    async def _handle_htask_verify_closure(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_htask_verify_closure - verify if parent can close."""
+        from .engine.handlers.htask import handle_htask_verify_closure
+
+        return await handle_htask_verify_closure(params, self._handler_ctx)
+
+    async def _handle_htask_close(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_htask_close - close parent task."""
+        from .engine.handlers.htask import handle_htask_close
+
+        return await handle_htask_close(params, self._handler_ctx)
+
+    async def _handle_htask_delete(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_htask_delete - delete task."""
+        from .engine.handlers.htask import handle_htask_delete
+
+        return await handle_htask_delete(params, self._handler_ctx)
+
+    async def _handle_htask_recommend_batch(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_htask_recommend_batch - get recommended N3 tasks."""
+        from .engine.handlers.htask import handle_htask_recommend_batch
+
+        return await handle_htask_recommend_batch(params, self._handler_ctx)
+
+    async def _handle_htask_policy_get(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_htask_policy_get - get htask policy."""
+        from .engine.handlers.htask import handle_htask_policy_get
+
+        return await handle_htask_policy_get(params, self._handler_ctx)
+
+    async def _handle_htask_policy_update(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_htask_policy_update - update htask policy."""
+        from .engine.handlers.htask import handle_htask_policy_update
+
+        return await handle_htask_policy_update(params, self._handler_ctx)
+
+    async def _handle_htask_metrics(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_htask_metrics - get comprehensive metrics."""
+        from .engine.handlers.htask import handle_htask_metrics
+
+        return await handle_htask_metrics(params, self._handler_ctx)
+
+    async def _handle_htask_audit_trail(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_htask_audit_trail - get task audit trail."""
+        from .engine.handlers.htask import handle_htask_audit_trail
+
+        return await handle_htask_audit_trail(params, self._handler_ctx)
+
+    async def _handle_htask_checkpoint_delta(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_htask_checkpoint_delta - get delta report."""
+        from .engine.handlers.htask import handle_htask_checkpoint_delta
+
+        return await handle_htask_checkpoint_delta(params, self._handler_ctx)
