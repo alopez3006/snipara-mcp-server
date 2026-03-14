@@ -19,24 +19,26 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# Create appuser home directory structure for caches
-RUN mkdir -p /home/appuser/.cache/torch/sentence_transformers
+# Create appuser home directory structure for Prisma and model caches
+RUN mkdir -p /home/appuser/.cache/huggingface /home/appuser/.cache/torch/sentence_transformers
 ENV HOME="/home/appuser"
 ENV HF_HOME="/home/appuser/.cache/huggingface"
+ENV TRANSFORMERS_CACHE="/home/appuser/.cache/huggingface"
 ENV SENTENCE_TRANSFORMERS_HOME="/home/appuser/.cache/torch/sentence_transformers"
 
 # Generate Prisma client (with HOME set so binaries go to /home/appuser/.cache)
+# ARG CACHEBUST forces layer invalidation when schema changes
+ARG CACHEBUST=1
 COPY prisma ./prisma
-RUN prisma generate
+RUN echo "Cache bust: $CACHEBUST" && prisma generate
 
 # Pre-download embedding models to avoid runtime network dependency
-# Models are cached in SENTENCE_TRANSFORMERS_HOME
+# Models are cached in /home/appuser/.cache/huggingface/
 # Primary model: bge-large (1024 dims) — pgvector indexing, memory, chunk search
-RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-large-en-v1.5', device='cpu')"
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-large-en-v1.5', device='cpu')" && \
+    ls -la /home/appuser/.cache/torch/sentence_transformers/
 # Light model: bge-small (384 dims) — on-the-fly fallback path (~10x faster on CPU)
 RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-small-en-v1.5', device='cpu')"
-# Verify model cache was created
-RUN ls -la /home/appuser/.cache/torch/sentence_transformers/
 
 
 # ============ RUNTIME STAGE ============
@@ -57,13 +59,14 @@ RUN groupadd --gid 1000 appgroup && \
 COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# Copy Prisma binaries cache from builder (already at /home/appuser/.cache)
+# Copy Prisma binaries and HuggingFace model cache from builder
 COPY --from=builder /home/appuser/.cache /home/appuser/.cache
 RUN chown -R appuser:appgroup /home/appuser
 
-# Set HOME and cache paths for appuser (must match build stage)
+# Set HOME and cache variables (must match build stage)
 ENV HOME="/home/appuser"
 ENV HF_HOME="/home/appuser/.cache/huggingface"
+ENV TRANSFORMERS_CACHE="/home/appuser/.cache/huggingface"
 ENV SENTENCE_TRANSFORMERS_HOME="/home/appuser/.cache/torch/sentence_transformers"
 
 # Copy application code
@@ -91,4 +94,3 @@ CMD ["gunicorn", "src.server:app", \
      "-b", "0.0.0.0:8000", \
      "--timeout", "120", \
      "--graceful-timeout", "30"]
-# Force rebuild Thu Mar 12 12:06:33 CET 2026 - add swarm tools
