@@ -51,18 +51,28 @@ UPDATE_WHITELIST = {
     "PENDING": [
         "title", "description", "owner", "priority", "etaTarget",
         "executionTarget", "acceptanceCriteria", "contextRefs",
-        "evidenceRequired", "isBlocking",
+        "evidenceRequired", "isBlocking", "status",
     ],
     "IN_PROGRESS": [
         "description", "etaTarget", "acceptanceCriteria",
-        "contextRefs", "evidenceProvided",
+        "contextRefs", "evidenceProvided", "status",
     ],
     "BLOCKED": [
         "blockerReason", "requiredInput", "etaRecovery", "escalationTo",
     ],
     "COMPLETED": [],
-    "FAILED": ["error"],
+    "FAILED": ["error", "status"],
     "CANCELLED": [],
+}
+
+# Valid status transitions
+VALID_TRANSITIONS = {
+    "PENDING": ["IN_PROGRESS", "CANCELLED"],
+    "IN_PROGRESS": ["BLOCKED", "FAILED", "COMPLETED", "CANCELLED"],
+    "BLOCKED": ["IN_PROGRESS", "CANCELLED"],  # Use unblock_task instead
+    "FAILED": ["IN_PROGRESS", "CANCELLED"],   # Retry
+    "COMPLETED": [],  # Terminal
+    "CANCELLED": [],  # Terminal
 }
 
 # Structural fields (admin only with allowStructuralUpdate)
@@ -1141,6 +1151,24 @@ async def update_htask(
             }
 
         prisma_updates[prisma_field] = value
+
+    # Validate status transition
+    if "status" in prisma_updates:
+        new_status = prisma_updates["status"]
+        valid_transitions = VALID_TRANSITIONS.get(task.status, [])
+        if new_status not in valid_transitions:
+            return {
+                "success": False,
+                "error": f"Invalid status transition: {task.status} → {new_status}. "
+                         f"Allowed: {valid_transitions}",
+            }
+
+        # Handle status-specific side effects
+        if new_status == "IN_PROGRESS" and task.status == "PENDING":
+            prisma_updates["startedAt"] = datetime.now(UTC)
+        elif new_status == "IN_PROGRESS" and task.status == "FAILED":
+            # Retry - clear error
+            prisma_updates["error"] = None
 
     # Validate parentId change (anti-cycle)
     if "parentId" in prisma_updates:

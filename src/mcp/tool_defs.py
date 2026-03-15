@@ -1906,7 +1906,19 @@ Returns recursive tree structure with all descendants up to max_depth.""",
         "name": "rlm_htask_update",
         "description": """Update task fields (whitelist enforced by status).
 
-Different fields are updatable based on task status. Structural fields require admin.""",
+Supports status transitions:
+- PENDING → IN_PROGRESS, CANCELLED
+- IN_PROGRESS → BLOCKED, FAILED, COMPLETED, CANCELLED
+- FAILED → IN_PROGRESS (retry), CANCELLED
+
+Example: {"updates": {"status": "IN_PROGRESS"}}
+
+Fields updatable by status:
+- PENDING: title, description, owner, priority, etaTarget, status, isBlocking
+- IN_PROGRESS: description, etaTarget, acceptanceCriteria, evidenceProvided, status
+- BLOCKED: blockerReason, requiredInput, etaRecovery, escalationTo
+
+Structural fields (level, parentId, sequenceNumber) require admin + policy.""",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1914,7 +1926,7 @@ Different fields are updatable based on task status. Structural fields require a
                 "task_id": {"type": "string", "description": "Task ID"},
                 "updates": {
                     "type": "object",
-                    "description": "Fields to update",
+                    "description": "Fields to update. Example: {\"status\": \"IN_PROGRESS\"}",
                 },
                 "is_admin": {
                     "type": "boolean",
