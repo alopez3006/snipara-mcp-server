@@ -5431,7 +5431,14 @@ Rationale: {decision.rationale}"""
                 - instructions: Clear instructions on what to do next
         """
         from .services.swarm import list_tasks, get_swarm_info
+        from .services.swarm_guards import (
+            safe_swarm_call,
+            validate_agent_status_response,
+            validate_swarm_info_response,
+            generate_correlation_id,
+        )
 
+        correlation_id = generate_correlation_id()
         swarm_id = params.get("swarm_id", "")
         agent_id = params.get("agent_id", "")
 
@@ -5442,40 +5449,62 @@ Rationale: {decision.rationale}"""
             if not agent_id:
                 missing.append("agent_id")
             return ToolResult(
-                data={"error": f"rlm_agent_status: missing required parameter(s): {', '.join(missing)}"},
+                data={
+                    "success": False,
+                    "error": f"rlm_agent_status: missing required parameter(s): {', '.join(missing)}",
+                    "correlation_id": correlation_id,
+                },
                 input_tokens=0,
                 output_tokens=0,
             )
 
-        # Get swarm info
-        swarm_info = await get_swarm_info(swarm_id)
-        if not swarm_info:
+        # Get swarm info with error handling
+        swarm_info, error = await safe_swarm_call(
+            get_swarm_info, swarm_id, error_context="get_swarm_info"
+        )
+        if error:
+            return ToolResult(data=error.to_dict(), input_tokens=0, output_tokens=0)
+
+        swarm_info = validate_swarm_info_response(swarm_info or {})
+        if not swarm_info.get("success"):
             return ToolResult(
-                data={"error": f"Swarm '{swarm_id}' not found"},
+                data={
+                    "success": False,
+                    "error": swarm_info.get("error", f"Swarm '{swarm_id}' not found"),
+                    "correlation_id": correlation_id,
+                },
                 input_tokens=0,
                 output_tokens=0,
             )
 
         # Get tasks assigned to this agent (pending status)
-        pending_tasks = await list_tasks(
+        pending_tasks, error = await safe_swarm_call(
+            list_tasks,
             swarm_id=swarm_id,
             status="pending",
             assigned_to=agent_id,
             limit=20,
+            error_context="list_pending_tasks",
         )
+        if error:
+            return ToolResult(data=error.to_dict(), input_tokens=0, output_tokens=0)
 
         # Get task this agent is currently working on (claimed status)
-        claimed_tasks = await list_tasks(
+        claimed_tasks, error = await safe_swarm_call(
+            list_tasks,
             swarm_id=swarm_id,
             status="claimed",
             assigned_to=agent_id,
             limit=5,
+            error_context="list_claimed_tasks",
         )
+        if error:
+            return ToolResult(data=error.to_dict(), input_tokens=0, output_tokens=0)
 
         # Build clear instructions based on status
         instructions = []
-        pending_list = pending_tasks.get("tasks", [])
-        claimed_list = claimed_tasks.get("tasks", [])
+        pending_list = (pending_tasks or {}).get("tasks", [])
+        claimed_list = (claimed_tasks or {}).get("tasks", [])
 
         if claimed_list:
             current_task = claimed_list[0]
@@ -5503,7 +5532,7 @@ Rationale: {decision.rationale}"""
                 "   → Or claim any available task: rlm_task_claim(swarm_id, agent_id)"
             )
 
-        result = {
+        result = validate_agent_status_response({
             "swarm": {
                 "id": swarm_info.get("id"),
                 "name": swarm_info.get("name"),
@@ -5515,7 +5544,8 @@ Rationale: {decision.rationale}"""
             "current_task": claimed_list[0] if claimed_list else None,
             "has_work": len(pending_list) > 0 or len(claimed_list) > 0,
             "instructions": "\n".join(instructions),
-        }
+        })
+        result["correlation_id"] = correlation_id
 
         return ToolResult(
             data=result,
@@ -5536,7 +5566,13 @@ Rationale: {decision.rationale}"""
             ToolResult with removal status
         """
         from .services.swarm import leave_swarm
+        from .services.swarm_guards import (
+            safe_swarm_call,
+            validate_leave_swarm_response,
+            generate_correlation_id,
+        )
 
+        correlation_id = generate_correlation_id()
         swarm_id = params.get("swarm_id", "")
         agent_id = params.get("agent_id", "")
 
@@ -5547,12 +5583,28 @@ Rationale: {decision.rationale}"""
             if not agent_id:
                 missing.append("agent_id")
             return ToolResult(
-                data={"error": f"rlm_swarm_leave: missing required parameter(s): {', '.join(missing)}"},
+                data={
+                    "success": False,
+                    "error": f"rlm_swarm_leave: missing required parameter(s): {', '.join(missing)}",
+                    "correlation_id": correlation_id,
+                },
                 input_tokens=0,
                 output_tokens=0,
             )
 
-        result = await leave_swarm(swarm_id=swarm_id, agent_id=agent_id)
+        # Execute with error handling
+        leave_result, error = await safe_swarm_call(
+            leave_swarm,
+            swarm_id=swarm_id,
+            agent_id=agent_id,
+            error_context="leave_swarm",
+        )
+        if error:
+            return ToolResult(data=error.to_dict(), input_tokens=0, output_tokens=0)
+
+        # Validate response
+        result = validate_leave_swarm_response(leave_result or {})
+        result["correlation_id"] = correlation_id
 
         return ToolResult(
             data=result,
@@ -5572,34 +5624,55 @@ Rationale: {decision.rationale}"""
             ToolResult with list of agents
         """
         from .services.swarm import get_swarm_info
+        from .services.swarm_guards import (
+            safe_swarm_call,
+            validate_swarm_members_response,
+            validate_swarm_info_response,
+            generate_correlation_id,
+        )
 
+        correlation_id = generate_correlation_id()
         swarm_id = params.get("swarm_id", "")
 
         if not swarm_id:
             return ToolResult(
-                data={"error": "rlm_swarm_members: missing required parameter 'swarm_id'"},
+                data={
+                    "success": False,
+                    "error": "rlm_swarm_members: missing required parameter 'swarm_id'",
+                    "correlation_id": correlation_id,
+                },
                 input_tokens=0,
                 output_tokens=0,
             )
 
-        swarm_info = await get_swarm_info(swarm_id)
-        if not swarm_info:
+        # Get swarm info with error handling
+        swarm_info, error = await safe_swarm_call(
+            get_swarm_info, swarm_id, error_context="get_swarm_info"
+        )
+        if error:
+            return ToolResult(data=error.to_dict(), input_tokens=0, output_tokens=0)
+
+        swarm_info = validate_swarm_info_response(swarm_info or {})
+        if not swarm_info.get("success"):
             return ToolResult(
-                data={"error": f"Swarm '{swarm_id}' not found"},
+                data={
+                    "success": False,
+                    "error": swarm_info.get("error", f"Swarm '{swarm_id}' not found"),
+                    "correlation_id": correlation_id,
+                },
                 input_tokens=0,
                 output_tokens=0,
             )
 
-        # Get agents list from swarm info
-        agents = swarm_info.get("agents", [])
-
-        result = {
+        # Build and validate response
+        result = validate_swarm_members_response({
             "swarm_id": swarm_id,
             "swarm_name": swarm_info.get("name"),
-            "agent_count": len(agents),
+            "agent_count": swarm_info.get("agent_count", 0),
             "max_agents": swarm_info.get("maxAgents", 10),
-            "agents": agents,
-        }
+            "agents": swarm_info.get("agents", []),
+        })
+        result["correlation_id"] = correlation_id
 
         return ToolResult(
             data=result,
