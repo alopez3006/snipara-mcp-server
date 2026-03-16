@@ -55,7 +55,7 @@ UPDATE_WHITELIST = {
     ],
     "IN_PROGRESS": [
         "description", "etaTarget", "acceptanceCriteria",
-        "contextRefs", "evidenceProvided", "status",
+        "contextRefs", "evidenceProvided", "result", "status",
     ],
     "BLOCKED": [
         "blockerReason", "requiredInput", "etaRecovery", "escalationTo",
@@ -149,6 +149,10 @@ async def _get_next_sequence(swarm_id: str, parent_id: str | None) -> int:
 
     Returns:
         Next sequence number
+
+    Note:
+        This is NOT concurrency-safe on its own. The create_htask function
+        handles race conditions with retry logic on unique constraint violations.
     """
     db = await get_db()
 
@@ -243,47 +247,79 @@ async def create_htask(
     if parent_id and not await _validate_no_cycle(None, parent_id):
         return {"success": False, "error": "Cycle detected in task hierarchy"}
 
-    # Auto-generate sequence number if not provided
-    if sequence_number is None:
-        sequence_number = await _get_next_sequence(swarm_id, parent_id)
-
     # Default isBlocking from policy
     if is_blocking is None:
         is_blocking = is_blocking_default(policy)
 
     db = await get_db()
 
-    # Create task - use relation connect syntax for prisma-client-py
-    create_data: dict[str, Any] = {
-        "swarm": {"connect": {"id": swarm_id}},
-        "level": level,
-        "sequenceNumber": sequence_number,
-        "title": title,
-        "description": description,
-        "owner": owner.strip(),
-        "priority": priority,
-        "status": "PENDING",
-        "isBlocking": is_blocking,
-        "contextRefs": context_refs or [],
-    }
+    # Retry loop for handling sequence number collisions (parallel creates)
+    max_retries = 3
+    task = None
 
-    # Optional fields
-    if parent_id:
-        create_data["parent"] = {"connect": {"id": parent_id}}
-    if workstream_type:
-        create_data["workstreamType"] = workstream_type
-    if custom_workstream_type:
-        create_data["customWorkstreamType"] = custom_workstream_type
-    if execution_target:
-        create_data["executionTarget"] = execution_target
-    if eta_target:
-        create_data["etaTarget"] = eta_target
-    if acceptance_criteria:
-        create_data["acceptanceCriteria"] = Json(acceptance_criteria)
-    if evidence_required:
-        create_data["evidenceRequired"] = Json(evidence_required)
+    for attempt in range(max_retries):
+        # Auto-generate sequence number if not provided (or on retry)
+        if sequence_number is None or attempt > 0:
+            sequence_number = await _get_next_sequence(swarm_id, parent_id)
+            # Add attempt offset to reduce collision chance on retry
+            if attempt > 0:
+                sequence_number += attempt
 
-    task = await db.hierarchicaltask.create(data=create_data)
+        # Create task - use relation connect syntax for prisma-client-py
+        create_data: dict[str, Any] = {
+            "swarm": {"connect": {"id": swarm_id}},
+            "level": level,
+            "sequenceNumber": sequence_number,
+            "title": title,
+            "description": description,
+            "owner": owner.strip(),
+            "priority": priority,
+            "status": "PENDING",
+            "isBlocking": is_blocking,
+            "contextRefs": context_refs or [],
+        }
+
+        # Optional fields
+        if parent_id:
+            create_data["parent"] = {"connect": {"id": parent_id}}
+        if workstream_type:
+            create_data["workstreamType"] = workstream_type
+        if custom_workstream_type:
+            create_data["customWorkstreamType"] = custom_workstream_type
+        if execution_target:
+            create_data["executionTarget"] = execution_target
+        if eta_target:
+            create_data["etaTarget"] = eta_target
+        if acceptance_criteria:
+            create_data["acceptanceCriteria"] = Json(acceptance_criteria)
+        if evidence_required:
+            create_data["evidenceRequired"] = Json(evidence_required)
+
+        try:
+            task = await db.hierarchicaltask.create(data=create_data)
+            break  # Success, exit retry loop
+        except Exception as e:
+            error_str = str(e).lower()
+            # Check for unique constraint violation on (swarmId, parentId, sequenceNumber)
+            if "unique constraint" in error_str or "unique_violation" in error_str:
+                if attempt < max_retries - 1:
+                    logger.warning(
+                        f"Sequence collision on htask create (attempt {attempt + 1}), retrying..."
+                    )
+                    sequence_number = None  # Force re-fetch on next iteration
+                    continue
+                else:
+                    logger.error(f"Failed to create htask after {max_retries} retries: {e}")
+                    return {
+                        "success": False,
+                        "error": "Failed to create task due to sequence collision. Please retry.",
+                    }
+            else:
+                # Other error, re-raise
+                raise
+
+    if not task:
+        return {"success": False, "error": "Failed to create task after retries"}
 
     # Log event
     await log_htask_event(
@@ -693,12 +729,17 @@ async def _propagate_blocked_status(swarm_id: str, task_id: str) -> list[str]:
     return affected
 
 
-async def unblock_task(swarm_id: str, task_id: str) -> dict[str, Any]:
+async def unblock_task(
+    swarm_id: str,
+    task_id: str,
+    resolution: str | None = None,
+) -> dict[str, Any]:
     """Clear blocking state from a task.
 
     Args:
         swarm_id: The swarm ID
         task_id: The task ID to unblock
+        resolution: How the blocker was resolved (for audit trail)
 
     Returns:
         Result with re-evaluated ancestors
@@ -713,6 +754,13 @@ async def unblock_task(swarm_id: str, task_id: str) -> dict[str, Any]:
 
     if task.status != "BLOCKED":
         return {"success": False, "error": f"Task is not blocked (status: {task.status})"}
+
+    # Capture blocker info for audit trail before clearing
+    previous_blocker = {
+        "type": task.blockerType,
+        "reason": task.blockerReason,
+        "blocked_at": task.blockedAt.isoformat() if task.blockedAt else None,
+    }
 
     # Clear blocking fields and set to IN_PROGRESS
     await db.hierarchicaltask.update(
@@ -733,20 +781,25 @@ async def unblock_task(swarm_id: str, task_id: str) -> dict[str, Any]:
     # Re-evaluate ancestor statuses
     reevaluated = await _reevaluate_ancestor_status(swarm_id, task_id)
 
-    # Log event
+    # Log event with resolution
     await log_htask_event(
         swarm_id=swarm_id,
         task_id=task_id,
         event_type="unblock",
-        payload={"reevaluated_ancestors": reevaluated},
+        payload={
+            "resolution": resolution,
+            "previous_blocker": previous_blocker,
+            "reevaluated_ancestors": reevaluated,
+        },
     )
 
-    logger.info(f"Unblocked htask {task_id}, reevaluated ancestors: {len(reevaluated)}")
+    logger.info(f"Unblocked htask {task_id}, resolution: {resolution}, reevaluated: {len(reevaluated)}")
 
     return {
         "success": True,
         "task_id": task_id,
         "new_status": "IN_PROGRESS",
+        "resolution": resolution,
         "reevaluated_ancestors": reevaluated,
     }
 
@@ -1132,6 +1185,13 @@ async def update_htask(
     # Get allowed fields for current status
     allowed = UPDATE_WHITELIST.get(task.status, [])
 
+    # If status transition is requested, also allow fields from target status
+    # This enables atomic updates like: status=IN_PROGRESS + result={...}
+    target_status = updates.get("status")
+    if target_status and target_status != task.status:
+        target_allowed = UPDATE_WHITELIST.get(target_status, [])
+        allowed = list(set(allowed) | set(target_allowed))
+
     # Validate fields
     prisma_updates = {}
     for field, value in updates.items():
@@ -1147,7 +1207,8 @@ async def update_htask(
         elif field not in allowed and prisma_field not in allowed:
             return {
                 "success": False,
-                "error": f"Cannot update '{field}' when status is {task.status}",
+                "error": f"Cannot update '{field}' when status is {task.status}. "
+                         f"Allowed fields: {sorted(allowed)}",
             }
 
         prisma_updates[prisma_field] = value
