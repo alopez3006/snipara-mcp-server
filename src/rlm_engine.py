@@ -4325,6 +4325,7 @@ Rationale: {decision.rationale}"""
         try:
             collections = await list_shared_collections(
                 user_id=user_id,
+                project_id=self.project_id,
                 include_public=include_public,
             )
 
@@ -4403,6 +4404,7 @@ Rationale: {decision.rationale}"""
             result = await create_shared_document(
                 collection_id=collection_id,
                 user_id=self.user_id,
+                project_id=self.project_id,
                 title=title,
                 content=content,
                 category=category,

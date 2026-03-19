@@ -621,19 +621,22 @@ async def _get_user_team_ids(user_id: str | None) -> list[str]:
 
 
 async def list_shared_collections(
-    user_id: str,
+    user_id: str | None = None,
+    project_id: str | None = None,
     include_public: bool = True,
 ) -> list[dict]:
     """
-    List all shared context collections accessible to a user.
+    List all shared context collections accessible to a user or project.
 
     Returns collections where:
     - User owns the collection directly
     - User is a member of the team that owns the collection
+    - Collection is linked to the project (via projectLinks)
     - Collection is public (if include_public=True)
 
     Args:
-        user_id: The user ID
+        user_id: The user ID (optional if project_id provided)
+        project_id: The project ID (optional, for project API key access)
         include_public: Whether to include public collections (default True)
 
     Returns:
@@ -641,8 +644,9 @@ async def list_shared_collections(
     """
     db = await get_db()
 
-    # Early validation - user_id must be valid for non-public queries
+    # Early validation - need user_id or project_id for non-public queries
     has_valid_user = bool(user_id)
+    has_valid_project = bool(project_id)
 
     # First, get all team IDs where user is a member
     user_team_ids = await _get_user_team_ids(user_id) if has_valid_user else []
@@ -656,6 +660,10 @@ async def list_shared_collections(
         # Add team access condition if user is in any teams
         if user_team_ids:
             or_conditions.append({"teamId": {"in": user_team_ids}})
+
+    # Add project-based condition if we have a valid project_id
+    if has_valid_project:
+        or_conditions.append({"projectLinks": {"some": {"projectId": project_id}}})
 
     if include_public:
         or_conditions.append({"isPublic": True})
@@ -679,10 +687,14 @@ async def list_shared_collections(
     result = []
     for col in collections:
         # Determine access type for clarity
-        if col.ownerId == user_id:
+        if has_valid_user and col.ownerId == user_id:
             access_type = "owner"
         elif col.teamId and col.teamId in user_team_ids:
             access_type = "team_member"
+        elif has_valid_project and col.projectLinks and any(
+            pl.projectId == project_id for pl in col.projectLinks
+        ):
+            access_type = "project_linked"
         else:
             access_type = "public"
 
@@ -711,9 +723,10 @@ async def list_shared_collections(
 
 async def create_shared_document(
     collection_id: str,
-    user_id: str,
-    title: str,
-    content: str,
+    user_id: str | None = None,
+    project_id: str | None = None,
+    title: str = "",
+    content: str = "",
     category: str | None = None,
     tags: list[str] | None = None,
     priority: int = 0,
@@ -724,6 +737,7 @@ async def create_shared_document(
     Args:
         collection_id: The collection ID
         user_id: The user creating the document (for auth check)
+        project_id: The project ID (for project API key access)
         title: Document title
         content: Document content (markdown)
         category: Optional category (MANDATORY, BEST_PRACTICES, GUIDELINES, REFERENCE)
@@ -740,19 +754,27 @@ async def create_shared_document(
 
     db = await get_db()
 
-    # Validate user_id
-    if not user_id:
-        raise ValueError("user_id is required to upload shared documents")
+    # Validate we have either user_id or project_id
+    if not user_id and not project_id:
+        raise ValueError("user_id or project_id is required to upload shared documents")
 
     # First, get all team IDs where user is a member
-    user_team_ids = await _get_user_team_ids(user_id)
+    user_team_ids = await _get_user_team_ids(user_id) if user_id else []
 
     # Build access conditions
-    or_conditions: list[dict] = [
-        {"ownerId": user_id},
-    ]
-    if user_team_ids:
-        or_conditions.append({"teamId": {"in": user_team_ids}})
+    or_conditions: list[dict] = []
+
+    if user_id:
+        or_conditions.append({"ownerId": user_id})
+        if user_team_ids:
+            or_conditions.append({"teamId": {"in": user_team_ids}})
+
+    # Add project-based condition if we have a valid project_id
+    if project_id:
+        or_conditions.append({"projectLinks": {"some": {"projectId": project_id}}})
+
+    if not or_conditions:
+        raise ValueError("No valid access credentials provided")
 
     # Check collection exists and user has access
     collection = await db.sharedcontextcollection.find_first(
@@ -765,7 +787,8 @@ async def create_shared_document(
     if not collection:
         raise ValueError(
             "Collection not found or you don't have access. "
-            "You must own the collection or be a member of its team."
+            "You must own the collection, be a member of its team, "
+            "or the collection must be linked to your project."
         )
 
     # Generate slug from title
