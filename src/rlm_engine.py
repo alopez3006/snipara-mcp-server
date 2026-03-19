@@ -1881,6 +1881,8 @@ class RLMEngine:
             from src.engine.handlers.decisions import handle_decision_query
             from src.models.decision import DecisionQueryParams
 
+            db = await get_db()
+
             # Query active decisions with HIGH or CRITICAL impact
             for impact in ["CRITICAL", "HIGH"]:
                 query_params = DecisionQueryParams(
@@ -1890,7 +1892,7 @@ class RLMEngine:
                     include_superseded=False,
                 )
                 decision_result = await handle_decision_query(
-                    self.db, self.project_id, query_params
+                    db, self.project_id, query_params
                 )
 
                 for decision in decision_result.decisions:
@@ -7231,7 +7233,8 @@ print(f"[Snipara] {len(context.get('files', {}))} files loaded. Helpers: peek, g
                 tags=params.get("tags", []),
             )
 
-            result = await handle_decision_create(self.db, self.project_id, create_params)
+            db = await get_db()
+            result = await handle_decision_create(db, self.project_id, create_params)
 
             return ToolResult(
                 data=result.model_dump(),
@@ -7264,7 +7267,8 @@ print(f"[Snipara] {len(context.get('files', {}))} files loaded. Helpers: peek, g
             include_superseded=params.get("include_superseded", False),
         )
 
-        result = await handle_decision_query(self.db, self.project_id, query_params)
+        db = await get_db()
+        result = await handle_decision_query(db, self.project_id, query_params)
 
         return ToolResult(
             data=result.model_dump(),
@@ -7303,8 +7307,9 @@ print(f"[Snipara] {len(context.get('files', {}))} files loaded. Helpers: peek, g
                 tags=params.get("tags", []),
             )
 
+            db = await get_db()
             result = await handle_decision_supersede(
-                self.db, self.project_id, old_decision_id, new_params
+                db, self.project_id, old_decision_id, new_params
             )
 
             return ToolResult(
