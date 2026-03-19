@@ -80,7 +80,7 @@ PostgreSQL:
   Version: "14+"
   Storage: "100GB SSD"
   Memory: "4GB RAM"
-  Note: "Neon, Supabase, or self-hosted"
+  Note: "Vaultbrix, Neon, or self-hosted"
 
 Redis:
   Version: "7+"
