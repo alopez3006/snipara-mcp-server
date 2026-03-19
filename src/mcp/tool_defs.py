@@ -65,7 +65,6 @@ TOOL_TIERS: dict[str, ToolTier] = {
     "rlm_get_template": ToolTier.TEAM,
     "rlm_upload_shared_document": ToolTier.TEAM,
     "rlm_list_collections": ToolTier.TEAM,
-    "rlm_create_collection": ToolTier.TEAM,
     "rlm_load_project": ToolTier.TEAM,
     # UTILITY (⚪) - Session management
     "rlm_inject": ToolTier.UTILITY,
@@ -103,6 +102,9 @@ TOOL_TIERS: dict[str, ToolTier] = {
     "rlm_task_reassign": ToolTier.ADVANCED,  # Reassign task
     "rlm_task_delete": ToolTier.ADVANCED,  # Delete task (admin only)
     "rlm_task_update": ToolTier.ADVANCED,  # Update task (admin only)
+    # ADVANCED - Agent Profiles (Soul Layer)
+    "rlm_agent_profile_get": ToolTier.ADVANCED,
+    "rlm_agent_profile_update": ToolTier.ADVANCED,
     # POWER_USER - Decision Log
     "rlm_decision_create": ToolTier.POWER_USER,
     "rlm_decision_query": ToolTier.POWER_USER,
@@ -130,6 +132,17 @@ TOOL_TIERS: dict[str, ToolTier] = {
     "rlm_htask_metrics": ToolTier.ADVANCED,
     "rlm_htask_audit_trail": ToolTier.ADVANCED,
     "rlm_htask_checkpoint_delta": ToolTier.ADVANCED,
+    # POWER_USER - Daily Journal
+    "rlm_journal_append": ToolTier.POWER_USER,
+    "rlm_journal_get": ToolTier.POWER_USER,
+    "rlm_journal_summarize": ToolTier.POWER_USER,
+    # POWER_USER - Memory Tiers & Compaction (Phase 20)
+    "rlm_session_memories": ToolTier.POWER_USER,
+    "rlm_memory_compact": ToolTier.ADVANCED,
+    "rlm_memory_daily_brief": ToolTier.POWER_USER,
+    # TEAM - Tenant Profile (Phase 20)
+    "rlm_tenant_profile_create": ToolTier.TEAM,
+    "rlm_tenant_profile_get": ToolTier.TEAM,
 }
 
 
@@ -519,39 +532,6 @@ TOOL_DEFINITIONS: list[dict] = [
         },
     },
     {
-        "name": "rlm_create_collection",
-        "description": "Create a new shared context collection. Collections can be scoped to TEAM (shared within your team), USER (personal across projects), or GLOBAL (public). Use this before uploading shared documents.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "name": {
-                    "type": "string",
-                    "description": "Human-readable name for the collection",
-                },
-                "slug": {
-                    "type": "string",
-                    "description": "URL-friendly identifier (lowercase, hyphens only, e.g. 'coding-standards')",
-                },
-                "description": {
-                    "type": "string",
-                    "description": "Optional description of the collection",
-                },
-                "scope": {
-                    "type": "string",
-                    "enum": ["TEAM", "USER", "GLOBAL"],
-                    "default": "TEAM",
-                    "description": "Collection scope: TEAM (shared within team), USER (personal), GLOBAL (public)",
-                },
-                "is_public": {
-                    "type": "boolean",
-                    "default": False,
-                    "description": "Whether the collection is publicly visible (only applies to GLOBAL scope)",
-                },
-            },
-            "required": ["name", "slug"],
-        },
-    },
-    {
         "name": "rlm_upload_shared_document",
         "description": "Upload or update a document in a shared context collection. Use for team best practices, coding standards, and guidelines. Requires Team plan or higher.",
         "inputSchema": {
@@ -745,6 +725,216 @@ TOOL_DEFINITIONS: list[dict] = [
             "required": [],
         },
     },
+    # ============ Daily Journal Tools ============
+    {
+        "name": "rlm_journal_append",
+        "description": "Append an entry to today's journal. Journals are daily logs of operational notes, decisions, and context. Auto-loads today + yesterday on session start.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "description": "Journal entry text (markdown supported)",
+                },
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional tags for categorization",
+                },
+            },
+            "required": ["text"],
+        },
+    },
+    {
+        "name": "rlm_journal_get",
+        "description": "Get journal entries for a specific date. Returns all entries from that day's operational log.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "date": {
+                    "type": "string",
+                    "description": "Date in YYYY-MM-DD format (default: today)",
+                },
+                "include_yesterday": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Also include yesterday's entries",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "rlm_journal_summarize",
+        "description": "Get journal entries for a date, ready for summarization. Use before archiving old journals.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "date": {
+                    "type": "string",
+                    "description": "Date to summarize (YYYY-MM-DD)",
+                },
+            },
+            "required": ["date"],
+        },
+    },
+    # ============ Memory Tiers & Compaction Tools (Phase 20) ============
+    {
+        "name": "rlm_session_memories",
+        "description": "Get tiered memories for session auto-load. Returns CRITICAL (decisions, facts) and DAILY (context, todos) memories organized by tier with token budgets.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "max_critical_tokens": {
+                    "type": "integer",
+                    "default": 8000,
+                    "description": "Token budget for CRITICAL tier",
+                },
+                "max_daily_tokens": {
+                    "type": "integer",
+                    "default": 4000,
+                    "description": "Token budget for DAILY tier",
+                },
+                "include_yesterday": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Include yesterday's daily memories",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "rlm_memory_compact",
+        "description": "Compact and optimize memories. Deduplicates similar memories, promotes frequent learnings to CRITICAL tier, and archives old entries.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "scope": {
+                    "type": "string",
+                    "enum": ["agent", "project", "team"],
+                    "default": "project",
+                    "description": "Memory scope to compact",
+                },
+                "deduplicate": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Merge similar memories",
+                },
+                "promote_threshold": {
+                    "type": "integer",
+                    "default": 3,
+                    "description": "If learning accessed N times, promote to CRITICAL",
+                },
+                "archive_older_than_days": {
+                    "type": "integer",
+                    "default": 30,
+                    "description": "Archive memories older than N days",
+                },
+                "dry_run": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Preview changes without applying",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "rlm_memory_daily_brief",
+        "description": "Generate a 'Top N active constraints' daily brief. Summarizes critical decisions, active rules, and pending todos.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "date": {
+                    "type": "string",
+                    "description": "Date for brief (default: today)",
+                },
+                "max_items": {
+                    "type": "integer",
+                    "default": 10,
+                    "description": "Maximum items to include",
+                },
+            },
+            "required": [],
+        },
+    },
+    # ============ Tenant Profile Tools (Phase 20) ============
+    {
+        "name": "rlm_tenant_profile_create",
+        "description": "Create a structured tenant/client profile. Stored as CRITICAL memory for auto-loading. Use for client onboarding.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "client_name": {
+                    "type": "string",
+                    "description": "Name of the client/tenant (required)",
+                },
+                "business_model": {
+                    "type": "string",
+                    "description": "How the business works",
+                },
+                "industry": {
+                    "type": "string",
+                    "description": "Industry vertical",
+                },
+                "tech_stack": {
+                    "type": "string",
+                    "description": "Technology stack used",
+                },
+                "legal_constraints": {
+                    "type": "string",
+                    "description": "Legal requirements",
+                },
+                "security_requirements": {
+                    "type": "string",
+                    "description": "Security constraints",
+                },
+                "ui_ux_prefs": {
+                    "type": "string",
+                    "description": "UI/UX preferences",
+                },
+                "communication_style": {
+                    "type": "string",
+                    "description": "How to communicate",
+                },
+                "risk_tolerance": {
+                    "type": "string",
+                    "enum": ["low", "medium", "high"],
+                    "description": "Risk tolerance level",
+                },
+                "dos": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of things to do",
+                },
+                "donts": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of things to avoid",
+                },
+                "custom_fields": {
+                    "type": "object",
+                    "description": "Additional custom fields",
+                },
+            },
+            "required": ["client_name"],
+        },
+    },
+    {
+        "name": "rlm_tenant_profile_get",
+        "description": "Get tenant profile(s) for a project. Returns latest profile if tenant_id not specified.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tenant_id": {
+                    "type": "string",
+                    "description": "Specific profile ID (optional, returns all if not specified)",
+                },
+            },
+            "required": [],
+        },
+    },
     # ============ Multi-Agent Swarm Tools ============
     {
         "name": "rlm_swarm_create",
@@ -776,6 +966,44 @@ TOOL_DEFINITIONS: list[dict] = [
                 "capabilities": {"type": "array", "items": {"type": "string"}},
             },
             "required": ["swarm_id", "agent_id"],
+        },
+    },
+    {
+        "name": "rlm_agent_profile_get",
+        "description": "Get an agent's profile (identity, personality, boundaries). Auto-loaded on session start for swarm agents.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "swarm_id": {"type": "string", "description": "Swarm ID"},
+                "agent_id": {"type": "string", "description": "Agent identifier"},
+            },
+            "required": ["swarm_id", "agent_id"],
+        },
+    },
+    {
+        "name": "rlm_agent_profile_update",
+        "description": "Update an agent's profile. Use to set personality, boundaries, communication style.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "swarm_id": {"type": "string", "description": "Swarm ID"},
+                "agent_id": {"type": "string", "description": "Agent identifier"},
+                "profile": {
+                    "type": "object",
+                    "description": "Profile data (merged with existing)",
+                    "properties": {
+                        "display_name": {"type": "string", "description": "Display name (e.g., 'Jarvis ⚡')"},
+                        "personality": {"type": "string", "description": "Personality type (e.g., 'INTJ - Strategic')"},
+                        "role_description": {"type": "string", "description": "Role description"},
+                        "boundaries": {"type": "array", "items": {"type": "string"}, "description": "Boundaries and limits"},
+                        "communication_style": {"type": "string", "description": "Preferred communication style"},
+                        "decision_making": {"type": "string", "description": "Decision-making approach"},
+                        "soul_document_path": {"type": "string", "description": "Path to SOUL.md document"},
+                        "memory_scope": {"type": "string", "enum": ["agent", "project", "team"], "description": "Memory scope"},
+                    },
+                },
+            },
+            "required": ["swarm_id", "agent_id", "profile"],
         },
     },
     {
@@ -1875,15 +2103,13 @@ Tasks have owners, priorities, acceptance criteria, and evidence requirements.""
         "name": "rlm_htask_create_feature",
         "description": """Create a N1 feature with standard workstreams.
 
-Creates a feature (N1) with automatic N2 workstreams: API, FRONTEND, QA, BUGFIX_HARDENING, DEPLOY_PROD_VERIFY.
-
-Minimal call: rlm_htask_create_feature(swarm_id, title, owner) - description auto-generated.""",
+Creates a feature (N1) with automatic N2 workstreams: API, FRONTEND, QA, BUGFIX_HARDENING, DEPLOY_PROD_VERIFY.""",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "swarm_id": {"type": "string", "description": "Swarm ID"},
                 "title": {"type": "string", "description": "Feature title"},
-                "description": {"type": "string", "description": "Feature description (auto-generated if not provided)"},
+                "description": {"type": "string", "description": "Feature description"},
                 "owner": {"type": "string", "description": "Feature owner"},
                 "parent_id": {"type": "string", "description": "Optional N0 parent"},
                 "workstreams": {
@@ -1892,7 +2118,7 @@ Minimal call: rlm_htask_create_feature(swarm_id, title, owner) - description aut
                     "description": "Workstream types to create (defaults to standard set)",
                 },
             },
-            "required": ["swarm_id", "title", "owner"],
+            "required": ["swarm_id", "title", "description", "owner"],
         },
     },
     {
@@ -1927,10 +2153,10 @@ Returns recursive tree structure with all descendants up to max_depth.""",
                     "default": 4,
                     "description": "Maximum depth to traverse",
                 },
-                "include_completed": {
+                "include_archived": {
                     "type": "boolean",
                     "default": False,
-                    "description": "Include completed tasks",
+                    "description": "Include archived tasks",
                 },
             },
             "required": ["swarm_id"],
@@ -1940,19 +2166,7 @@ Returns recursive tree structure with all descendants up to max_depth.""",
         "name": "rlm_htask_update",
         "description": """Update task fields (whitelist enforced by status).
 
-Supports status transitions:
-- PENDING → IN_PROGRESS, CANCELLED
-- IN_PROGRESS → BLOCKED, FAILED, COMPLETED, CANCELLED
-- FAILED → IN_PROGRESS (retry), CANCELLED
-
-Example: {"updates": {"status": "IN_PROGRESS"}}
-
-Fields updatable by status:
-- PENDING: title, description, owner, priority, etaTarget, status, isBlocking
-- IN_PROGRESS: description, etaTarget, acceptanceCriteria, evidenceProvided, status
-- BLOCKED: blockerReason, requiredInput, etaRecovery, escalationTo
-
-Structural fields (level, parentId, sequenceNumber) require admin + policy.""",
+Different fields are updatable based on task status. Structural fields require admin.""",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1960,7 +2174,7 @@ Structural fields (level, parentId, sequenceNumber) require admin + policy.""",
                 "task_id": {"type": "string", "description": "Task ID"},
                 "updates": {
                     "type": "object",
-                    "description": "Fields to update. Example: {\"status\": \"IN_PROGRESS\"}",
+                    "description": "Fields to update",
                 },
                 "is_admin": {
                     "type": "boolean",
@@ -2010,9 +2224,10 @@ Requires blocker_type and blocker_reason. Automatically propagates to ancestors 
     },
     {
         "name": "rlm_htask_complete",
-        "description": """Complete an N3 task with evidence.
+        "description": """Complete an N3 task with evidence and optional memory creation.
 
-Evidence may be required based on policy. Use for leaf tasks (N3_TASK).""",
+Evidence may be required based on policy. Use for leaf tasks (N3_TASK).
+Automatically creates a linked memory with task outcome, learnings, and decision impact.""",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2026,6 +2241,20 @@ Evidence may be required based on policy. Use for leaf tasks (N3_TASK).""",
                 "result": {
                     "type": "object",
                     "description": "Task result data",
+                },
+                "learnings": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Lessons learned from this task",
+                },
+                "decision_impact": {
+                    "type": "string",
+                    "description": "How this task affects future decisions",
+                },
+                "create_memory": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Auto-create a memory with task outcome (default: true)",
                 },
             },
             "required": ["swarm_id", "task_id"],

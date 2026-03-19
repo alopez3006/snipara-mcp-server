@@ -51,28 +51,18 @@ UPDATE_WHITELIST = {
     "PENDING": [
         "title", "description", "owner", "priority", "etaTarget",
         "executionTarget", "acceptanceCriteria", "contextRefs",
-        "evidenceRequired", "isBlocking", "status",
+        "evidenceRequired", "isBlocking",
     ],
     "IN_PROGRESS": [
         "description", "etaTarget", "acceptanceCriteria",
-        "contextRefs", "evidenceProvided", "status",
+        "contextRefs", "evidenceProvided",
     ],
     "BLOCKED": [
         "blockerReason", "requiredInput", "etaRecovery", "escalationTo",
     ],
     "COMPLETED": [],
-    "FAILED": ["error", "status"],
+    "FAILED": ["error"],
     "CANCELLED": [],
-}
-
-# Valid status transitions
-VALID_TRANSITIONS = {
-    "PENDING": ["IN_PROGRESS", "CANCELLED"],
-    "IN_PROGRESS": ["BLOCKED", "FAILED", "COMPLETED", "CANCELLED"],
-    "BLOCKED": ["IN_PROGRESS", "CANCELLED"],  # Use unblock_task instead
-    "FAILED": ["IN_PROGRESS", "CANCELLED"],   # Retry
-    "COMPLETED": [],  # Terminal
-    "CANCELLED": [],  # Terminal
 }
 
 # Structural fields (admin only with allowStructuralUpdate)
@@ -149,10 +139,6 @@ async def _get_next_sequence(swarm_id: str, parent_id: str | None) -> int:
 
     Returns:
         Next sequence number
-
-    Note:
-        This is NOT concurrency-safe on its own. The create_htask function
-        handles race conditions with retry logic on unique constraint violations.
     """
     db = await get_db()
 
@@ -247,79 +233,38 @@ async def create_htask(
     if parent_id and not await _validate_no_cycle(None, parent_id):
         return {"success": False, "error": "Cycle detected in task hierarchy"}
 
+    # Auto-generate sequence number if not provided
+    if sequence_number is None:
+        sequence_number = await _get_next_sequence(swarm_id, parent_id)
+
     # Default isBlocking from policy
     if is_blocking is None:
         is_blocking = is_blocking_default(policy)
 
     db = await get_db()
 
-    # Retry loop for handling sequence number collisions (parallel creates)
-    max_retries = 3
-    task = None
-
-    for attempt in range(max_retries):
-        # Auto-generate sequence number if not provided (or on retry)
-        if sequence_number is None or attempt > 0:
-            sequence_number = await _get_next_sequence(swarm_id, parent_id)
-            # Add attempt offset to reduce collision chance on retry
-            if attempt > 0:
-                sequence_number += attempt
-
-        # Create task - use relation connect syntax for prisma-client-py
-        create_data: dict[str, Any] = {
-            "swarm": {"connect": {"id": swarm_id}},
+    # Create task
+    task = await db.hierarchicaltask.create(
+        data={
+            "swarmId": swarm_id,
             "level": level,
+            "parentId": parent_id,
             "sequenceNumber": sequence_number,
+            "workstreamType": workstream_type,
+            "customWorkstreamType": custom_workstream_type,
             "title": title,
             "description": description,
             "owner": owner.strip(),
+            "executionTarget": execution_target,
             "priority": priority,
+            "etaTarget": eta_target,
+            "acceptanceCriteria": Json(acceptance_criteria) if acceptance_criteria else None,
+            "contextRefs": context_refs or [],
+            "evidenceRequired": Json(evidence_required) if evidence_required else None,
             "status": "PENDING",
             "isBlocking": is_blocking,
-            "contextRefs": context_refs or [],
         }
-
-        # Optional fields
-        if parent_id:
-            create_data["parent"] = {"connect": {"id": parent_id}}
-        if workstream_type:
-            create_data["workstreamType"] = workstream_type
-        if custom_workstream_type:
-            create_data["customWorkstreamType"] = custom_workstream_type
-        if execution_target:
-            create_data["executionTarget"] = execution_target
-        if eta_target:
-            create_data["etaTarget"] = eta_target
-        if acceptance_criteria:
-            create_data["acceptanceCriteria"] = Json(acceptance_criteria)
-        if evidence_required:
-            create_data["evidenceRequired"] = Json(evidence_required)
-
-        try:
-            task = await db.hierarchicaltask.create(data=create_data)
-            break  # Success, exit retry loop
-        except Exception as e:
-            error_str = str(e).lower()
-            # Check for unique constraint violation on (swarmId, parentId, sequenceNumber)
-            if "unique constraint" in error_str or "unique_violation" in error_str:
-                if attempt < max_retries - 1:
-                    logger.warning(
-                        f"Sequence collision on htask create (attempt {attempt + 1}), retrying..."
-                    )
-                    sequence_number = None  # Force re-fetch on next iteration
-                    continue
-                else:
-                    logger.error(f"Failed to create htask after {max_retries} retries: {e}")
-                    return {
-                        "success": False,
-                        "error": "Failed to create task due to sequence collision. Please retry.",
-                    }
-            else:
-                # Other error, re-raise
-                raise
-
-    if not task:
-        return {"success": False, "error": "Failed to create task after retries"}
+    )
 
     # Log event
     await log_htask_event(
@@ -729,17 +674,12 @@ async def _propagate_blocked_status(swarm_id: str, task_id: str) -> list[str]:
     return affected
 
 
-async def unblock_task(
-    swarm_id: str,
-    task_id: str,
-    resolution: str | None = None,
-) -> dict[str, Any]:
+async def unblock_task(swarm_id: str, task_id: str) -> dict[str, Any]:
     """Clear blocking state from a task.
 
     Args:
         swarm_id: The swarm ID
         task_id: The task ID to unblock
-        resolution: How the blocker was resolved (for audit trail)
 
     Returns:
         Result with re-evaluated ancestors
@@ -754,13 +694,6 @@ async def unblock_task(
 
     if task.status != "BLOCKED":
         return {"success": False, "error": f"Task is not blocked (status: {task.status})"}
-
-    # Capture blocker info for audit trail before clearing
-    previous_blocker = {
-        "type": task.blockerType,
-        "reason": task.blockerReason,
-        "blocked_at": task.blockedAt.isoformat() if task.blockedAt else None,
-    }
 
     # Clear blocking fields and set to IN_PROGRESS
     await db.hierarchicaltask.update(
@@ -781,25 +714,20 @@ async def unblock_task(
     # Re-evaluate ancestor statuses
     reevaluated = await _reevaluate_ancestor_status(swarm_id, task_id)
 
-    # Log event with resolution
+    # Log event
     await log_htask_event(
         swarm_id=swarm_id,
         task_id=task_id,
         event_type="unblock",
-        payload={
-            "resolution": resolution,
-            "previous_blocker": previous_blocker,
-            "reevaluated_ancestors": reevaluated,
-        },
+        payload={"reevaluated_ancestors": reevaluated},
     )
 
-    logger.info(f"Unblocked htask {task_id}, resolution: {resolution}, reevaluated: {len(reevaluated)}")
+    logger.info(f"Unblocked htask {task_id}, reevaluated ancestors: {len(reevaluated)}")
 
     return {
         "success": True,
         "task_id": task_id,
         "new_status": "IN_PROGRESS",
-        "resolution": resolution,
         "reevaluated_ancestors": reevaluated,
     }
 
@@ -869,23 +797,30 @@ async def complete_task(
     task_id: str,
     evidence: list[dict] | None = None,
     result: dict | None = None,
+    learnings: list[str] | None = None,
+    decision_impact: str | None = None,
+    create_memory: bool = True,
 ) -> dict[str, Any]:
-    """Complete an N3 task with evidence.
+    """Complete an N3 task with evidence and optional memory creation.
 
     Args:
         swarm_id: The swarm ID
         task_id: The task ID
         evidence: List of evidence items [{type, url, description}]
         result: Optional result data
+        learnings: Optional list of lessons learned from this task
+        decision_impact: Optional description of how this task affects future decisions
+        create_memory: Whether to auto-create a memory with task outcome (default: True)
 
     Returns:
-        Completion result
+        Completion result with optional linked_memory_id
     """
     db = await get_db()
     policy = await get_policy(swarm_id)
 
     task = await db.hierarchicaltask.find_first(
-        where={"id": task_id, "swarmId": swarm_id}
+        where={"id": task_id, "swarmId": swarm_id},
+        include={"swarm": True},
     )
     if not task:
         return {"success": False, "error": f"Task {task_id} not found"}
@@ -905,15 +840,65 @@ async def complete_task(
                 "error": "Evidence is required for task completion",
             }
 
+    # Build update data
+    update_data = {
+        "status": "COMPLETED",
+        "completedAt": datetime.now(UTC),
+        "evidenceProvided": Json(evidence) if evidence else None,
+        "result": Json(result) if result else None,
+    }
+
+    # Create linked memory if requested
+    linked_memory_id = None
+    if create_memory and task.swarm and task.swarm.projectId:
+        from .agent_memory import store_memory
+
+        # Build memory content
+        memory_parts = [
+            f"## Task Completed: {task.title}",
+            f"**Status:** COMPLETED",
+            f"**Owner:** {task.owner}",
+            f"**Completed:** {datetime.now(UTC).isoformat()}",
+        ]
+
+        if evidence:
+            memory_parts.append("\n### Evidence Provided")
+            for ev in evidence:
+                ev_type = ev.get("type", "unknown")
+                ev_desc = ev.get("description", "")
+                memory_parts.append(f"- **{ev_type}**: {ev_desc}")
+
+        if result:
+            memory_parts.append(f"\n### Result\n```json\n{json.dumps(result, indent=2)}\n```")
+
+        if learnings:
+            memory_parts.append("\n### Learnings")
+            for learning in learnings:
+                memory_parts.append(f"- {learning}")
+
+        if decision_impact:
+            memory_parts.append(f"\n### Decision Impact\n{decision_impact}")
+
+        memory_content = "\n".join(memory_parts)
+
+        # Store the memory
+        memory_result = await store_memory(
+            project_id=task.swarm.projectId,
+            content=memory_content,
+            memory_type="LEARNING" if learnings else "FACT",
+            scope="PROJECT",
+            category=f"htask:{task_id}",
+            document_refs=[f"htask:{task_id}"],
+        )
+
+        if memory_result.get("memory_id"):
+            linked_memory_id = memory_result["memory_id"]
+            update_data["linkedMemoryId"] = linked_memory_id
+
     # Complete the task
     await db.hierarchicaltask.update(
         where={"id": task_id},
-        data={
-            "status": "COMPLETED",
-            "completedAt": datetime.now(UTC),
-            "evidenceProvided": Json(evidence) if evidence else None,
-            "result": Json(result) if result else None,
-        },
+        data=update_data,
     )
 
     # Log event
@@ -924,10 +909,12 @@ async def complete_task(
         payload={
             "evidence_count": len(evidence) if evidence else 0,
             "has_result": result is not None,
+            "has_learnings": learnings is not None and len(learnings) > 0,
+            "linked_memory_id": linked_memory_id,
         },
     )
 
-    logger.info(f"Completed htask {task_id}")
+    logger.info(f"Completed htask {task_id}" + (f" with memory {linked_memory_id}" if linked_memory_id else ""))
 
     # Check if parent can auto-close
     auto_closed = None
@@ -943,6 +930,7 @@ async def complete_task(
         "task_id": task_id,
         "status": "COMPLETED",
         "auto_closed_parent": auto_closed,
+        "linked_memory_id": linked_memory_id,
     }
 
 
@@ -1185,17 +1173,6 @@ async def update_htask(
     # Get allowed fields for current status
     allowed = UPDATE_WHITELIST.get(task.status, [])
 
-    # If status transition is requested, also allow fields from target status
-    target_status = updates.get("status")
-    if target_status and target_status != task.status:
-        target_allowed = UPDATE_WHITELIST.get(target_status, [])
-        allowed = list(set(allowed) | set(target_allowed))
-
-        # Special case: allow 'result' only when completing or failing
-        # This enables atomic updates like: status=COMPLETED + result={...}
-        if target_status in ("COMPLETED", "FAILED"):
-            allowed.append("result")
-
     # Validate fields
     prisma_updates = {}
     for field, value in updates.items():
@@ -1211,29 +1188,10 @@ async def update_htask(
         elif field not in allowed and prisma_field not in allowed:
             return {
                 "success": False,
-                "error": f"Cannot update '{field}' when status is {task.status}. "
-                         f"Allowed fields: {sorted(allowed)}",
+                "error": f"Cannot update '{field}' when status is {task.status}",
             }
 
         prisma_updates[prisma_field] = value
-
-    # Validate status transition
-    if "status" in prisma_updates:
-        new_status = prisma_updates["status"]
-        valid_transitions = VALID_TRANSITIONS.get(task.status, [])
-        if new_status not in valid_transitions:
-            return {
-                "success": False,
-                "error": f"Invalid status transition: {task.status} → {new_status}. "
-                         f"Allowed: {valid_transitions}",
-            }
-
-        # Handle status-specific side effects
-        if new_status == "IN_PROGRESS" and task.status == "PENDING":
-            prisma_updates["startedAt"] = datetime.now(UTC)
-        elif new_status == "IN_PROGRESS" and task.status == "FAILED":
-            # Retry - clear error
-            prisma_updates["error"] = None
 
     # Validate parentId change (anti-cycle)
     if "parentId" in prisma_updates:

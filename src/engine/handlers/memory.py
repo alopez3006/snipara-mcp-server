@@ -12,10 +12,13 @@ from typing import Any
 from ...models import ToolResult
 from ...services.agent_limits import check_memory_limits
 from ...services.agent_memory import (
+    append_journal,
     delete_memories,
+    get_journal,
     list_memories,
     semantic_recall,
     store_memory,
+    summarize_journal,
 )
 from .base import HandlerContext, count_tokens
 
@@ -277,6 +280,320 @@ async def handle_forget(
         memory_type=memory_type,
         category=category,
         older_than_days=older_than_days,
+    )
+
+    return ToolResult(
+        data=result,
+        input_tokens=0,
+        output_tokens=count_tokens(str(result)),
+    )
+
+
+# ============ DAILY JOURNAL HANDLERS ============
+
+
+async def handle_journal_append(
+    params: dict[str, Any],
+    ctx: HandlerContext,
+) -> ToolResult:
+    """Append an entry to today's journal.
+
+    Args:
+        params: Dict containing:
+            - text: Journal entry text (markdown supported)
+            - tags: Optional tags for categorization
+
+    Returns:
+        ToolResult with entry_id, date, and confirmation
+    """
+    text = params.get("text", "")
+    tags = params.get("tags")
+
+    if not text:
+        return ToolResult(
+            data={"error": "rlm_journal_append: missing required parameter 'text'"},
+            input_tokens=0,
+            output_tokens=0,
+        )
+
+    # Check memory limits (journal entries count against memory quota)
+    allowed, error = await check_memory_limits(ctx.project_id, ctx.user_id)
+    if not allowed:
+        return ToolResult(
+            data={"error": error, "upgrade_url": "/billing/upgrade"},
+            input_tokens=count_tokens(text),
+            output_tokens=0,
+        )
+
+    result = await append_journal(
+        project_id=ctx.project_id,
+        text=text,
+        tags=tags,
+    )
+
+    return ToolResult(
+        data=result,
+        input_tokens=count_tokens(text),
+        output_tokens=count_tokens(str(result)),
+    )
+
+
+async def handle_journal_get(
+    params: dict[str, Any],
+    ctx: HandlerContext,
+) -> ToolResult:
+    """Get journal entries for a specific date.
+
+    Args:
+        params: Dict containing:
+            - date: Date in YYYY-MM-DD format (default: today)
+            - include_yesterday: Also include yesterday's entries
+
+    Returns:
+        ToolResult with date, entries list, and total count
+    """
+    date = params.get("date")
+    include_yesterday = params.get("include_yesterday", False)
+
+    result = await get_journal(
+        project_id=ctx.project_id,
+        date=date,
+        include_yesterday=include_yesterday,
+    )
+
+    return ToolResult(
+        data=result,
+        input_tokens=0,
+        output_tokens=count_tokens(str(result)),
+    )
+
+
+async def handle_journal_summarize(
+    params: dict[str, Any],
+    ctx: HandlerContext,
+) -> ToolResult:
+    """Get journal entries for a date, ready for summarization.
+
+    Args:
+        params: Dict containing:
+            - date: Date to summarize (YYYY-MM-DD)
+
+    Returns:
+        ToolResult with combined content and suggested prompt
+    """
+    date = params.get("date")
+
+    if not date:
+        return ToolResult(
+            data={"error": "rlm_journal_summarize: missing required parameter 'date'"},
+            input_tokens=0,
+            output_tokens=0,
+        )
+
+    result = await summarize_journal(
+        project_id=ctx.project_id,
+        date=date,
+    )
+
+    return ToolResult(
+        data=result,
+        input_tokens=0,
+        output_tokens=count_tokens(str(result)),
+    )
+
+
+# ============ PHASE 20: MEMORY TIERS & COMPACTION HANDLERS ============
+
+
+async def handle_session_memories(
+    params: dict[str, Any],
+    ctx: HandlerContext,
+) -> ToolResult:
+    """Get tiered memories for session auto-load.
+
+    Args:
+        params: Dict containing:
+            - max_critical_tokens: Token budget for CRITICAL tier (default: 8000)
+            - max_daily_tokens: Token budget for DAILY tier (default: 4000)
+            - include_yesterday: Include yesterday's daily memories (default: True)
+
+    Returns:
+        ToolResult with critical and daily memories organized by tier
+    """
+    from ...services.agent_memory import get_session_memories
+
+    max_critical = params.get("max_critical_tokens", 8000)
+    max_daily = params.get("max_daily_tokens", 4000)
+    include_yesterday = params.get("include_yesterday", True)
+
+    result = await get_session_memories(
+        project_id=ctx.project_id,
+        max_critical_tokens=max_critical,
+        max_daily_tokens=max_daily,
+        include_yesterday=include_yesterday,
+    )
+
+    return ToolResult(
+        data=result,
+        input_tokens=0,
+        output_tokens=count_tokens(str(result)),
+    )
+
+
+async def handle_memory_compact(
+    params: dict[str, Any],
+    ctx: HandlerContext,
+) -> ToolResult:
+    """Compact and optimize memories.
+
+    Args:
+        params: Dict containing:
+            - scope: Memory scope to compact (default: project)
+            - deduplicate: Merge similar memories (default: True)
+            - promote_threshold: Access count to promote to CRITICAL (default: 3)
+            - archive_older_than_days: Archive memories older than N days (default: 30)
+            - dry_run: Preview changes without applying (default: False)
+
+    Returns:
+        ToolResult with compaction results
+    """
+    from ...services.agent_memory import compact_memories
+
+    scope = params.get("scope", "project")
+    deduplicate = params.get("deduplicate", True)
+    promote_threshold = params.get("promote_threshold", 3)
+    archive_older_than_days = params.get("archive_older_than_days", 30)
+    dry_run = params.get("dry_run", False)
+
+    result = await compact_memories(
+        project_id=ctx.project_id,
+        scope=scope,
+        deduplicate=deduplicate,
+        promote_threshold=promote_threshold,
+        archive_older_than_days=archive_older_than_days,
+        dry_run=dry_run,
+    )
+
+    return ToolResult(
+        data=result,
+        input_tokens=0,
+        output_tokens=count_tokens(str(result)),
+    )
+
+
+async def handle_memory_daily_brief(
+    params: dict[str, Any],
+    ctx: HandlerContext,
+) -> ToolResult:
+    """Generate a daily memory brief.
+
+    Args:
+        params: Dict containing:
+            - date: Date for brief (default: today)
+            - max_items: Maximum items to include (default: 10)
+
+    Returns:
+        ToolResult with prioritized memory brief
+    """
+    from ...services.agent_memory import get_daily_brief
+
+    date = params.get("date")
+    max_items = params.get("max_items", 10)
+
+    result = await get_daily_brief(
+        project_id=ctx.project_id,
+        date=date,
+        max_items=max_items,
+    )
+
+    return ToolResult(
+        data=result,
+        input_tokens=0,
+        output_tokens=count_tokens(str(result)),
+    )
+
+
+# ============ PHASE 20: TENANT PROFILE HANDLERS ============
+
+
+async def handle_tenant_profile_create(
+    params: dict[str, Any],
+    ctx: HandlerContext,
+) -> ToolResult:
+    """Create a structured tenant/client profile.
+
+    Args:
+        params: Dict containing:
+            - client_name: Name of the client (required)
+            - business_model: How the business works
+            - industry: Industry vertical
+            - tech_stack: Technology stack
+            - legal_constraints: Legal requirements
+            - security_requirements: Security constraints
+            - ui_ux_prefs: UI/UX preferences
+            - communication_style: How to communicate
+            - risk_tolerance: low/medium/high
+            - dos: List of things to do
+            - donts: List of things to avoid
+            - custom_fields: Additional custom fields
+
+    Returns:
+        ToolResult with profile ID and confirmation
+    """
+    from ...services.agent_memory import create_tenant_profile
+
+    client_name = params.get("client_name")
+
+    if not client_name:
+        return ToolResult(
+            data={"error": "rlm_tenant_profile_create: missing required parameter 'client_name'"},
+            input_tokens=0,
+            output_tokens=0,
+        )
+
+    result = await create_tenant_profile(
+        project_id=ctx.project_id,
+        client_name=client_name,
+        business_model=params.get("business_model"),
+        industry=params.get("industry"),
+        tech_stack=params.get("tech_stack"),
+        legal_constraints=params.get("legal_constraints"),
+        security_requirements=params.get("security_requirements"),
+        ui_ux_prefs=params.get("ui_ux_prefs"),
+        communication_style=params.get("communication_style"),
+        risk_tolerance=params.get("risk_tolerance"),
+        dos=params.get("dos"),
+        donts=params.get("donts"),
+        custom_fields=params.get("custom_fields"),
+    )
+
+    return ToolResult(
+        data=result,
+        input_tokens=count_tokens(str(params)),
+        output_tokens=count_tokens(str(result)),
+    )
+
+
+async def handle_tenant_profile_get(
+    params: dict[str, Any],
+    ctx: HandlerContext,
+) -> ToolResult:
+    """Get tenant profile(s) for a project.
+
+    Args:
+        params: Dict containing:
+            - tenant_id: Specific profile ID (optional, returns all if not specified)
+
+    Returns:
+        ToolResult with tenant profile(s)
+    """
+    from ...services.agent_memory import get_tenant_profile
+
+    tenant_id = params.get("tenant_id")
+
+    result = await get_tenant_profile(
+        project_id=ctx.project_id,
+        tenant_id=tenant_id,
     )
 
     return ToolResult(

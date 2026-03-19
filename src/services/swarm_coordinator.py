@@ -275,6 +275,128 @@ async def get_swarm_info(swarm_id: str) -> dict[str, Any]:
     }
 
 
+async def get_agent_profile(
+    swarm_id: str,
+    agent_id: str,
+) -> dict[str, Any]:
+    """Get an agent's profile (identity, personality, boundaries).
+
+    Args:
+        swarm_id: The swarm ID
+        agent_id: The agent's unique identifier
+
+    Returns:
+        Dict with agent profile or error
+    """
+    db = await get_db()
+
+    # Find agent in swarm
+    agent = await db.swarmagent.find_first(
+        where={
+            "swarmId": swarm_id,
+            "agentId": agent_id,
+        }
+    )
+
+    if not agent:
+        return {
+            "success": False,
+            "error": f"Agent '{agent_id}' not found in swarm",
+            "profile": None,
+        }
+
+    # Parse profile JSON if exists
+    profile = agent.profile if agent.profile else {}
+    if isinstance(profile, str):
+        try:
+            profile = json.loads(profile)
+        except json.JSONDecodeError:
+            profile = {}
+
+    return {
+        "success": True,
+        "swarm_id": swarm_id,
+        "agent_id": agent_id,
+        "db_id": agent.id,
+        "name": agent.name,
+        "profile": profile,
+        "is_active": agent.isActive,
+        "joined_at": agent.joinedAt.isoformat() if agent.joinedAt else None,
+    }
+
+
+async def update_agent_profile(
+    swarm_id: str,
+    agent_id: str,
+    profile: dict[str, Any],
+) -> dict[str, Any]:
+    """Update an agent's profile.
+
+    Profile structure:
+    {
+        "display_name": str,       # "Jarvis ⚡"
+        "personality": str,        # "INTJ - Strategic, decisive"
+        "role_description": str,   # "Chief Coordinator"
+        "boundaries": list[str],   # ["Never send without approval", ...]
+        "communication_style": str, # "Direct, no fluff"
+        "decision_making": str,    # "Analyze then decide"
+        "soul_document_path": str, # "agents/jarvis/SOUL.md"
+        "memory_scope": str,       # "agent" | "project" | "team"
+        "custom": dict             # Any additional fields
+    }
+
+    Args:
+        swarm_id: The swarm ID
+        agent_id: The agent's unique identifier
+        profile: The profile data to update (merged with existing)
+
+    Returns:
+        Dict with updated profile or error
+    """
+    db = await get_db()
+
+    # Find agent in swarm
+    agent = await db.swarmagent.find_first(
+        where={
+            "swarmId": swarm_id,
+            "agentId": agent_id,
+        }
+    )
+
+    if not agent:
+        return {
+            "success": False,
+            "error": f"Agent '{agent_id}' not found in swarm",
+            "profile": None,
+        }
+
+    # Merge with existing profile
+    existing_profile = agent.profile if agent.profile else {}
+    if isinstance(existing_profile, str):
+        try:
+            existing_profile = json.loads(existing_profile)
+        except json.JSONDecodeError:
+            existing_profile = {}
+
+    merged_profile = {**existing_profile, **profile}
+
+    # Update agent with new profile
+    updated = await db.swarmagent.update(
+        where={"id": agent.id},
+        data={"profile": Json(merged_profile)},
+    )
+
+    logger.info(f"Updated profile for agent {agent_id} in swarm {swarm_id}")
+
+    return {
+        "success": True,
+        "swarm_id": swarm_id,
+        "agent_id": agent_id,
+        "profile": merged_profile,
+        "message": "Profile updated successfully",
+    }
+
+
 # =============================================================================
 # RESOURCE CLAIMS
 # =============================================================================

@@ -11,6 +11,7 @@ from .swarm_coordinator import (
     complete_task,
     create_swarm,
     create_task,
+    get_agent_profile,
     get_state,
     get_swarm_info,
     get_task_stats,
@@ -20,6 +21,7 @@ from .swarm_coordinator import (
     list_tasks_enhanced,
     release_claim,
     set_state,
+    update_agent_profile,
 )
 from .swarm_events import (
     broadcast_agent_event,
@@ -39,6 +41,8 @@ __all__ = [
     "join_swarm",
     "leave_swarm",
     "get_swarm_info",
+    "get_agent_profile",
+    "update_agent_profile",
     "acquire_claim",
     "release_claim",
     "check_claim",

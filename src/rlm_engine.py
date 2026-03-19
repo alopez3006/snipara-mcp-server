@@ -40,7 +40,6 @@ from .engine.core import (
 # These are available for integration - handlers are extracted but methods
 # below still use original implementations for backward compatibility.
 # Full migration will replace _handle_* methods with calls to these functions.
-from .engine.handlers.base import HandlerContext
 from .engine.middleware import maybe_auto_remember
 
 # Phase 2 Refactor: Import from extracted scoring module
@@ -130,7 +129,6 @@ from .services.shared_context import (
     DocumentCategory,
     allocate_shared_context_budget,
     compute_context_hash,
-    create_shared_collection,
     create_shared_document,
     get_shared_prompt_templates,
     list_shared_collections,
@@ -509,20 +507,6 @@ class RLMEngine:
             )
         else:
             self.settings = ProjectSettings()
-
-        # Initialize handler context for htask and other extracted handlers
-        self._handler_ctx = HandlerContext(
-            project_id=self.project_id,
-            user_id=self.user_id,
-            team_id=None,  # Will be set from project lookup if needed
-            plan=self.plan,
-            access_level=self.access_level,
-            settings=self.settings,
-            session_context=self.session_context,
-            tips_shown=self._tips_shown_this_session,
-            index=self.index,
-            db=None,  # Handlers call await get_db() themselves
-        )
 
     def _generate_chunk_id(self, section_id: str) -> str:
         """Generate a unique chunk ID for pass-by-reference retrieval.
@@ -936,7 +920,6 @@ class RLMEngine:
             ToolName.RLM_LIST_TEMPLATES: self._handle_list_templates,
             ToolName.RLM_GET_TEMPLATE: self._handle_get_template,
             ToolName.RLM_LIST_COLLECTIONS: self._handle_list_collections,
-            ToolName.RLM_CREATE_COLLECTION: self._handle_create_collection,
             ToolName.RLM_UPLOAD_SHARED_DOCUMENT: self._handle_upload_shared_document,
             # Phase 8.2: Agent Memory Tools
             ToolName.RLM_REMEMBER: self._handle_remember,
@@ -944,6 +927,17 @@ class RLMEngine:
             ToolName.RLM_RECALL: self._handle_recall,
             ToolName.RLM_MEMORIES: self._handle_memories,
             ToolName.RLM_FORGET: self._handle_forget,
+            # Phase 18: Daily Journal Tools
+            ToolName.RLM_JOURNAL_APPEND: self._handle_journal_append,
+            ToolName.RLM_JOURNAL_GET: self._handle_journal_get,
+            ToolName.RLM_JOURNAL_SUMMARIZE: self._handle_journal_summarize,
+            # Phase 20: Memory Tiers & Compaction
+            ToolName.RLM_SESSION_MEMORIES: self._handle_session_memories,
+            ToolName.RLM_MEMORY_COMPACT: self._handle_memory_compact,
+            ToolName.RLM_MEMORY_DAILY_BRIEF: self._handle_memory_daily_brief,
+            # Phase 20: Tenant Profile
+            ToolName.RLM_TENANT_PROFILE_CREATE: self._handle_tenant_profile_create,
+            ToolName.RLM_TENANT_PROFILE_GET: self._handle_tenant_profile_get,
             # Phase 9.1: Multi-Agent Swarm Tools
             ToolName.RLM_SWARM_CREATE: self._handle_swarm_create,
             ToolName.RLM_SWARM_JOIN: self._handle_swarm_join,
@@ -969,6 +963,9 @@ class RLMEngine:
             ToolName.RLM_TASK_REASSIGN: self._handle_task_reassign,
             ToolName.RLM_TASK_DELETE: self._handle_task_delete,
             ToolName.RLM_TASK_UPDATE: self._handle_task_update,
+            # Phase 19: Agent Profiles (Soul Layer)
+            ToolName.RLM_AGENT_PROFILE_GET: self._handle_agent_profile_get,
+            ToolName.RLM_AGENT_PROFILE_UPDATE: self._handle_agent_profile_update,
             # Phase 10: Document Sync Tools
             ToolName.RLM_UPLOAD_DOCUMENT: self._handle_upload_document,
             ToolName.RLM_SYNC_DOCUMENTS: self._handle_sync_documents,
@@ -1881,8 +1878,6 @@ class RLMEngine:
             from src.engine.handlers.decisions import handle_decision_query
             from src.models.decision import DecisionQueryParams
 
-            db = await get_db()
-
             # Query active decisions with HIGH or CRITICAL impact
             for impact in ["CRITICAL", "HIGH"]:
                 query_params = DecisionQueryParams(
@@ -1892,7 +1887,7 @@ class RLMEngine:
                     include_superseded=False,
                 )
                 decision_result = await handle_decision_query(
-                    db, self.project_id, query_params
+                    self.db, self.project_id, query_params
                 )
 
                 for decision in decision_result.decisions:
@@ -4329,7 +4324,6 @@ Rationale: {decision.rationale}"""
         try:
             collections = await list_shared_collections(
                 user_id=user_id,
-                project_id=self.project_id,
                 include_public=include_public,
             )
 
@@ -4345,71 +4339,6 @@ Rationale: {decision.rationale}"""
             logger.error(f"Error listing collections: {e}")
             return ToolResult(
                 data={"error": f"Failed to list collections: {str(e)}"},
-                input_tokens=0,
-                output_tokens=0,
-            )
-
-    async def _handle_create_collection(self, params: dict[str, Any]) -> ToolResult:
-        """
-        Handle rlm_create_collection - create a new shared context collection.
-
-        Args:
-            params: Dict containing:
-                - name: Human-readable name for the collection
-                - slug: URL-friendly identifier (lowercase, hyphens only)
-                - description: Optional description
-                - scope: TEAM, USER, or GLOBAL (default: TEAM)
-                - is_public: Whether the collection is publicly visible
-
-        Returns:
-            ToolResult with collection details
-        """
-        name = params.get("name", "")
-        slug = params.get("slug", "")
-        description = params.get("description")
-        scope = params.get("scope", "TEAM")
-        is_public = params.get("is_public", False)
-
-        if not name:
-            return ToolResult(
-                data={"error": "name is required"},
-                input_tokens=0,
-                output_tokens=0,
-            )
-
-        if not slug:
-            return ToolResult(
-                data={"error": "slug is required"},
-                input_tokens=0,
-                output_tokens=0,
-            )
-
-        try:
-            result = await create_shared_collection(
-                name=name,
-                slug=slug,
-                user_id=self.user_id,
-                project_id=self.project_id,
-                description=description,
-                scope=scope,
-                is_public=is_public,
-            )
-
-            return ToolResult(
-                data=result,
-                input_tokens=0,
-                output_tokens=0,
-            )
-        except ValueError as e:
-            return ToolResult(
-                data={"error": str(e)},
-                input_tokens=0,
-                output_tokens=0,
-            )
-        except Exception as e:
-            logger.error(f"Error creating collection: {e}")
-            return ToolResult(
-                data={"error": f"Failed to create collection: {str(e)}"},
                 input_tokens=0,
                 output_tokens=0,
             )
@@ -4473,7 +4402,6 @@ Rationale: {decision.rationale}"""
             result = await create_shared_document(
                 collection_id=collection_id,
                 user_id=self.user_id,
-                project_id=self.project_id,
                 title=title,
                 content=content,
                 category=category,
@@ -4753,6 +4681,344 @@ Rationale: {decision.rationale}"""
         return ToolResult(
             data=result,
             input_tokens=0,
+            output_tokens=count_tokens(str(result)),
+        )
+
+    # ============ PHASE 18: DAILY JOURNAL HANDLERS ============
+
+    async def _handle_journal_append(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_journal_append - append an entry to today's journal.
+
+        Args:
+            params: Dict containing:
+                - text: Journal entry text (markdown supported)
+                - tags: Optional tags for categorization
+
+        Returns:
+            ToolResult with entry_id, date, and confirmation
+        """
+        from .services.agent_memory import append_journal
+
+        text = params.get("text", "")
+        tags = params.get("tags")
+
+        if not text:
+            return ToolResult(
+                data={"error": "text is required"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        result = await append_journal(
+            project_id=self.project_id,
+            text=text,
+            tags=tags,
+        )
+
+        return ToolResult(
+            data=result,
+            input_tokens=count_tokens(text),
+            output_tokens=count_tokens(str(result)),
+        )
+
+    async def _handle_journal_get(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_journal_get - get journal entries for a specific date.
+
+        Args:
+            params: Dict containing:
+                - date: Date in YYYY-MM-DD format (default: today)
+                - include_yesterday: Also include yesterday's entries
+
+        Returns:
+            ToolResult with date, entries list, and total count
+        """
+        from .services.agent_memory import get_journal
+
+        date = params.get("date")
+        include_yesterday = params.get("include_yesterday", False)
+
+        result = await get_journal(
+            project_id=self.project_id,
+            date=date,
+            include_yesterday=include_yesterday,
+        )
+
+        return ToolResult(
+            data=result,
+            input_tokens=0,
+            output_tokens=count_tokens(str(result)),
+        )
+
+    async def _handle_journal_summarize(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_journal_summarize - get journal entries for a date, ready for summarization.
+
+        Args:
+            params: Dict containing:
+                - date: Date to summarize (YYYY-MM-DD)
+
+        Returns:
+            ToolResult with combined content and suggested prompt
+        """
+        from .services.agent_memory import summarize_journal
+
+        date = params.get("date")
+
+        if not date:
+            return ToolResult(
+                data={"error": "date is required"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        result = await summarize_journal(
+            project_id=self.project_id,
+            date=date,
+        )
+
+        return ToolResult(
+            data=result,
+            input_tokens=0,
+            output_tokens=count_tokens(str(result)),
+        )
+
+    # ============ PHASE 20: MEMORY TIERS & COMPACTION ============
+
+    async def _handle_session_memories(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_session_memories - get tiered memories for session auto-load.
+
+        Args:
+            params: Dict containing:
+                - max_critical_tokens: Token budget for CRITICAL tier
+                - max_daily_tokens: Token budget for DAILY tier
+                - include_yesterday: Include yesterday's daily memories
+
+        Returns:
+            ToolResult with critical and daily memories organized by tier
+        """
+        from .services.agent_memory import get_session_memories
+
+        result = await get_session_memories(
+            project_id=self.project_id,
+            max_critical_tokens=params.get("max_critical_tokens", 8000),
+            max_daily_tokens=params.get("max_daily_tokens", 4000),
+            include_yesterday=params.get("include_yesterday", True),
+        )
+
+        return ToolResult(
+            data=result,
+            input_tokens=0,
+            output_tokens=count_tokens(str(result)),
+        )
+
+    async def _handle_memory_compact(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_memory_compact - compact and optimize memories.
+
+        Args:
+            params: Dict containing:
+                - scope: Memory scope to compact
+                - deduplicate: Merge similar memories
+                - promote_threshold: Access count to promote to CRITICAL
+                - archive_older_than_days: Archive memories older than N days
+                - dry_run: Preview changes without applying
+
+        Returns:
+            ToolResult with compaction results
+        """
+        from .services.agent_memory import compact_memories
+
+        result = await compact_memories(
+            project_id=self.project_id,
+            scope=params.get("scope", "project"),
+            deduplicate=params.get("deduplicate", True),
+            promote_threshold=params.get("promote_threshold", 3),
+            archive_older_than_days=params.get("archive_older_than_days", 30),
+            dry_run=params.get("dry_run", False),
+        )
+
+        return ToolResult(
+            data=result,
+            input_tokens=0,
+            output_tokens=count_tokens(str(result)),
+        )
+
+    async def _handle_memory_daily_brief(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_memory_daily_brief - generate a daily memory brief.
+
+        Args:
+            params: Dict containing:
+                - date: Date for brief (default: today)
+                - max_items: Maximum items to include
+
+        Returns:
+            ToolResult with prioritized memory brief
+        """
+        from .services.agent_memory import get_daily_brief
+
+        result = await get_daily_brief(
+            project_id=self.project_id,
+            date=params.get("date"),
+            max_items=params.get("max_items", 10),
+        )
+
+        return ToolResult(
+            data=result,
+            input_tokens=0,
+            output_tokens=count_tokens(str(result)),
+        )
+
+    # ============ PHASE 20: TENANT PROFILE ============
+
+    async def _handle_tenant_profile_create(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_tenant_profile_create - create a structured tenant/client profile.
+
+        Args:
+            params: Dict containing tenant profile fields (client_name required)
+
+        Returns:
+            ToolResult with profile ID and confirmation
+        """
+        from .services.agent_memory import create_tenant_profile
+
+        client_name = params.get("client_name")
+        if not client_name:
+            return ToolResult(
+                data={"error": "client_name is required"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        result = await create_tenant_profile(
+            project_id=self.project_id,
+            client_name=client_name,
+            business_model=params.get("business_model"),
+            industry=params.get("industry"),
+            tech_stack=params.get("tech_stack"),
+            legal_constraints=params.get("legal_constraints"),
+            security_requirements=params.get("security_requirements"),
+            ui_ux_prefs=params.get("ui_ux_prefs"),
+            communication_style=params.get("communication_style"),
+            risk_tolerance=params.get("risk_tolerance"),
+            dos=params.get("dos"),
+            donts=params.get("donts"),
+            custom_fields=params.get("custom_fields"),
+        )
+
+        return ToolResult(
+            data=result,
+            input_tokens=count_tokens(str(params)),
+            output_tokens=count_tokens(str(result)),
+        )
+
+    async def _handle_tenant_profile_get(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_tenant_profile_get - get tenant profile(s) for a project.
+
+        Args:
+            params: Dict containing:
+                - tenant_id: Specific profile ID (optional)
+
+        Returns:
+            ToolResult with tenant profile(s)
+        """
+        from .services.agent_memory import get_tenant_profile
+
+        result = await get_tenant_profile(
+            project_id=self.project_id,
+            tenant_id=params.get("tenant_id"),
+        )
+
+        return ToolResult(
+            data=result,
+            input_tokens=0,
+            output_tokens=count_tokens(str(result)),
+        )
+
+    # ============ PHASE 19: AGENT PROFILES (SOUL LAYER) ============
+
+    async def _handle_agent_profile_get(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_agent_profile_get - get an agent's profile.
+
+        Args:
+            params: Dict containing:
+                - swarm_id: Swarm ID
+                - agent_id: Agent identifier
+
+        Returns:
+            ToolResult with agent profile
+        """
+        from .services.swarm import get_agent_profile
+
+        swarm_id = params.get("swarm_id", "")
+        agent_id = params.get("agent_id", "")
+
+        if not swarm_id or not agent_id:
+            return ToolResult(
+                data={"error": "swarm_id and agent_id are required"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        result = await get_agent_profile(
+            swarm_id=swarm_id,
+            agent_id=agent_id,
+        )
+
+        return ToolResult(
+            data=result,
+            input_tokens=0,
+            output_tokens=count_tokens(str(result)),
+        )
+
+    async def _handle_agent_profile_update(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_agent_profile_update - update an agent's profile.
+
+        Args:
+            params: Dict containing:
+                - swarm_id: Swarm ID
+                - agent_id: Agent identifier
+                - profile: Profile data to update
+
+        Returns:
+            ToolResult with updated profile
+        """
+        from .services.swarm import update_agent_profile
+
+        swarm_id = params.get("swarm_id", "")
+        agent_id = params.get("agent_id", "")
+        profile = params.get("profile", {})
+
+        if not swarm_id or not agent_id:
+            return ToolResult(
+                data={"error": "swarm_id and agent_id are required"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        if not profile:
+            return ToolResult(
+                data={"error": "profile is required"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        result = await update_agent_profile(
+            swarm_id=swarm_id,
+            agent_id=agent_id,
+            profile=profile,
+        )
+
+        return ToolResult(
+            data=result,
+            input_tokens=count_tokens(str(profile)),
             output_tokens=count_tokens(str(result)),
         )
 
@@ -5502,14 +5768,7 @@ Rationale: {decision.rationale}"""
                 - instructions: Clear instructions on what to do next
         """
         from .services.swarm import list_tasks, get_swarm_info
-        from .services.swarm_guards import (
-            safe_swarm_call,
-            validate_agent_status_response,
-            validate_swarm_info_response,
-            generate_correlation_id,
-        )
 
-        correlation_id = generate_correlation_id()
         swarm_id = params.get("swarm_id", "")
         agent_id = params.get("agent_id", "")
 
@@ -5520,62 +5779,40 @@ Rationale: {decision.rationale}"""
             if not agent_id:
                 missing.append("agent_id")
             return ToolResult(
-                data={
-                    "success": False,
-                    "error": f"rlm_agent_status: missing required parameter(s): {', '.join(missing)}",
-                    "correlation_id": correlation_id,
-                },
+                data={"error": f"rlm_agent_status: missing required parameter(s): {', '.join(missing)}"},
                 input_tokens=0,
                 output_tokens=0,
             )
 
-        # Get swarm info with error handling
-        swarm_info, error = await safe_swarm_call(
-            get_swarm_info, swarm_id, error_context="get_swarm_info"
-        )
-        if error:
-            return ToolResult(data=error.to_dict(), input_tokens=0, output_tokens=0)
-
-        swarm_info = validate_swarm_info_response(swarm_info or {})
-        if not swarm_info.get("success"):
+        # Get swarm info
+        swarm_info = await get_swarm_info(swarm_id)
+        if not swarm_info:
             return ToolResult(
-                data={
-                    "success": False,
-                    "error": swarm_info.get("error", f"Swarm '{swarm_id}' not found"),
-                    "correlation_id": correlation_id,
-                },
+                data={"error": f"Swarm '{swarm_id}' not found"},
                 input_tokens=0,
                 output_tokens=0,
             )
 
         # Get tasks assigned to this agent (pending status)
-        pending_tasks, error = await safe_swarm_call(
-            list_tasks,
+        pending_tasks = await list_tasks(
             swarm_id=swarm_id,
             status="pending",
             assigned_to=agent_id,
             limit=20,
-            error_context="list_pending_tasks",
         )
-        if error:
-            return ToolResult(data=error.to_dict(), input_tokens=0, output_tokens=0)
 
         # Get task this agent is currently working on (claimed status)
-        claimed_tasks, error = await safe_swarm_call(
-            list_tasks,
+        claimed_tasks = await list_tasks(
             swarm_id=swarm_id,
             status="claimed",
             assigned_to=agent_id,
             limit=5,
-            error_context="list_claimed_tasks",
         )
-        if error:
-            return ToolResult(data=error.to_dict(), input_tokens=0, output_tokens=0)
 
         # Build clear instructions based on status
         instructions = []
-        pending_list = (pending_tasks or {}).get("tasks", [])
-        claimed_list = (claimed_tasks or {}).get("tasks", [])
+        pending_list = pending_tasks.get("tasks", [])
+        claimed_list = claimed_tasks.get("tasks", [])
 
         if claimed_list:
             current_task = claimed_list[0]
@@ -5603,7 +5840,7 @@ Rationale: {decision.rationale}"""
                 "   → Or claim any available task: rlm_task_claim(swarm_id, agent_id)"
             )
 
-        result = validate_agent_status_response({
+        result = {
             "swarm": {
                 "id": swarm_info.get("id"),
                 "name": swarm_info.get("name"),
@@ -5615,8 +5852,7 @@ Rationale: {decision.rationale}"""
             "current_task": claimed_list[0] if claimed_list else None,
             "has_work": len(pending_list) > 0 or len(claimed_list) > 0,
             "instructions": "\n".join(instructions),
-        })
-        result["correlation_id"] = correlation_id
+        }
 
         return ToolResult(
             data=result,
@@ -5637,13 +5873,7 @@ Rationale: {decision.rationale}"""
             ToolResult with removal status
         """
         from .services.swarm import leave_swarm
-        from .services.swarm_guards import (
-            safe_swarm_call,
-            validate_leave_swarm_response,
-            generate_correlation_id,
-        )
 
-        correlation_id = generate_correlation_id()
         swarm_id = params.get("swarm_id", "")
         agent_id = params.get("agent_id", "")
 
@@ -5654,28 +5884,12 @@ Rationale: {decision.rationale}"""
             if not agent_id:
                 missing.append("agent_id")
             return ToolResult(
-                data={
-                    "success": False,
-                    "error": f"rlm_swarm_leave: missing required parameter(s): {', '.join(missing)}",
-                    "correlation_id": correlation_id,
-                },
+                data={"error": f"rlm_swarm_leave: missing required parameter(s): {', '.join(missing)}"},
                 input_tokens=0,
                 output_tokens=0,
             )
 
-        # Execute with error handling
-        leave_result, error = await safe_swarm_call(
-            leave_swarm,
-            swarm_id=swarm_id,
-            agent_id=agent_id,
-            error_context="leave_swarm",
-        )
-        if error:
-            return ToolResult(data=error.to_dict(), input_tokens=0, output_tokens=0)
-
-        # Validate response
-        result = validate_leave_swarm_response(leave_result or {})
-        result["correlation_id"] = correlation_id
+        result = await leave_swarm(swarm_id=swarm_id, agent_id=agent_id)
 
         return ToolResult(
             data=result,
@@ -5695,55 +5909,34 @@ Rationale: {decision.rationale}"""
             ToolResult with list of agents
         """
         from .services.swarm import get_swarm_info
-        from .services.swarm_guards import (
-            safe_swarm_call,
-            validate_swarm_members_response,
-            validate_swarm_info_response,
-            generate_correlation_id,
-        )
 
-        correlation_id = generate_correlation_id()
         swarm_id = params.get("swarm_id", "")
 
         if not swarm_id:
             return ToolResult(
-                data={
-                    "success": False,
-                    "error": "rlm_swarm_members: missing required parameter 'swarm_id'",
-                    "correlation_id": correlation_id,
-                },
+                data={"error": "rlm_swarm_members: missing required parameter 'swarm_id'"},
                 input_tokens=0,
                 output_tokens=0,
             )
 
-        # Get swarm info with error handling
-        swarm_info, error = await safe_swarm_call(
-            get_swarm_info, swarm_id, error_context="get_swarm_info"
-        )
-        if error:
-            return ToolResult(data=error.to_dict(), input_tokens=0, output_tokens=0)
-
-        swarm_info = validate_swarm_info_response(swarm_info or {})
-        if not swarm_info.get("success"):
+        swarm_info = await get_swarm_info(swarm_id)
+        if not swarm_info:
             return ToolResult(
-                data={
-                    "success": False,
-                    "error": swarm_info.get("error", f"Swarm '{swarm_id}' not found"),
-                    "correlation_id": correlation_id,
-                },
+                data={"error": f"Swarm '{swarm_id}' not found"},
                 input_tokens=0,
                 output_tokens=0,
             )
 
-        # Build and validate response
-        result = validate_swarm_members_response({
+        # Get agents list from swarm info
+        agents = swarm_info.get("agents", [])
+
+        result = {
             "swarm_id": swarm_id,
             "swarm_name": swarm_info.get("name"),
-            "agent_count": swarm_info.get("agent_count", 0),
+            "agent_count": len(agents),
             "max_agents": swarm_info.get("maxAgents", 10),
-            "agents": swarm_info.get("agents", []),
-        })
-        result["correlation_id"] = correlation_id
+            "agents": agents,
+        }
 
         return ToolResult(
             data=result,
@@ -7233,8 +7426,7 @@ print(f"[Snipara] {len(context.get('files', {}))} files loaded. Helpers: peek, g
                 tags=params.get("tags", []),
             )
 
-            db = await get_db()
-            result = await handle_decision_create(db, self.project_id, create_params)
+            result = await handle_decision_create(self.db, self.project_id, create_params)
 
             return ToolResult(
                 data=result.model_dump(),
@@ -7267,8 +7459,7 @@ print(f"[Snipara] {len(context.get('files', {}))} files loaded. Helpers: peek, g
             include_superseded=params.get("include_superseded", False),
         )
 
-        db = await get_db()
-        result = await handle_decision_query(db, self.project_id, query_params)
+        result = await handle_decision_query(self.db, self.project_id, query_params)
 
         return ToolResult(
             data=result.model_dump(),
@@ -7307,9 +7498,8 @@ print(f"[Snipara] {len(context.get('files', {}))} files loaded. Helpers: peek, g
                 tags=params.get("tags", []),
             )
 
-            db = await get_db()
             result = await handle_decision_supersede(
-                db, self.project_id, old_decision_id, new_params
+                self.db, self.project_id, old_decision_id, new_params
             )
 
             return ToolResult(

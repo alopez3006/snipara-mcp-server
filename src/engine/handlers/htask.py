@@ -127,8 +127,8 @@ async def handle_htask_create_feature(
         params: Dict containing:
             - swarm_id: Swarm ID (required)
             - title: Feature title (required)
+            - description: Feature description (required)
             - owner: Feature owner (required)
-            - description: Feature description (auto-generated if not provided)
             - parent_id: Optional N0 parent
             - workstreams: List of workstream types to create
               Defaults to: API, FRONTEND, QA, BUGFIX_HARDENING, DEPLOY_PROD_VERIFY
@@ -138,15 +138,17 @@ async def handle_htask_create_feature(
     """
     swarm_id = params.get("swarm_id", "")
     title = params.get("title", "")
+    description = params.get("description", "")
     owner = params.get("owner", "")
 
-    # Validate only truly required fields
-    if not swarm_id or not title or not owner:
+    if not swarm_id or not title or not description or not owner:
         missing = []
         if not swarm_id:
             missing.append("swarm_id")
         if not title:
             missing.append("title")
+        if not description:
+            missing.append("description")
         if not owner:
             missing.append("owner")
         return ToolResult(
@@ -155,16 +157,13 @@ async def handle_htask_create_feature(
             output_tokens=0,
         )
 
-    # Auto-generate description if not provided
-    description = params.get("description") or f"Feature: {title}"
-
     result = await create_feature_with_workstreams(
         swarm_id=swarm_id,
         title=title,
         description=description,
         owner=owner,
         parent_id=params.get("parent_id"),
-        include_workstreams=params.get("workstreams"),
+        workstreams=params.get("workstreams"),
     )
 
     return ToolResult(
@@ -228,7 +227,7 @@ async def handle_htask_tree(
             - swarm_id: Swarm ID (required)
             - task_id: Root task ID (optional, defaults to all root tasks)
             - max_depth: Maximum depth to traverse (default 4)
-            - include_completed: Include completed tasks (default false)
+            - include_archived: Include archived tasks (default false)
 
     Returns:
         ToolResult with recursive tree structure
@@ -244,9 +243,9 @@ async def handle_htask_tree(
 
     result = await get_htask_tree(
         swarm_id=swarm_id,
-        root_id=params.get("task_id"),
+        task_id=params.get("task_id"),
         max_depth=params.get("max_depth", 4),
-        include_completed=params.get("include_completed", False),
+        include_archived=params.get("include_archived", False),
     )
 
     return ToolResult(
@@ -415,7 +414,7 @@ async def handle_htask_complete(
     params: dict[str, Any],
     ctx: HandlerContext,
 ) -> ToolResult:
-    """Complete an N3 task with evidence.
+    """Complete an N3 task with evidence and optional memory creation.
 
     Args:
         params: Dict containing:
@@ -423,9 +422,12 @@ async def handle_htask_complete(
             - task_id: Task ID (required)
             - evidence: List of evidence dicts [{type, description, ...}] (optional but may be required by policy)
             - result: Task result data (optional)
+            - learnings: List of lessons learned from this task (optional)
+            - decision_impact: How this task affects future decisions (optional)
+            - create_memory: Whether to create a memory with task outcome (default: True)
 
     Returns:
-        ToolResult with completion confirmation
+        ToolResult with completion confirmation and optional linked_memory_id
     """
     swarm_id = params.get("swarm_id", "")
     task_id = params.get("task_id", "")
@@ -447,6 +449,9 @@ async def handle_htask_complete(
         task_id=task_id,
         evidence=params.get("evidence"),
         result=params.get("result"),
+        learnings=params.get("learnings"),
+        decision_impact=params.get("decision_impact"),
+        create_memory=params.get("create_memory", True),
     )
 
     return ToolResult(

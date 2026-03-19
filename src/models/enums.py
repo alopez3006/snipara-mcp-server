@@ -30,7 +30,6 @@ class ToolName(StrEnum):
     RLM_LIST_TEMPLATES = "rlm_list_templates"
     RLM_GET_TEMPLATE = "rlm_get_template"
     RLM_LIST_COLLECTIONS = "rlm_list_collections"
-    RLM_CREATE_COLLECTION = "rlm_create_collection"
     RLM_UPLOAD_SHARED_DOCUMENT = "rlm_upload_shared_document"
     # Phase 8.2: Agent Memory Tools
     RLM_REMEMBER = "rlm_remember"
@@ -38,6 +37,13 @@ class ToolName(StrEnum):
     RLM_RECALL = "rlm_recall"
     RLM_MEMORIES = "rlm_memories"
     RLM_FORGET = "rlm_forget"
+    # Phase 18: Daily Journal Tools
+    RLM_JOURNAL_APPEND = "rlm_journal_append"
+    RLM_JOURNAL_GET = "rlm_journal_get"
+    RLM_JOURNAL_SUMMARIZE = "rlm_journal_summarize"
+    # Phase 19: Agent Profiles (Soul Layer)
+    RLM_AGENT_PROFILE_GET = "rlm_agent_profile_get"
+    RLM_AGENT_PROFILE_UPDATE = "rlm_agent_profile_update"
     # Phase 9.1: Multi-Agent Swarm Tools
     RLM_SWARM_CREATE = "rlm_swarm_create"
     RLM_SWARM_JOIN = "rlm_swarm_join"
@@ -104,6 +110,13 @@ class ToolName(StrEnum):
     RLM_HTASK_METRICS = "rlm_htask_metrics"
     RLM_HTASK_AUDIT_TRAIL = "rlm_htask_audit_trail"
     RLM_HTASK_CHECKPOINT_DELTA = "rlm_htask_checkpoint_delta"
+    # Phase 20: Memory Tiers & Compaction
+    RLM_MEMORY_COMPACT = "rlm_memory_compact"
+    RLM_MEMORY_DAILY_BRIEF = "rlm_memory_daily_brief"
+    RLM_SESSION_MEMORIES = "rlm_session_memories"
+    # Phase 20: Tenant Profile
+    RLM_TENANT_PROFILE_CREATE = "rlm_tenant_profile_create"
+    RLM_TENANT_PROFILE_GET = "rlm_tenant_profile_get"
 
 
 class SearchMode(StrEnum):
@@ -177,6 +190,19 @@ class AgentMemoryScope(StrEnum):
     PROJECT = "project"  # Shared across project
     TEAM = "team"  # Shared across team
     USER = "user"  # Personal across all projects
+
+
+class MemoryTier(StrEnum):
+    """Tier for memory prioritization and auto-loading."""
+
+    CRITICAL = "CRITICAL"  # Auto-load, max 8K tokens (decisions, facts)
+    DAILY = "DAILY"  # Auto-load today+yesterday, max 4K tokens (context, todos)
+    ARCHIVE = "ARCHIVE"  # Query-only, no auto-load (old learnings, preferences)
+
+    @classmethod
+    def from_str(cls, value: str) -> "MemoryTier":
+        """Convert string to MemoryTier enum."""
+        return cls(value.upper())
 
 
 class IndexJobStatus(StrEnum):

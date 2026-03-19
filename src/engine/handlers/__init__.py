@@ -25,10 +25,18 @@ from .document import (
 )
 from .memory import (
     handle_forget,
+    handle_journal_append,
+    handle_journal_get,
+    handle_journal_summarize,
     handle_memories,
+    handle_memory_compact,
+    handle_memory_daily_brief,
     handle_recall,
     handle_remember,
     handle_remember_bulk,
+    handle_session_memories,
+    handle_tenant_profile_create,
+    handle_tenant_profile_get,
 )
 from .session import (
     handle_clear_context,
@@ -41,6 +49,8 @@ from .summary import (
     handle_store_summary,
 )
 from .swarm import (
+    handle_agent_profile_get,
+    handle_agent_profile_update,
     handle_broadcast,
     handle_claim,
     handle_release,
@@ -92,9 +102,22 @@ __all__ = [
     "handle_recall",
     "handle_memories",
     "handle_forget",
+    # Journal handlers
+    "handle_journal_append",
+    "handle_journal_get",
+    "handle_journal_summarize",
+    # Memory Tier & Compaction handlers (Phase 20)
+    "handle_session_memories",
+    "handle_memory_compact",
+    "handle_memory_daily_brief",
+    # Tenant Profile handlers (Phase 20)
+    "handle_tenant_profile_create",
+    "handle_tenant_profile_get",
     # Swarm handlers
     "handle_swarm_create",
     "handle_swarm_join",
+    "handle_agent_profile_get",
+    "handle_agent_profile_update",
     "handle_claim",
     "handle_release",
     "handle_state_get",

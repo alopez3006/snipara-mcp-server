@@ -4,12 +4,6 @@ generator client {
   binaryTargets   = ["native", "rhel-openssl-3.0.x"]
 }
 
-generator py {
-  provider             = "prisma-client-py"
-  interface            = "asyncio"
-  recursive_type_depth = 5
-}
-
 datasource db {
   provider   = "postgresql"
   url        = env("DATABASE_URL")
@@ -1234,6 +1228,12 @@ enum MemoryScope {
   USER        // Personal across all projects
 }
 
+enum MemoryTier {
+  CRITICAL    // Auto-load, max 8K tokens (decisions, facts)
+  DAILY       // Auto-load today+yesterday, max 4K tokens (context, todos)
+  ARCHIVE     // Query-only, no auto-load (old learnings, preferences)
+}
+
 model AgentMemory {
   id            String       @id @default(cuid())
   projectId     String
@@ -1259,11 +1259,17 @@ model AgentMemory {
   createdAt     DateTime     @default(now())
   updatedAt     DateTime     @updatedAt
 
+  // Tiering (Phase 20)
+  tier          MemoryTier   @default(ARCHIVE)
+  promotedAt    DateTime?    // When promoted to higher tier
+  promotedBy    String?      // Who/what promoted (agent_id, "system", "manual")
+
   project       Project      @relation(fields: [projectId], references: [id], onDelete: Cascade)
 
   @@index([projectId, type])
   @@index([projectId, category])
   @@index([projectId, scope])
+  @@index([projectId, tier])
   @@index([expiresAt])
   @@map("agent_memories")
 }
@@ -1280,6 +1286,11 @@ model MemoryStats {
   factCount     Int      @default(0)
   decisionCount Int      @default(0)
   learningCount Int      @default(0)
+
+  // By tier (Phase 20)
+  criticalCount Int      @default(0)
+  dailyCount    Int      @default(0)
+  archiveCount  Int      @default(0)
 
   updatedAt     DateTime @updatedAt
 
@@ -1414,6 +1425,9 @@ model SwarmAgent {
   swarmId       String
   agentId       String   // External agent identifier
   name          String?  // Human-readable name
+
+  // Agent Profile (Soul layer) - identity, personality, boundaries
+  profile       Json?
 
   // Status
   isActive      Boolean  @default(true)
@@ -1588,6 +1602,7 @@ model HierarchicalTask {
 
   // Results & Audit
   result                Json?
+  linkedMemoryId        String?         // Link to AgentMemory created on completion
   error                 String?         @db.Text
   createdAt             DateTime        @default(now())
   updatedAt             DateTime        @updatedAt

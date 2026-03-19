@@ -24,6 +24,7 @@ from ...services.swarm import (
     complete_task,
     create_swarm,
     create_task,
+    get_agent_profile,
     get_state,
     get_task_events,
     get_task_stats,
@@ -32,6 +33,7 @@ from ...services.swarm import (
     list_tasks_enhanced,
     release_claim,
     set_state,
+    update_agent_profile,
 )
 from .base import HandlerContext, count_tokens
 
@@ -684,5 +686,113 @@ async def handle_task_events(
     return ToolResult(
         data=result,
         input_tokens=0,
+        output_tokens=count_tokens(str(result)),
+    )
+
+
+# ============ AGENT PROFILE HANDLERS ============
+
+
+async def handle_agent_profile_get(
+    params: dict[str, Any],
+    ctx: HandlerContext,
+) -> ToolResult:
+    """Get an agent's profile (identity, personality, boundaries).
+
+    Args:
+        params: Dict containing:
+            - swarm_id: Swarm ID (required)
+            - agent_id: Agent identifier (required)
+
+    Returns:
+        ToolResult with agent profile
+    """
+    swarm_id = params.get("swarm_id", "")
+    agent_id = params.get("agent_id", "")
+
+    if not swarm_id:
+        return ToolResult(
+            data={"error": "rlm_agent_profile_get: missing required parameter 'swarm_id'"},
+            input_tokens=0,
+            output_tokens=0,
+        )
+
+    if not agent_id:
+        return ToolResult(
+            data={"error": "rlm_agent_profile_get: missing required parameter 'agent_id'"},
+            input_tokens=0,
+            output_tokens=0,
+        )
+
+    result = await get_agent_profile(
+        swarm_id=swarm_id,
+        agent_id=agent_id,
+    )
+
+    return ToolResult(
+        data=result,
+        input_tokens=0,
+        output_tokens=count_tokens(str(result)),
+    )
+
+
+async def handle_agent_profile_update(
+    params: dict[str, Any],
+    ctx: HandlerContext,
+) -> ToolResult:
+    """Update an agent's profile.
+
+    Args:
+        params: Dict containing:
+            - swarm_id: Swarm ID (required)
+            - agent_id: Agent identifier (required)
+            - profile: Profile data to update (merged with existing)
+                - display_name: str
+                - personality: str
+                - role_description: str
+                - boundaries: list[str]
+                - communication_style: str
+                - decision_making: str
+                - soul_document_path: str
+                - memory_scope: "agent" | "project" | "team"
+                - custom: dict
+
+    Returns:
+        ToolResult with updated profile
+    """
+    swarm_id = params.get("swarm_id", "")
+    agent_id = params.get("agent_id", "")
+    profile = params.get("profile", {})
+
+    if not swarm_id:
+        return ToolResult(
+            data={"error": "rlm_agent_profile_update: missing required parameter 'swarm_id'"},
+            input_tokens=0,
+            output_tokens=0,
+        )
+
+    if not agent_id:
+        return ToolResult(
+            data={"error": "rlm_agent_profile_update: missing required parameter 'agent_id'"},
+            input_tokens=0,
+            output_tokens=0,
+        )
+
+    if not profile:
+        return ToolResult(
+            data={"error": "rlm_agent_profile_update: missing required parameter 'profile'"},
+            input_tokens=0,
+            output_tokens=0,
+        )
+
+    result = await update_agent_profile(
+        swarm_id=swarm_id,
+        agent_id=agent_id,
+        profile=profile,
+    )
+
+    return ToolResult(
+        data=result,
+        input_tokens=count_tokens(str(profile)),
         output_tokens=count_tokens(str(result)),
     )
