@@ -1878,6 +1878,8 @@ class RLMEngine:
             from src.engine.handlers.decisions import handle_decision_query
             from src.models.decision import DecisionQueryParams
 
+            db = await get_db()
+
             # Query active decisions with HIGH or CRITICAL impact
             for impact in ["CRITICAL", "HIGH"]:
                 query_params = DecisionQueryParams(
@@ -1887,7 +1889,7 @@ class RLMEngine:
                     include_superseded=False,
                 )
                 decision_result = await handle_decision_query(
-                    self.db, self.project_id, query_params
+                    db, self.project_id, query_params
                 )
 
                 for decision in decision_result.decisions:
