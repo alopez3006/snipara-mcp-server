@@ -30,6 +30,7 @@ class ToolName(StrEnum):
     RLM_LIST_TEMPLATES = "rlm_list_templates"
     RLM_GET_TEMPLATE = "rlm_get_template"
     RLM_LIST_COLLECTIONS = "rlm_list_collections"
+    RLM_CREATE_COLLECTION = "rlm_create_collection"
     RLM_UPLOAD_SHARED_DOCUMENT = "rlm_upload_shared_document"
     # Phase 8.2: Agent Memory Tools
     RLM_REMEMBER = "rlm_remember"

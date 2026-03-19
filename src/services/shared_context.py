@@ -721,6 +721,134 @@ async def list_shared_collections(
     return result
 
 
+async def create_shared_collection(
+    name: str,
+    slug: str,
+    user_id: str | None = None,
+    project_id: str | None = None,
+    description: str | None = None,
+    scope: str = "TEAM",
+    is_public: bool = False,
+) -> dict:
+    """
+    Create a new shared context collection.
+
+    A collection can be owned by a user (USER scope), a team (TEAM scope),
+    or be global (GLOBAL scope). Projects can link to collections to access
+    shared documents.
+
+    Args:
+        name: Human-readable name for the collection
+        slug: URL-friendly identifier (lowercase, hyphens only)
+        user_id: The user creating the collection (required for USER/TEAM scope)
+        project_id: Optional project to auto-link the collection to
+        description: Optional description
+        scope: GLOBAL, TEAM, or USER (default: TEAM)
+        is_public: Whether the collection is publicly visible
+
+    Returns:
+        Dict with collection details including id, name, slug, scope
+
+    Raises:
+        ValueError: If validation fails or user doesn't have access
+    """
+    import re
+
+    db = await get_db()
+
+    # Validate slug format
+    if not re.match(r"^[a-z0-9-]+$", slug):
+        raise ValueError("Slug must contain only lowercase letters, numbers, and hyphens")
+
+    # Validate scope
+    valid_scopes = {"GLOBAL", "TEAM", "USER"}
+    scope_upper = scope.upper()
+    if scope_upper not in valid_scopes:
+        raise ValueError(f"Invalid scope. Must be one of: {', '.join(valid_scopes)}")
+
+    # Determine ownership based on scope
+    owner_id = None
+    team_id = None
+
+    if scope_upper == "USER":
+        if not user_id:
+            raise ValueError("user_id is required for USER scope collections")
+        owner_id = user_id
+
+    elif scope_upper == "TEAM":
+        # Need to find the user's team
+        if not user_id and not project_id:
+            raise ValueError("user_id or project_id is required for TEAM scope collections")
+
+        # Try to get team from user
+        if user_id:
+            user_teams = await _get_user_team_ids(user_id)
+            if not user_teams:
+                raise ValueError("You must be a member of a team to create TEAM scope collections")
+            team_id = user_teams[0]  # Use first team
+
+        # If we have a project_id, get the team from the project
+        if project_id and not team_id:
+            project = await db.project.find_unique(where={"id": project_id})
+            if project and project.teamId:
+                team_id = project.teamId
+            else:
+                raise ValueError("Project not found or has no team")
+
+    elif scope_upper == "GLOBAL":
+        # Global collections don't have owner or team
+        # Only admins should create these (enforced at API level)
+        pass
+
+    # Check for duplicate slug within scope
+    existing = await db.sharedcontextcollection.find_first(
+        where={
+            "slug": slug,
+            "scope": scope_upper,
+            "teamId": team_id,
+        }
+    )
+
+    if existing:
+        raise ValueError(f"A collection with slug '{slug}' already exists in this scope")
+
+    # Create the collection
+    collection = await db.sharedcontextcollection.create(
+        data={
+            "name": name,
+            "slug": slug,
+            "description": description,
+            "scope": scope_upper,
+            "ownerId": owner_id,
+            "teamId": team_id,
+            "isPublic": is_public,
+        }
+    )
+
+    # Auto-link to project if project_id provided
+    if project_id:
+        await db.projectsharedcontext.create(
+            data={
+                "projectId": project_id,
+                "collectionId": collection.id,
+                "priority": 1,
+            }
+        )
+
+    return {
+        "id": collection.id,
+        "name": collection.name,
+        "slug": collection.slug,
+        "description": collection.description,
+        "scope": collection.scope,
+        "is_public": collection.isPublic,
+        "team_id": team_id,
+        "owner_id": owner_id,
+        "auto_linked_to_project": project_id is not None,
+        "message": f"Collection '{name}' created successfully",
+    }
+
+
 async def create_shared_document(
     collection_id: str,
     user_id: str | None = None,

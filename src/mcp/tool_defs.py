@@ -65,6 +65,7 @@ TOOL_TIERS: dict[str, ToolTier] = {
     "rlm_get_template": ToolTier.TEAM,
     "rlm_upload_shared_document": ToolTier.TEAM,
     "rlm_list_collections": ToolTier.TEAM,
+    "rlm_create_collection": ToolTier.TEAM,
     "rlm_load_project": ToolTier.TEAM,
     # UTILITY (⚪) - Session management
     "rlm_inject": ToolTier.UTILITY,
@@ -515,6 +516,39 @@ TOOL_DEFINITIONS: list[dict] = [
                 },
             },
             "required": [],
+        },
+    },
+    {
+        "name": "rlm_create_collection",
+        "description": "Create a new shared context collection. Collections can be scoped to TEAM (shared within your team), USER (personal across projects), or GLOBAL (public). Use this before uploading shared documents.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Human-readable name for the collection",
+                },
+                "slug": {
+                    "type": "string",
+                    "description": "URL-friendly identifier (lowercase, hyphens only, e.g. 'coding-standards')",
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Optional description of the collection",
+                },
+                "scope": {
+                    "type": "string",
+                    "enum": ["TEAM", "USER", "GLOBAL"],
+                    "default": "TEAM",
+                    "description": "Collection scope: TEAM (shared within team), USER (personal), GLOBAL (public)",
+                },
+                "is_public": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Whether the collection is publicly visible (only applies to GLOBAL scope)",
+                },
+            },
+            "required": ["name", "slug"],
         },
     },
     {

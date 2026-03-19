@@ -130,6 +130,7 @@ from .services.shared_context import (
     DocumentCategory,
     allocate_shared_context_budget,
     compute_context_hash,
+    create_shared_collection,
     create_shared_document,
     get_shared_prompt_templates,
     list_shared_collections,
@@ -935,6 +936,7 @@ class RLMEngine:
             ToolName.RLM_LIST_TEMPLATES: self._handle_list_templates,
             ToolName.RLM_GET_TEMPLATE: self._handle_get_template,
             ToolName.RLM_LIST_COLLECTIONS: self._handle_list_collections,
+            ToolName.RLM_CREATE_COLLECTION: self._handle_create_collection,
             ToolName.RLM_UPLOAD_SHARED_DOCUMENT: self._handle_upload_shared_document,
             # Phase 8.2: Agent Memory Tools
             ToolName.RLM_REMEMBER: self._handle_remember,
@@ -4341,6 +4343,71 @@ Rationale: {decision.rationale}"""
             logger.error(f"Error listing collections: {e}")
             return ToolResult(
                 data={"error": f"Failed to list collections: {str(e)}"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+    async def _handle_create_collection(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_create_collection - create a new shared context collection.
+
+        Args:
+            params: Dict containing:
+                - name: Human-readable name for the collection
+                - slug: URL-friendly identifier (lowercase, hyphens only)
+                - description: Optional description
+                - scope: TEAM, USER, or GLOBAL (default: TEAM)
+                - is_public: Whether the collection is publicly visible
+
+        Returns:
+            ToolResult with collection details
+        """
+        name = params.get("name", "")
+        slug = params.get("slug", "")
+        description = params.get("description")
+        scope = params.get("scope", "TEAM")
+        is_public = params.get("is_public", False)
+
+        if not name:
+            return ToolResult(
+                data={"error": "name is required"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        if not slug:
+            return ToolResult(
+                data={"error": "slug is required"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        try:
+            result = await create_shared_collection(
+                name=name,
+                slug=slug,
+                user_id=self.user_id,
+                project_id=self.project_id,
+                description=description,
+                scope=scope,
+                is_public=is_public,
+            )
+
+            return ToolResult(
+                data=result,
+                input_tokens=0,
+                output_tokens=0,
+            )
+        except ValueError as e:
+            return ToolResult(
+                data={"error": str(e)},
+                input_tokens=0,
+                output_tokens=0,
+            )
+        except Exception as e:
+            logger.error(f"Error creating collection: {e}")
+            return ToolResult(
+                data={"error": f"Failed to create collection: {str(e)}"},
                 input_tokens=0,
                 output_tokens=0,
             )
