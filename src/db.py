@@ -22,6 +22,15 @@ async def _create_client() -> Prisma:
         try:
             client = Prisma()
             await client.connect()
+
+            # CRITICAL: Enable pgvector extension before setting search_path
+            # This must run ONCE but is safe to retry (IF NOT EXISTS)
+            try:
+                await client.execute_raw("CREATE EXTENSION IF NOT EXISTS vector SCHEMA public;")
+                logger.info("pgvector extension enabled in public schema")
+            except Exception as e:
+                logger.error(f"FAILED to enable pgvector extension: {e}")
+
             # CRITICAL: Force search_path for pgvector support
             # Multi-tenant databases (Vaultbrix) need both tenant schema (for tables) and public (for pgvector)
             try:
