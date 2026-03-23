@@ -1,5 +1,6 @@
 """FastAPI MCP Server for RLM SaaS."""
 
+import asyncio
 import json
 import logging
 import time
@@ -44,6 +45,7 @@ from .models import (
 )
 from .rlm_engine import RLMEngine
 from .services.agent_memory import semantic_recall, store_memory
+from .services.swarm_events import subscribe_to_swarm, unsubscribe_from_swarm
 from .usage import (
     _is_demo_key,
     check_rate_limit,
@@ -1175,6 +1177,126 @@ async def mcp_sse_endpoint_post(
             user_id=api_key_info.get("user_id"),
             access_level=api_key_info.get("access_level", "EDITOR"),
         ),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # Disable nginx buffering
+        },
+    )
+
+
+# ============ SWARM SSE ENDPOINTS ============
+
+
+async def swarm_sse_event_generator(
+    swarm_id: str,
+    project_id: str,
+) -> AsyncGenerator[str, None]:
+    """
+    Generate Server-Sent Events for swarm real-time updates.
+
+    Subscribes to Redis pub/sub channel and streams events to client.
+
+    Yields SSE-formatted events:
+    - connected: Connection established
+    - event: Swarm event (task_created, task_completed, agent_joined, etc.)
+    - heartbeat: Keep-alive ping every 30 seconds
+    - error: Error occurred
+    """
+    pubsub = None
+    try:
+        # Send connection established event
+        yield f"data: {json.dumps({'type': 'connected', 'swarm_id': swarm_id})}\n\n"
+
+        # Subscribe to swarm events
+        pubsub = await subscribe_to_swarm(swarm_id)
+        if not pubsub:
+            yield f"data: {json.dumps({'type': 'error', 'message': 'Redis unavailable, use polling instead'})}\n\n"
+            return
+
+        # Listen for events with heartbeat
+        heartbeat_interval = 30  # seconds
+        last_heartbeat = time.time()
+
+        while True:
+            try:
+                # Non-blocking get with timeout
+                message = await asyncio.wait_for(
+                    pubsub.get_message(ignore_subscribe_messages=True),
+                    timeout=1.0,
+                )
+
+                if message and message.get("type") == "message":
+                    data = message.get("data")
+                    if isinstance(data, bytes):
+                        data = data.decode("utf-8")
+                    event_data = json.loads(data) if isinstance(data, str) else data
+                    yield f"data: {json.dumps({'type': 'event', 'event': event_data})}\n\n"
+
+                # Send heartbeat every 30 seconds
+                if time.time() - last_heartbeat >= heartbeat_interval:
+                    yield f"data: {json.dumps({'type': 'heartbeat', 'timestamp': datetime.utcnow().isoformat()})}\n\n"
+                    last_heartbeat = time.time()
+
+            except asyncio.TimeoutError:
+                # Timeout is normal, check for heartbeat
+                if time.time() - last_heartbeat >= heartbeat_interval:
+                    yield f"data: {json.dumps({'type': 'heartbeat', 'timestamp': datetime.utcnow().isoformat()})}\n\n"
+                    last_heartbeat = time.time()
+                continue
+
+    except asyncio.CancelledError:
+        # Client disconnected
+        logger.debug(f"SSE client disconnected from swarm {swarm_id}")
+    except Exception as e:
+        logger.error(f"Swarm SSE error: {e}")
+        yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+    finally:
+        if pubsub:
+            await unsubscribe_from_swarm(pubsub, swarm_id)
+
+
+@app.get("/v1/{project_id}/swarm/{swarm_id}/sse", tags=["Swarm", "SSE"])
+async def swarm_sse_endpoint(
+    project_id: str,
+    swarm_id: str,
+    api_key: Annotated[str, Depends(get_api_key)],
+):
+    """
+    Subscribe to real-time swarm events via Server-Sent Events (SSE).
+
+    This endpoint streams swarm events in real-time using Redis pub/sub.
+    Useful for dashboards, monitoring, and real-time coordination.
+
+    Events include:
+    - task_created, task_claimed, task_completed, task_failed
+    - agent_joined, agent_left
+    - state_changed
+    - claim_acquired, claim_released
+
+    Args:
+        project_id: The project ID
+        swarm_id: The swarm ID to subscribe to
+        api_key: API key from X-API-Key header
+
+    Returns:
+        SSE stream with swarm events
+    """
+    # Validate API key and project
+    api_key_info, project, plan, _ = await validate_and_rate_limit(project_id, api_key)
+
+    # Verify swarm exists and belongs to project
+    db = await get_db()
+    swarm = await db.swarm.find_first(
+        where={"id": swarm_id, "projectId": project.id}
+    )
+    if not swarm:
+        raise HTTPException(status_code=404, detail=f"Swarm {swarm_id} not found")
+
+    # Return SSE stream
+    return StreamingResponse(
+        swarm_sse_event_generator(swarm_id, project.id),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
