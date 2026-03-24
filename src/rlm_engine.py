@@ -1659,7 +1659,7 @@ class RLMEngine:
                 # Cache hit - return early
                 timing["total_ms"] = int((time.perf_counter() - timing_start) * 1000)
                 timing["cache_hit"] = 1
-                timing["cache_level"] = cache_level
+                # cache_level is passed to ContextQueryResult separately (string field)
 
                 # Reconstruct ContextQueryResult from cached data
                 cached_sections = cached_result.get("sections", [])
