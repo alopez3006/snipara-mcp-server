@@ -682,6 +682,51 @@ def get_snipara_tools(
             params["older_than_days"] = older_than_days
         return await client.call_tool("rlm_forget", params)
 
+    # ============ GRAVEYARD TOOLS ============
+
+    async def bury(
+        reason: str,
+        memory_id: str | None = None,
+        content: str | None = None,
+    ) -> dict[str, Any]:
+        """Bury a memory or approach in the graveyard.
+
+        Buried entries trigger warnings during rlm_recall to prevent
+        re-suggesting abandoned approaches.
+
+        Args:
+            reason: Why this approach was abandoned (required)
+            memory_id: ID of an existing memory to bury
+            content: Description of the abandoned approach (if no memory_id)
+
+        Returns:
+            Dictionary with burial details
+        """
+        params: dict[str, Any] = {"reason": reason}
+        if memory_id:
+            params["memory_id"] = memory_id
+        if content:
+            params["content"] = content
+        return await client.call_tool("rlm_bury", params)
+
+    async def unbury(
+        memory_id: str,
+        reinstate_tier: str = "archive",
+    ) -> dict[str, Any]:
+        """Reinstate a memory from the graveyard.
+
+        Args:
+            memory_id: ID of the graveyard memory to reinstate
+            reinstate_tier: Tier to restore to (critical, daily, archive)
+
+        Returns:
+            Dictionary with reinstatement details
+        """
+        return await client.call_tool("rlm_unbury", {
+            "memory_id": memory_id,
+            "reinstate_tier": reinstate_tier,
+        })
+
     # ============ SWARM COORDINATION TOOLS ============
 
     async def swarm_create(

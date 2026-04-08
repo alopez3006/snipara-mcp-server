@@ -636,6 +636,37 @@ Examples:
                 "required": [],
             },
         ),
+        # Graveyard Tools
+        Tool(
+            name="rlm_bury",
+            description="Bury a memory or approach in the graveyard. Buried entries trigger warnings during rlm_recall to prevent re-suggesting abandoned approaches. Provide memory_id to bury an existing memory, or content to bury a new approach directly.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "memory_id": {"type": "string", "description": "ID of an existing memory to bury (optional if content provided)"},
+                    "content": {"type": "string", "description": "Description of the abandoned approach (optional if memory_id provided)"},
+                    "reason": {"type": "string", "description": "Why this approach was abandoned (required)"},
+                },
+                "required": ["reason"],
+            },
+        ),
+        Tool(
+            name="rlm_unbury",
+            description="Reinstate a memory from the graveyard. Use when a previously abandoned approach becomes viable again.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "memory_id": {"type": "string", "description": "ID of the graveyard memory to reinstate"},
+                    "reinstate_tier": {
+                        "type": "string",
+                        "enum": ["critical", "daily", "archive"],
+                        "default": "archive",
+                        "description": "Tier to restore the memory to",
+                    },
+                },
+                "required": ["memory_id"],
+            },
+        ),
         # Phase 9.1: Multi-Agent Swarm Tools
         Tool(
             name="rlm_swarm_create",
@@ -1348,6 +1379,32 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             if result.get("success"):
                 data = result.get("result", {})
                 return [TextContent(type="text", text=f"**{data.get('message', 'Deleted')}** ({data.get('deleted_count', 0)} memories)")]
+            return [TextContent(type="text", text=f"**Error:** {result.get('error', 'Unknown error')}")]
+
+        # Graveyard Handlers
+        elif name == "rlm_bury":
+            result = await call_api("rlm_bury", {
+                "memory_id": arguments.get("memory_id"),
+                "content": arguments.get("content"),
+                "reason": arguments["reason"],
+            })
+            if result.get("success"):
+                data = result.get("result", {})
+                if data.get("error"):
+                    return [TextContent(type="text", text=f"**Error:** {data['error']}")]
+                return [TextContent(type="text", text=f"**Buried in graveyard:** {data.get('content', '')[:100]}...\nReason: {data.get('buried_reason', '')}\nID: {data.get('memory_id', '')}")]
+            return [TextContent(type="text", text=f"**Error:** {result.get('error', 'Unknown error')}")]
+
+        elif name == "rlm_unbury":
+            result = await call_api("rlm_unbury", {
+                "memory_id": arguments["memory_id"],
+                "reinstate_tier": arguments.get("reinstate_tier", "archive"),
+            })
+            if result.get("success"):
+                data = result.get("result", {})
+                if data.get("error"):
+                    return [TextContent(type="text", text=f"**Error:** {data['error']}")]
+                return [TextContent(type="text", text=f"**Reinstated from graveyard:** {data.get('content', '')[:100]}...\nTier: {data.get('reinstated_tier', 'archive')}\nID: {data.get('memory_id', '')}")]
             return [TextContent(type="text", text=f"**Error:** {result.get('error', 'Unknown error')}")]
 
         # Phase 9.1: Multi-Agent Swarm Handlers
