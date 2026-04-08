@@ -114,6 +114,9 @@ class ToolName(StrEnum):
     RLM_MEMORY_COMPACT = "rlm_memory_compact"
     RLM_MEMORY_DAILY_BRIEF = "rlm_memory_daily_brief"
     RLM_SESSION_MEMORIES = "rlm_session_memories"
+    # Graveyard System
+    RLM_BURY = "rlm_bury"
+    RLM_UNBURY = "rlm_unbury"
     # Phase 20: Tenant Profile
     RLM_TENANT_PROFILE_CREATE = "rlm_tenant_profile_create"
     RLM_TENANT_PROFILE_GET = "rlm_tenant_profile_get"

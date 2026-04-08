@@ -444,26 +444,78 @@ async def handle_memory_compact(
     params: dict[str, Any],
     ctx: HandlerContext,
 ) -> ToolResult:
-    """Compact and optimize memories.
+    """Compact and optimize memories with intelligent consolidation.
 
     Args:
         params: Dict containing:
+            # Existing parameters:
             - scope: Memory scope to compact (default: project)
             - deduplicate: Merge similar memories (default: True)
             - promote_threshold: Access count to promote to CRITICAL (default: 3)
             - archive_older_than_days: Archive memories older than N days (default: 30)
             - dry_run: Preview changes without applying (default: False)
 
+            # NEW consolidation parameters:
+            - normalize_dates: Convert relative dates to absolute (default: True)
+                Example: "yesterday" -> "2026-03-24" (based on memory creation time)
+            - validate_refs: Remove dead document_refs (default: True)
+                Removes references to documents no longer in the index
+            - conflict_strategy: How to resolve similar-but-different memories (default: "newer")
+                - "newer": Keep most recent, archive older
+                - "higher_confidence": Keep highest confidence score
+                - "merge": Combine content into newer memory
+                - "flag": Mark both for manual review (adds :needs_review to category)
+            - similarity_threshold: Semantic similarity for conflict detection (default: 0.85)
+                Range 0.0-1.0. Higher = stricter matching (fewer conflicts detected)
+
     Returns:
-        ToolResult with compaction results
+        ToolResult with compaction results including:
+            - dates_normalized: Count of date conversions
+            - dead_refs_removed: Count of invalid references removed
+            - conflicts_resolved: Count of contradictions resolved
+            - conflicts_flagged: Count flagged for review (if strategy="flag")
+            - duplicates_merged: Count of exact duplicates removed
+            - promoted_to_critical: Count of learnings promoted
+            - archived: Count of old memories archived
+            - tokens_freed: Estimated tokens saved
     """
     from ...services.agent_memory import compact_memories
 
+    # Existing parameters
     scope = params.get("scope", "project")
     deduplicate = params.get("deduplicate", True)
     promote_threshold = params.get("promote_threshold", 3)
     archive_older_than_days = params.get("archive_older_than_days", 30)
     dry_run = params.get("dry_run", False)
+
+    # NEW consolidation parameters
+    normalize_dates = params.get("normalize_dates", True)
+    validate_refs = params.get("validate_refs", True)
+    conflict_strategy = params.get("conflict_strategy", "newer")
+    similarity_threshold = params.get("similarity_threshold", 0.85)
+
+    # Validate conflict_strategy
+    valid_strategies = ["newer", "higher_confidence", "merge", "flag"]
+    if conflict_strategy not in valid_strategies:
+        return ToolResult(
+            data={
+                "error": f"Invalid conflict_strategy: {conflict_strategy}. "
+                f"Must be one of: {', '.join(valid_strategies)}"
+            },
+            input_tokens=0,
+            output_tokens=0,
+        )
+
+    # Validate similarity_threshold
+    if not (0.0 <= similarity_threshold <= 1.0):
+        return ToolResult(
+            data={
+                "error": f"Invalid similarity_threshold: {similarity_threshold}. "
+                "Must be between 0.0 and 1.0"
+            },
+            input_tokens=0,
+            output_tokens=0,
+        )
 
     result = await compact_memories(
         project_id=ctx.project_id,
@@ -472,6 +524,11 @@ async def handle_memory_compact(
         promote_threshold=promote_threshold,
         archive_older_than_days=archive_older_than_days,
         dry_run=dry_run,
+        # NEW parameters
+        normalize_dates=normalize_dates,
+        validate_refs=validate_refs,
+        conflict_strategy=conflict_strategy,
+        similarity_threshold=similarity_threshold,
     )
 
     return ToolResult(

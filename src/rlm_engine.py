@@ -950,6 +950,9 @@ class RLMEngine:
             ToolName.RLM_RECALL: self._handle_recall,
             ToolName.RLM_MEMORIES: self._handle_memories,
             ToolName.RLM_FORGET: self._handle_forget,
+            # Graveyard System
+            ToolName.RLM_BURY: self._handle_bury,
+            ToolName.RLM_UNBURY: self._handle_unbury,
             # Phase 18: Daily Journal Tools
             ToolName.RLM_JOURNAL_APPEND: self._handle_journal_append,
             ToolName.RLM_JOURNAL_GET: self._handle_journal_get,
@@ -4800,6 +4803,69 @@ Rationale: {decision.rationale}"""
         return ToolResult(
             data=result,
             input_tokens=0,
+            output_tokens=count_tokens(str(result)),
+        )
+
+    # ============ GRAVEYARD HANDLERS ============
+
+    async def _handle_bury(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_bury - bury a memory or approach in the graveyard."""
+        from .services.agent_memory import bury_memory
+
+        reason = params.get("reason")
+        if not reason:
+            return ToolResult(
+                data={"error": "rlm_bury: 'reason' is required"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        memory_id = params.get("memory_id")
+        content = params.get("content")
+        if not memory_id and not content:
+            return ToolResult(
+                data={"error": "rlm_bury: either 'memory_id' or 'content' is required"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        result = await bury_memory(
+            project_id=self.project_id,
+            reason=reason,
+            memory_id=memory_id,
+            content=content,
+            buried_by="mcp",
+        )
+
+        return ToolResult(
+            data=result,
+            input_tokens=count_tokens(str(params)),
+            output_tokens=count_tokens(str(result)),
+        )
+
+    async def _handle_unbury(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_unbury - reinstate a memory from the graveyard."""
+        from .services.agent_memory import unbury_memory
+
+        memory_id = params.get("memory_id")
+        if not memory_id:
+            return ToolResult(
+                data={"error": "rlm_unbury: 'memory_id' is required"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        reinstate_tier = params.get("reinstate_tier", "archive")
+
+        result = await unbury_memory(
+            project_id=self.project_id,
+            memory_id=memory_id,
+            reinstate_tier=reinstate_tier,
+        )
+
+        return ToolResult(
+            data=result,
+            input_tokens=count_tokens(str(params)),
             output_tokens=count_tokens(str(result)),
         )
 

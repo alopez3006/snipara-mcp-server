@@ -1307,6 +1307,7 @@ enum MemoryTier {
   CRITICAL    // Auto-load, max 8K tokens (decisions, facts)
   DAILY       // Auto-load today+yesterday, max 4K tokens (context, todos)
   ARCHIVE     // Query-only, no auto-load (old learnings, preferences)
+  GRAVEYARD   // Abandoned approaches — warns during recall
 
   @@schema("tenant_snipara")
 }
@@ -1341,6 +1342,16 @@ model AgentMemory {
   promotedAt    DateTime?    // When promoted to higher tier
   promotedBy    String?      // Who/what promoted (agent_id, "system", "manual")
 
+  // Contradiction tracking
+  contradictsId       String?   // ID of the memory this one contradicts
+  contradictedById    String?   // ID of the memory that later contradicted this one
+  contradictionScore  Float?    // Similarity score at detection time (0.85-0.98)
+
+  // Graveyard metadata
+  buriedAt            DateTime? // When this memory was buried
+  buriedReason        String?   @db.Text  // Why this approach was abandoned
+  buriedBy            String?   // Who buried it (agent_id, "user", "system")
+
   project       Project      @relation(fields: [projectId], references: [id], onDelete: Cascade)
 
   @@index([projectId, type])
@@ -1348,6 +1359,9 @@ model AgentMemory {
   @@index([projectId, scope])
   @@index([projectId, tier])
   @@index([expiresAt])
+  @@index([projectId, tier, buriedAt])
+  @@index([contradictsId])
+  @@index([contradictedById])
   @@map("agent_memories")
   @@schema("tenant_snipara")
 }

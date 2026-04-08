@@ -21,6 +21,10 @@ class RememberResult(BaseModel):
     expires_at: datetime | None = Field(default=None, description="When memory expires")
     created: bool = Field(default=True, description="True if new, False if updated")
     message: str = Field(..., description="Human-readable status message")
+    contradiction: dict[str, Any] | None = Field(
+        default=None,
+        description="Contradiction info if new memory conflicts with an existing one",
+    )
 
 
 class RecalledMemory(BaseModel):
@@ -36,6 +40,21 @@ class RecalledMemory(BaseModel):
     created_at: datetime = Field(..., description="When memory was created")
     last_accessed_at: datetime | None = Field(default=None, description="Last access time")
     access_count: int = Field(default=0, ge=0, description="Times accessed")
+    contradicts: str | None = Field(default=None, description="ID of memory this one contradicts")
+    contradicted_by: str | None = Field(
+        default=None, description="ID of memory that contradicts this one"
+    )
+
+
+class GraveyardWarning(BaseModel):
+    """Warning about a previously abandoned approach."""
+
+    memory_id: str = Field(..., description="Graveyard memory ID")
+    content: str = Field(..., description="The abandoned approach")
+    buried_reason: str = Field(..., description="Why it was abandoned")
+    buried_at: datetime | None = Field(default=None, description="When it was buried")
+    similarity: float = Field(..., ge=0.0, le=1.0, description="Similarity to query")
+    warning: str = Field(..., description="Formatted warning message")
 
 
 class RecallResult(BaseModel):
@@ -47,6 +66,10 @@ class RecallResult(BaseModel):
     total_searched: int = Field(default=0, ge=0, description="Total memories searched")
     query: str = Field(..., description="Original query")
     timing_ms: int = Field(default=0, ge=0, description="Recall latency in milliseconds")
+    graveyard_warnings: list[GraveyardWarning] = Field(
+        default_factory=list,
+        description="Warnings about previously abandoned approaches matching the query",
+    )
 
 
 class MemoryInfo(BaseModel):
@@ -76,6 +99,26 @@ class ForgetResult(BaseModel):
     """Result of rlm_forget tool."""
 
     deleted_count: int = Field(default=0, ge=0, description="Number of memories deleted")
+    message: str = Field(..., description="Human-readable status message")
+
+
+class BuryResult(BaseModel):
+    """Result of rlm_bury tool."""
+
+    memory_id: str = Field(..., description="Graveyard memory ID")
+    content: str = Field(..., description="Content preview of the buried memory")
+    buried_reason: str = Field(..., description="Why this approach was abandoned")
+    buried_at: datetime = Field(..., description="When it was buried")
+    was_existing: bool = Field(..., description="True if moved existing memory, False if created new")
+    message: str = Field(..., description="Human-readable status message")
+
+
+class UnburyResult(BaseModel):
+    """Result of rlm_unbury tool."""
+
+    memory_id: str = Field(..., description="Reinstated memory ID")
+    content: str = Field(..., description="Content preview of the reinstated memory")
+    reinstated_tier: str = Field(..., description="Tier the memory was restored to")
     message: str = Field(..., description="Human-readable status message")
 
 

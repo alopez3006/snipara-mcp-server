@@ -5,8 +5,10 @@ Memories can have types (FACT, DECISION, LEARNING, etc.), scopes,
 and TTL with confidence decay over time.
 """
 
+import asyncio
 import json
 import logging
+import re
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -23,6 +25,36 @@ MEMORY_EMBEDDING_TTL = 60 * 60 * 24 * 7  # 7 days default
 # Confidence decay settings
 CONFIDENCE_DECAY_RATE = 0.01  # 1% decay per day
 MIN_CONFIDENCE = 0.1  # Minimum confidence after decay
+
+# Auto-compaction settings
+AUTO_COMPACT_THRESHOLD = 500  # Trigger compaction when memory count exceeds this
+AUTO_COMPACT_COOLDOWN = 60 * 60 * 24  # Minimum seconds between auto-compactions (24 hours)
+AUTO_COMPACT_CACHE_KEY_PREFIX = "rlm:auto_compact_last:"
+
+# Conflict resolution strategies
+CONFLICT_STRATEGY_NEWER = "newer"  # Keep most recent, archive older
+CONFLICT_STRATEGY_HIGHER_CONFIDENCE = "higher_confidence"  # Keep highest confidence
+CONFLICT_STRATEGY_MERGE = "merge"  # Combine into one
+CONFLICT_STRATEGY_FLAG = "flag"  # Mark for manual review
+
+# Date normalization patterns (regex pattern, replacement function)
+# Note: replacement functions take (reference_time, *groups) as arguments
+DATE_PATTERNS: list[tuple[str, Any]] = [
+    # "yesterday" -> absolute date based on memory creation time
+    (r"\byesterday\b", lambda ref: ref - timedelta(days=1)),
+    # "today" -> absolute date
+    (r"\btoday\b", lambda ref: ref),
+    # "N days ago" -> absolute date
+    (r"\b(\d+)\s+days?\s+ago\b", lambda ref, d: ref - timedelta(days=int(d))),
+    # "last week" -> week of date
+    (r"\blast\s+week\b", lambda ref: ref - timedelta(weeks=1)),
+    # "last month" -> month
+    (r"\blast\s+month\b", lambda ref: ref - timedelta(days=30)),
+    # "this morning" -> date with morning
+    (r"\bthis\s+morning\b", lambda ref: ref),
+    # "recently" -> around date
+    (r"\brecently\b", lambda ref: ref),
+]
 
 
 def calculate_confidence_decay(
@@ -102,6 +134,10 @@ async def _get_memory_embedding(memory_id: str) -> list[float] | None:
 async def _get_memory_embeddings_batch(memory_ids: list[str]) -> dict[str, list[float]]:
     """Get cached embeddings for multiple memories from Redis using MGET.
 
+    Batches requests to avoid exceeding Upstash's 10MB response limit.
+    Each embedding is ~8KB (1024 floats × 8 bytes JSON), so we batch
+    in groups of 500 (~4MB per batch) to stay well under the limit.
+
     Args:
         memory_ids: List of memory IDs
 
@@ -115,26 +151,61 @@ async def _get_memory_embeddings_batch(memory_ids: list[str]) -> dict[str, list[
     if redis is None:
         return {}
 
-    try:
-        keys = [f"{MEMORY_EMBEDDING_PREFIX}{mid}" for mid in memory_ids]
-        values = await redis.mget(keys)
+    # Batch size: 400 embeddings × ~22KB = ~8.8MB per batch (under 10MB limit)
+    # Actual embedding size: 1024 floats × ~21 bytes JSON encoding per float
+    BATCH_SIZE = 400
+    result: dict[str, list[float]] = {}
 
-        result = {}
-        for mid, value in zip(memory_ids, values):
-            if value:
-                try:
-                    embedding = json.loads(value)
-                    # Validate embedding structure and dimensions
-                    if _is_valid_embedding(embedding):
-                        result[mid] = embedding
-                    else:
-                        logger.warning(
-                            f"Invalid embedding for memory {mid}: "
-                            f"expected {EMBEDDING_DIMENSION} dimensions, "
-                            f"got {len(embedding) if isinstance(embedding, list) else 'non-list'}"
-                        )
-                except json.JSONDecodeError:
-                    logger.warning(f"Failed to parse embedding JSON for memory {mid}")
+    try:
+        # Process in batches to avoid Upstash 10MB limit
+        for i in range(0, len(memory_ids), BATCH_SIZE):
+            batch_ids = memory_ids[i : i + BATCH_SIZE]
+            keys = [f"{MEMORY_EMBEDDING_PREFIX}{mid}" for mid in batch_ids]
+
+            try:
+                values = await redis.mget(keys)
+            except Exception as batch_error:
+                # If batch still fails, try smaller batches
+                if BATCH_SIZE > 100:
+                    logger.warning(
+                        f"MGET batch of {len(batch_ids)} failed, trying smaller batches: {batch_error}"
+                    )
+                    # Recursively process with smaller batch
+                    for j in range(0, len(batch_ids), 100):
+                        sub_batch = batch_ids[j : j + 100]
+                        sub_keys = [f"{MEMORY_EMBEDDING_PREFIX}{mid}" for mid in sub_batch]
+                        try:
+                            sub_values = await redis.mget(sub_keys)
+                            for mid, value in zip(sub_batch, sub_values):
+                                if value:
+                                    try:
+                                        embedding = json.loads(value)
+                                        if _is_valid_embedding(embedding):
+                                            result[mid] = embedding
+                                    except json.JSONDecodeError:
+                                        pass
+                        except Exception:
+                            logger.warning(f"Sub-batch of {len(sub_batch)} also failed")
+                    continue
+                else:
+                    raise
+
+            for mid, value in zip(batch_ids, values):
+                if value:
+                    try:
+                        embedding = json.loads(value)
+                        # Validate embedding structure and dimensions
+                        if _is_valid_embedding(embedding):
+                            result[mid] = embedding
+                        else:
+                            logger.warning(
+                                f"Invalid embedding for memory {mid}: "
+                                f"expected {EMBEDDING_DIMENSION} dimensions, "
+                                f"got {len(embedding) if isinstance(embedding, list) else 'non-list'}"
+                            )
+                    except json.JSONDecodeError:
+                        logger.warning(f"Failed to parse embedding JSON for memory {mid}")
+
         return result
     except Exception as e:
         logger.warning(f"Error getting memory embeddings batch: {e}")
@@ -260,7 +331,24 @@ async def store_memory(
         logger.info(f"Stored memory {memory.id} with embedding")
     except Exception as e:
         logger.warning(f"Failed to generate embedding for memory {memory.id}: {e}")
-        # Memory is still created, just without embedding
+        embedding = None  # Mark as unavailable for contradiction check
+
+    # Check for contradictions with existing memories (non-fatal)
+    contradiction_info = None
+    if embedding is not None:
+        try:
+            contradiction_info = await _check_write_time_contradictions(
+                project_id=project_id,
+                new_memory_id=memory.id,
+                new_content=content,
+                new_embedding=embedding,
+                memory_type=memory_type_upper,
+            )
+        except Exception as e:
+            logger.warning(f"Contradiction check failed for {memory.id}: {e}")
+
+    # Trigger auto-compaction check (non-blocking)
+    asyncio.create_task(_safe_auto_compact(project_id))
 
     return {
         "memory_id": memory.id,
@@ -271,7 +359,16 @@ async def store_memory(
         "expires_at": expires_at.isoformat() if expires_at else None,
         "created": True,
         "message": f"Memory stored successfully (ID: {memory.id})",
+        "contradiction": contradiction_info,
     }
+
+
+async def _safe_auto_compact(project_id: str) -> None:
+    """Safely run auto-compaction without blocking or raising."""
+    try:
+        await maybe_auto_compact(project_id)
+    except Exception as e:
+        logger.debug(f"Auto-compact background task failed: {e}")
 
 
 async def store_memories_bulk(
@@ -440,6 +537,7 @@ async def semantic_recall(
         query_embedding = await embeddings_service.embed_text_async(query)
     except Exception as e:
         logger.error(f"Failed to embed query: {e}")
+        query_embedding = None
         # Fallback to text search if embedding fails
         return await _text_search_fallback(memories, query, limit, min_relevance, start_time)
 
@@ -523,22 +621,28 @@ async def semantic_recall(
                 relevance = min(relevance * boost, 1.0)
 
         if relevance >= min_relevance:
-            results.append(
-                {
-                    "memory_id": memory.id,
-                    "content": memory.content,
-                    "type": memory.type.lower(),
-                    "scope": memory.scope.lower(),
-                    "category": memory.category,
-                    "relevance": round(relevance, 4),
-                    "confidence": round(decayed_confidence, 4),
-                    "created_at": memory.createdAt.isoformat(),
-                    "last_accessed_at": memory.lastAccessedAt.isoformat()
-                    if memory.lastAccessedAt
-                    else None,
-                    "access_count": memory.accessCount,
-                }
-            )
+            result_entry = {
+                "memory_id": memory.id,
+                "content": memory.content,
+                "type": memory.type.lower(),
+                "scope": memory.scope.lower(),
+                "category": memory.category,
+                "relevance": round(relevance, 4),
+                "confidence": round(decayed_confidence, 4),
+                "created_at": memory.createdAt.isoformat(),
+                "last_accessed_at": memory.lastAccessedAt.isoformat()
+                if memory.lastAccessedAt
+                else None,
+                "access_count": memory.accessCount,
+            }
+
+            # Include contradiction info if present
+            if getattr(memory, "contradictsId", None):
+                result_entry["contradicts"] = memory.contradictsId
+            if getattr(memory, "contradictedById", None):
+                result_entry["contradicted_by"] = memory.contradictedById
+
+            results.append(result_entry)
 
     # Sort by relevance
     results.sort(key=lambda x: x["relevance"], reverse=True)
@@ -558,11 +662,19 @@ async def semantic_recall(
         except Exception as e:
             logger.warning(f"Failed to batch update access counts: {e}")
 
+    # Scan graveyard for abandoned approach warnings (non-fatal)
+    graveyard_warnings = []
+    try:
+        graveyard_warnings = await _scan_graveyard(project_id, query_embedding)
+    except Exception as e:
+        logger.warning(f"Graveyard scan failed: {e}")
+
     return {
         "memories": results,
         "total_searched": len(memories),
         "query": query,
         "timing_ms": int((time.time() - start_time) * 1000),
+        "graveyard_warnings": graveyard_warnings,
     }
 
 
@@ -920,6 +1032,25 @@ async def delete_memories(
     to_delete = await db.agentmemory.find_many(where=where)
     memory_ids = [m.id for m in to_delete]
 
+    # Clean up contradiction links pointing to memories being deleted
+    for mem in to_delete:
+        if getattr(mem, "contradictsId", None):
+            try:
+                await db.agentmemory.update_many(
+                    where={"contradictedById": mem.id},
+                    data={"contradictedById": None, "contradictionScore": None},
+                )
+            except Exception as e:
+                logger.debug(f"Failed to clear contradiction link for {mem.id}: {e}")
+        if getattr(mem, "contradictedById", None):
+            try:
+                await db.agentmemory.update_many(
+                    where={"contradictsId": mem.id},
+                    data={"contradictsId": None, "contradictionScore": None},
+                )
+            except Exception as e:
+                logger.debug(f"Failed to clear contradiction link for {mem.id}: {e}")
+
     # Delete memories
     result = await db.agentmemory.delete_many(where=where)
     deleted_count = result
@@ -940,7 +1071,657 @@ async def delete_memories(
     }
 
 
+# ============ GRAVEYARD SYSTEM ============
+
+# Cache key for graveyard count (fast emptiness check)
+GRAVEYARD_COUNT_PREFIX = "rlm:graveyard_count:"
+GRAVEYARD_COUNT_TTL = 60 * 5  # 5 minutes
+GRAVEYARD_SIMILARITY_THRESHOLD = 0.70  # Lower than contradiction — better to over-warn
+
+
+async def bury_memory(
+    project_id: str,
+    reason: str,
+    memory_id: str | None = None,
+    content: str | None = None,
+    buried_by: str | None = None,
+) -> dict[str, Any]:
+    """Bury a memory or approach in the graveyard.
+
+    Two modes:
+    - By memory_id: moves existing memory to GRAVEYARD tier
+    - By content: creates a new GRAVEYARD-tier memory with embedding
+
+    Args:
+        project_id: The project ID
+        reason: Why this approach was abandoned
+        memory_id: Existing memory to bury (optional)
+        content: New content to bury directly (optional, used if no memory_id)
+        buried_by: Who buried it (agent_id, "user", "system")
+
+    Returns:
+        Dict with burial details
+    """
+    if not memory_id and not content:
+        return {"error": "Either memory_id or content is required"}
+
+    db = await get_db()
+    now = datetime.now(UTC)
+
+    if memory_id:
+        # Move existing memory to GRAVEYARD
+        memory = await db.agentmemory.find_first(
+            where={"id": memory_id, "projectId": project_id}
+        )
+        if not memory:
+            return {"error": f"Memory {memory_id} not found"}
+
+        await db.agentmemory.update(
+            where={"id": memory_id},
+            data={
+                "tier": "GRAVEYARD",
+                "buriedAt": now,
+                "buriedReason": reason,
+                "buriedBy": buried_by or "user",
+            },
+        )
+
+        result = {
+            "memory_id": memory_id,
+            "content": memory.content[:200],
+            "buried_reason": reason,
+            "buried_at": now.isoformat(),
+            "was_existing": True,
+            "message": f"Memory {memory_id} buried in graveyard",
+        }
+    else:
+        # Create new GRAVEYARD memory
+        memory = await db.agentmemory.create(
+            data={
+                "projectId": project_id,
+                "content": content,
+                "type": "LEARNING",
+                "scope": "PROJECT",
+                "tier": "GRAVEYARD",
+                "buriedAt": now,
+                "buriedReason": reason,
+                "buriedBy": buried_by or "user",
+                "confidence": 1.0,
+                "accessCount": 0,
+            }
+        )
+
+        # Generate embedding for semantic matching during recall
+        try:
+            embeddings_service = get_embeddings_service()
+            embedding = await embeddings_service.embed_text_async(content)
+            await _store_memory_embedding(memory.id, embedding)
+        except Exception as e:
+            logger.warning(f"Failed to embed graveyard memory {memory.id}: {e}")
+
+        result = {
+            "memory_id": memory.id,
+            "content": content[:200],
+            "buried_reason": reason,
+            "buried_at": now.isoformat(),
+            "was_existing": False,
+            "message": f"Approach buried in graveyard (ID: {memory.id})",
+        }
+
+    # Invalidate graveyard count cache
+    redis = await get_redis()
+    if redis:
+        try:
+            await redis.delete(f"{GRAVEYARD_COUNT_PREFIX}{project_id}")
+        except Exception:
+            pass
+
+    return result
+
+
+async def unbury_memory(
+    project_id: str,
+    memory_id: str,
+    reinstate_tier: str = "ARCHIVE",
+) -> dict[str, Any]:
+    """Reinstate a memory from the graveyard.
+
+    Args:
+        project_id: The project ID
+        memory_id: Memory to unbury
+        reinstate_tier: Tier to restore to (default: ARCHIVE)
+
+    Returns:
+        Dict with reinstatement details
+    """
+    db = await get_db()
+
+    memory = await db.agentmemory.find_first(
+        where={"id": memory_id, "projectId": project_id, "tier": "GRAVEYARD"}
+    )
+    if not memory:
+        return {"error": f"Memory {memory_id} not found in graveyard"}
+
+    tier_upper = reinstate_tier.upper()
+    if tier_upper not in ("CRITICAL", "DAILY", "ARCHIVE"):
+        tier_upper = "ARCHIVE"
+
+    await db.agentmemory.update(
+        where={"id": memory_id},
+        data={
+            "tier": tier_upper,
+            "buriedAt": None,
+            "buriedReason": None,
+            "buriedBy": None,
+        },
+    )
+
+    # Invalidate graveyard count cache
+    redis = await get_redis()
+    if redis:
+        try:
+            await redis.delete(f"{GRAVEYARD_COUNT_PREFIX}{project_id}")
+        except Exception:
+            pass
+
+    return {
+        "memory_id": memory_id,
+        "content": memory.content[:200],
+        "reinstated_tier": tier_upper.lower(),
+        "message": f"Memory {memory_id} reinstated from graveyard to {tier_upper.lower()} tier",
+    }
+
+
+async def _scan_graveyard(
+    project_id: str,
+    query_embedding: list[float],
+) -> list[dict[str, Any]]:
+    """Fast-path graveyard scan during recall.
+
+    Checks if any buried memories are semantically similar to the query.
+    Uses a lower similarity threshold (0.70) than contradiction detection
+    because it's better to over-warn than to silently re-suggest abandoned approaches.
+
+    Args:
+        project_id: The project ID
+        query_embedding: Pre-computed query embedding
+
+    Returns:
+        List of graveyard warnings (max 3), empty list if no graveyard entries
+    """
+    # Fast emptiness check via cached count
+    redis = await get_redis()
+    if redis:
+        try:
+            cached_count = await redis.get(f"{GRAVEYARD_COUNT_PREFIX}{project_id}")
+            if cached_count is not None and int(cached_count) == 0:
+                return []
+        except Exception:
+            pass
+
+    db = await get_db()
+    embeddings_service = get_embeddings_service()
+
+    # Fetch all graveyard memories
+    graveyard = await db.agentmemory.find_many(
+        where={"projectId": project_id, "tier": "GRAVEYARD"},
+        order={"buriedAt": "desc"},
+        take=100,
+    )
+
+    # Update cached count
+    if redis:
+        try:
+            await redis.setex(
+                f"{GRAVEYARD_COUNT_PREFIX}{project_id}",
+                GRAVEYARD_COUNT_TTL,
+                str(len(graveyard)),
+            )
+        except Exception:
+            pass
+
+    if not graveyard:
+        return []
+
+    # Batch-fetch embeddings
+    graveyard_ids = [g.id for g in graveyard]
+    cached_embeddings = await _get_memory_embeddings_batch(graveyard_ids)
+
+    if not cached_embeddings:
+        return []
+
+    # Compare query against graveyard embeddings
+    warnings = []
+    for memory in graveyard:
+        if memory.id not in cached_embeddings:
+            continue
+
+        try:
+            similarities = embeddings_service.cosine_similarity(
+                query_embedding, [cached_embeddings[memory.id]]
+            )
+            similarity = similarities[0] if similarities else 0
+        except Exception:
+            continue
+
+        if similarity >= GRAVEYARD_SIMILARITY_THRESHOLD:
+            content_preview = memory.content[:100]
+            buried_reason = memory.buriedReason or "No reason provided"
+            warnings.append({
+                "memory_id": memory.id,
+                "content": memory.content,
+                "buried_reason": buried_reason,
+                "buried_at": memory.buriedAt.isoformat() if memory.buriedAt else None,
+                "similarity": round(similarity, 4),
+                "warning": (
+                    f"Previously abandoned: {content_preview}... "
+                    f"Reason: {buried_reason}"
+                ),
+            })
+
+    # Sort by similarity, return top 3
+    warnings.sort(key=lambda x: x["similarity"], reverse=True)
+    return warnings[:3]
+
+
 # ============ PHASE 20: MEMORY TIERS & COMPACTION ============
+
+
+def normalize_memory_dates(content: str, reference_time: datetime) -> tuple[str, int]:
+    """Convert relative dates in memory content to absolute dates.
+
+    Uses the memory's creation time as reference (not current time) to accurately
+    convert "yesterday" etc. to what was meant when the memory was stored.
+
+    Args:
+        content: Memory content string
+        reference_time: The memory's creation time (used as reference for relative dates)
+
+    Returns:
+        Tuple of (normalized_content, count_of_replacements)
+    """
+    normalized = content
+    replacement_count = 0
+
+    # Ensure reference_time is timezone-aware
+    if reference_time.tzinfo is None:
+        reference_time = reference_time.replace(tzinfo=UTC)
+
+    for pattern, replacer in DATE_PATTERNS:
+        matches = list(re.finditer(pattern, normalized, re.IGNORECASE))
+        for match in reversed(matches):  # Reverse to preserve indices
+            try:
+                groups = match.groups()
+                if groups:
+                    result_date = replacer(reference_time, *groups)
+                else:
+                    result_date = replacer(reference_time)
+
+                # Format the replacement based on pattern type
+                if "week" in pattern:
+                    replacement = f"week of {result_date.strftime('%Y-%m-%d')}"
+                elif "month" in pattern:
+                    replacement = result_date.strftime("%Y-%m")
+                elif "morning" in pattern:
+                    replacement = f"{result_date.strftime('%Y-%m-%d')} morning"
+                elif "recently" in pattern:
+                    replacement = f"around {result_date.strftime('%Y-%m-%d')}"
+                else:
+                    replacement = result_date.strftime("%Y-%m-%d")
+
+                normalized = normalized[: match.start()] + replacement + normalized[match.end() :]
+                replacement_count += 1
+            except Exception as e:
+                logger.warning(f"Failed to normalize date pattern '{match.group()}': {e}")
+                continue
+
+    return normalized, replacement_count
+
+
+async def validate_document_refs(
+    document_refs: list[str],
+    project_id: str,
+) -> tuple[list[str], int]:
+    """Validate document_refs against indexed documents.
+
+    Args:
+        document_refs: List of document paths to validate
+        project_id: The project ID
+
+    Returns:
+        Tuple of (valid_refs, removed_count)
+    """
+    if not document_refs:
+        return [], 0
+
+    db = await get_db()
+
+    # Get all indexed document paths for this project
+    try:
+        indexed_docs = await db.document.find_many(
+            where={"projectId": project_id},
+            select={"path": True},
+        )
+        indexed_paths = {doc.path for doc in indexed_docs}
+
+        # Filter to only valid refs
+        valid_refs = [ref for ref in document_refs if ref in indexed_paths]
+        removed_count = len(document_refs) - len(valid_refs)
+
+        return valid_refs, removed_count
+    except Exception as e:
+        logger.warning(f"Failed to validate document refs: {e}")
+        return document_refs, 0  # Return original on error
+
+
+async def find_semantic_conflicts(
+    memories: list[Any],
+    similarity_threshold: float = 0.85,
+) -> list[tuple[Any, Any, float]]:
+    """Find memory pairs that are semantically similar but not identical.
+
+    These are potential conflicts (e.g., "user prefers React" vs "user prefers Vue").
+
+    Args:
+        memories: List of memory objects
+        similarity_threshold: Minimum similarity to consider as conflict (0.85 = 85%)
+
+    Returns:
+        List of tuples: (older_memory, newer_memory, similarity_score)
+    """
+    if len(memories) < 2:
+        return []
+
+    embeddings_service = get_embeddings_service()
+    conflicts: list[tuple[Any, Any, float]] = []
+
+    # Get all memory IDs
+    memory_ids = [m.id for m in memories]
+
+    # Batch fetch cached embeddings
+    cached_embeddings = await _get_memory_embeddings_batch(memory_ids)
+
+    # Build list of memories with embeddings
+    memories_with_embeddings: list[tuple[Any, list[float]]] = []
+
+    for memory in memories:
+        if memory.id in cached_embeddings:
+            memories_with_embeddings.append((memory, cached_embeddings[memory.id]))
+        else:
+            # Generate embedding on the fly (limited to prevent timeout)
+            if len(memories_with_embeddings) < 100:  # Limit on-the-fly generation
+                try:
+                    embedding = await embeddings_service.embed_text_async(memory.content)
+                    await _store_memory_embedding(memory.id, embedding)
+                    memories_with_embeddings.append((memory, embedding))
+                except Exception as e:
+                    logger.warning(f"Failed to embed memory {memory.id} for conflict detection: {e}")
+
+    if len(memories_with_embeddings) < 2:
+        return []
+
+    # Compare pairs of same-type memories
+    for i, (m1, emb1) in enumerate(memories_with_embeddings):
+        for j, (m2, emb2) in enumerate(memories_with_embeddings):
+            if i >= j:
+                continue  # Skip self and already-compared pairs
+
+            # Only compare same-type memories (e.g., PREFERENCE vs PREFERENCE)
+            if m1.type != m2.type:
+                continue
+
+            # Calculate similarity
+            try:
+                similarities = embeddings_service.cosine_similarity(emb1, [emb2])
+                similarity = similarities[0] if similarities else 0
+            except Exception as e:
+                logger.warning(f"Failed to calculate similarity: {e}")
+                continue
+
+            # Check if similar but not identical (conflict zone: 0.85-0.98)
+            if similarity_threshold <= similarity < 0.98:
+                # Determine which is older
+                m1_time = m1.createdAt or datetime.min.replace(tzinfo=UTC)
+                m2_time = m2.createdAt or datetime.min.replace(tzinfo=UTC)
+
+                if m1_time.tzinfo is None:
+                    m1_time = m1_time.replace(tzinfo=UTC)
+                if m2_time.tzinfo is None:
+                    m2_time = m2_time.replace(tzinfo=UTC)
+
+                if m1_time < m2_time:
+                    conflicts.append((m1, m2, similarity))  # m1 is older
+                else:
+                    conflicts.append((m2, m1, similarity))  # m2 is older
+
+    return conflicts
+
+
+async def _check_write_time_contradictions(
+    project_id: str,
+    new_memory_id: str,
+    new_content: str,
+    new_embedding: list[float],
+    memory_type: str,
+) -> dict[str, Any] | None:
+    """Check if a newly stored memory contradicts existing memories.
+
+    Runs at write-time with minimal overhead (~10-20ms) since the embedding
+    is already computed. Only checks the 50 most recent same-type memories.
+
+    Args:
+        project_id: The project ID
+        new_memory_id: ID of the newly created memory
+        new_content: Content of the new memory
+        new_embedding: Pre-computed embedding of the new memory
+        memory_type: Type of the new memory (uppercase)
+
+    Returns:
+        Dict with contradiction info if found, None otherwise
+    """
+    db = await get_db()
+    embeddings_service = get_embeddings_service()
+
+    # Fetch 50 most recent same-type memories (excluding the new one)
+    candidates = await db.agentmemory.find_many(
+        where={
+            "projectId": project_id,
+            "type": memory_type,
+            "id": {"not": new_memory_id},
+            "tier": {"not": "GRAVEYARD"},
+            "OR": [
+                {"expiresAt": None},
+                {"expiresAt": {"gt": datetime.now(UTC)}},
+            ],
+        },
+        order={"createdAt": "desc"},
+        take=50,
+    )
+
+    if not candidates:
+        return None
+
+    # Batch-fetch cached embeddings
+    candidate_ids = [c.id for c in candidates]
+    cached_embeddings = await _get_memory_embeddings_batch(candidate_ids)
+
+    if not cached_embeddings:
+        return None
+
+    # Compare against each candidate
+    best_conflict: dict[str, Any] | None = None
+    best_similarity = 0.0
+
+    for candidate in candidates:
+        if candidate.id not in cached_embeddings:
+            continue
+
+        try:
+            similarities = embeddings_service.cosine_similarity(
+                new_embedding, [cached_embeddings[candidate.id]]
+            )
+            similarity = similarities[0] if similarities else 0
+        except Exception:
+            continue
+
+        # Conflict zone: similar but not identical (0.85-0.98)
+        if 0.85 <= similarity < 0.98 and similarity > best_similarity:
+            best_similarity = similarity
+            best_conflict = {
+                "contradicts_memory_id": candidate.id,
+                "contradicts_content": candidate.content[:200],
+                "similarity": round(similarity, 4),
+            }
+
+    if not best_conflict:
+        return None
+
+    # Update both memory records with contradiction links
+    try:
+        contradicted_id = best_conflict["contradicts_memory_id"]
+
+        await db.agentmemory.update(
+            where={"id": new_memory_id},
+            data={
+                "contradictsId": contradicted_id,
+                "contradictionScore": best_conflict["similarity"],
+            },
+        )
+        await db.agentmemory.update(
+            where={"id": contradicted_id},
+            data={
+                "contradictedById": new_memory_id,
+                "contradictionScore": best_conflict["similarity"],
+            },
+        )
+
+        logger.info(
+            f"Contradiction detected: {new_memory_id} contradicts {contradicted_id} "
+            f"(similarity: {best_conflict['similarity']})"
+        )
+    except Exception as e:
+        logger.warning(f"Failed to update contradiction links: {e}")
+
+    return best_conflict
+
+
+async def resolve_conflict(
+    older: Any,
+    newer: Any,
+    similarity: float,
+    strategy: str,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Resolve a conflict between two similar memories.
+
+    Args:
+        older: The older memory
+        newer: The newer memory
+        similarity: Similarity score between them
+        strategy: Resolution strategy (newer, higher_confidence, merge, flag)
+        dry_run: If True, don't apply changes
+
+    Returns:
+        Dict with resolution details
+    """
+    db = await get_db()
+
+    if strategy == CONFLICT_STRATEGY_NEWER:
+        # Archive the older one (newer wins by recency)
+        if not dry_run:
+            await db.agentmemory.update(
+                where={"id": older.id},
+                data={
+                    "tier": "ARCHIVE",
+                    "category": f"{older.category or 'uncategorized'}:superseded",
+                },
+            )
+        return {
+            "action": "archived_older",
+            "archived_id": older.id,
+            "kept_id": newer.id,
+            "similarity": round(similarity, 4),
+            "reason": "Newer memory supersedes older similar memory",
+        }
+
+    elif strategy == CONFLICT_STRATEGY_HIGHER_CONFIDENCE:
+        # Archive the lower confidence one
+        older_conf = calculate_confidence_decay(older.confidence, older.createdAt, older.lastAccessedAt)
+        newer_conf = calculate_confidence_decay(newer.confidence, newer.createdAt, newer.lastAccessedAt)
+
+        if older_conf > newer_conf:
+            to_archive, to_keep = newer, older
+        else:
+            to_archive, to_keep = older, newer
+
+        if not dry_run:
+            await db.agentmemory.update(
+                where={"id": to_archive.id},
+                data={
+                    "tier": "ARCHIVE",
+                    "category": f"{to_archive.category or 'uncategorized'}:superseded",
+                },
+            )
+        return {
+            "action": "archived_lower_confidence",
+            "archived_id": to_archive.id,
+            "kept_id": to_keep.id,
+            "similarity": round(similarity, 4),
+            "reason": f"Kept memory with higher confidence ({to_keep.confidence:.2f} vs {to_archive.confidence:.2f})",
+        }
+
+    elif strategy == CONFLICT_STRATEGY_MERGE:
+        # Merge content into newer, archive older
+        merged_content = f"{newer.content}\n\n[Supersedes ({older.createdAt.strftime('%Y-%m-%d') if older.createdAt else 'unknown'}): {older.content[:100]}...]"
+
+        if not dry_run:
+            # Update newer with merged content
+            await db.agentmemory.update(
+                where={"id": newer.id},
+                data={
+                    "content": merged_content,
+                    "relatedMemoryIds": [*newer.relatedMemoryIds, older.id],
+                },
+            )
+            # Archive older
+            await db.agentmemory.update(
+                where={"id": older.id},
+                data={
+                    "tier": "ARCHIVE",
+                    "category": f"{older.category or 'uncategorized'}:merged",
+                },
+            )
+        return {
+            "action": "merged",
+            "kept_id": newer.id,
+            "archived_id": older.id,
+            "similarity": round(similarity, 4),
+            "reason": "Merged older memory content into newer",
+        }
+
+    elif strategy == CONFLICT_STRATEGY_FLAG:
+        # Mark both for manual review
+        if not dry_run:
+            for m in [older, newer]:
+                current_category = m.category or "uncategorized"
+                if ":needs_review" not in current_category:
+                    await db.agentmemory.update(
+                        where={"id": m.id},
+                        data={"category": f"{current_category}:needs_review"},
+                    )
+        return {
+            "action": "flagged",
+            "flagged_ids": [older.id, newer.id],
+            "similarity": round(similarity, 4),
+            "reason": "Flagged both memories for manual review",
+        }
+
+    else:
+        return {
+            "action": "skipped",
+            "reason": f"Unknown strategy: {strategy}",
+        }
+
 
 # Tier classification rules
 TIER_TYPE_DEFAULTS = {
@@ -1096,8 +1877,13 @@ async def compact_memories(
     promote_threshold: int = 3,
     archive_older_than_days: int = 30,
     dry_run: bool = False,
+    # New consolidation parameters
+    normalize_dates: bool = True,
+    validate_refs: bool = True,
+    conflict_strategy: str = "newer",
+    similarity_threshold: float = 0.85,
 ) -> dict[str, Any]:
-    """Compact and optimize memories.
+    """Compact and optimize memories with intelligent consolidation.
 
     Args:
         project_id: The project ID
@@ -1107,21 +1893,144 @@ async def compact_memories(
         archive_older_than_days: Archive memories older than N days
         dry_run: Preview changes without applying
 
+        # New consolidation parameters (inspired by dream-skill):
+        normalize_dates: Convert relative dates ("yesterday") to absolute ("2026-03-24")
+        validate_refs: Remove dead document_refs that no longer exist in index
+        conflict_strategy: How to resolve contradictions:
+            - "newer": Keep most recent, archive older (default)
+            - "higher_confidence": Keep highest confidence score
+            - "merge": Combine content into newer memory
+            - "flag": Mark both for manual review
+        similarity_threshold: Semantic similarity threshold for conflict detection (0.0-1.0)
+
     Returns:
-        Dict with compaction results
+        Dict with compaction results including new consolidation metrics
     """
     db = await get_db()
     now = datetime.now(UTC)
 
-    results = {
+    results: dict[str, Any] = {
+        # Existing metrics
         "duplicates_merged": 0,
         "promoted_to_critical": 0,
         "archived": 0,
         "tokens_freed": 0,
+        # New consolidation metrics
+        "dates_normalized": 0,
+        "dead_refs_removed": 0,
+        "conflicts_resolved": 0,
+        "conflicts_flagged": 0,
+        "conflict_details": [],
         "dry_run": dry_run,
     }
 
-    # 1. Promote frequently accessed learnings
+    # Get all memories for this project (used across multiple phases)
+    all_memories = await db.agentmemory.find_many(
+        where={"projectId": project_id},
+        order={"createdAt": "asc"},
+    )
+
+    # ─────────────────────────────────────────────────────────
+    # Phase 1: Date Normalization (NEW)
+    # Convert relative dates to absolute using memory's creation time
+    # ─────────────────────────────────────────────────────────
+    if normalize_dates:
+        for memory in all_memories:
+            if not memory.content or not memory.createdAt:
+                continue
+
+            normalized_content, replacement_count = normalize_memory_dates(
+                memory.content,
+                memory.createdAt,
+            )
+
+            if replacement_count > 0:
+                if not dry_run:
+                    await db.agentmemory.update(
+                        where={"id": memory.id},
+                        data={"content": normalized_content},
+                    )
+                    # Update in-memory object for subsequent phases
+                    memory.content = normalized_content
+                results["dates_normalized"] += replacement_count
+
+    # ─────────────────────────────────────────────────────────
+    # Phase 2: Dead Reference Cleanup (NEW)
+    # Remove document_refs that no longer exist in the index
+    # ─────────────────────────────────────────────────────────
+    if validate_refs:
+        for memory in all_memories:
+            if not memory.documentRefs:
+                continue
+
+            valid_refs, removed_count = await validate_document_refs(
+                memory.documentRefs,
+                project_id,
+            )
+
+            if removed_count > 0:
+                if not dry_run:
+                    await db.agentmemory.update(
+                        where={"id": memory.id},
+                        data={"documentRefs": valid_refs},
+                    )
+                results["dead_refs_removed"] += removed_count
+
+    # ─────────────────────────────────────────────────────────
+    # Phase 3: Semantic Conflict Resolution (NEW)
+    # Find similar-but-different memories and resolve contradictions
+    # ─────────────────────────────────────────────────────────
+    if deduplicate and conflict_strategy:
+        # Find semantic conflicts using embeddings
+        conflicts = await find_semantic_conflicts(all_memories, similarity_threshold)
+
+        for older, newer, similarity in conflicts:
+            resolution = await resolve_conflict(
+                older=older,
+                newer=newer,
+                similarity=similarity,
+                strategy=conflict_strategy,
+                dry_run=dry_run,
+            )
+
+            if resolution.get("action") == "flagged":
+                results["conflicts_flagged"] += 1
+            elif resolution.get("action") != "skipped":
+                results["conflicts_resolved"] += 1
+                # Estimate tokens freed from archived memory
+                if "archived_id" in resolution:
+                    archived_mem = next((m for m in all_memories if m.id == resolution["archived_id"]), None)
+                    if archived_mem:
+                        results["tokens_freed"] += len(archived_mem.content) // 4
+
+            results["conflict_details"].append(resolution)
+
+    # ─────────────────────────────────────────────────────────
+    # Phase 4: Exact Duplicate Removal (existing logic)
+    # Remove memories with identical content prefix + type
+    # ─────────────────────────────────────────────────────────
+    if deduplicate:
+        seen_content: dict[str, str] = {}  # content hash -> id
+        duplicates_to_delete: list[str] = []
+
+        for m in all_memories:
+            # Simple hash: first 100 chars + type
+            content_key = f"{m.type}:{m.content[:100]}"
+            if content_key in seen_content:
+                duplicates_to_delete.append(m.id)
+                results["duplicates_merged"] += 1
+                results["tokens_freed"] += len(m.content) // 4
+            else:
+                seen_content[content_key] = m.id
+
+        if not dry_run and duplicates_to_delete:
+            await db.agentmemory.delete_many(
+                where={"id": {"in": duplicates_to_delete}},
+            )
+
+    # ─────────────────────────────────────────────────────────
+    # Phase 5: Promote Frequently Accessed Learnings (existing)
+    # ─────────────────────────────────────────────────────────
     learnings = await db.agentmemory.find_many(
         where={
             "projectId": project_id,
@@ -1143,7 +2052,9 @@ async def compact_memories(
             )
         results["promoted_to_critical"] += 1
 
-    # 2. Archive old memories (except CRITICAL)
+    # ─────────────────────────────────────────────────────────
+    # Phase 6: Archive Old Memories (existing)
+    # ─────────────────────────────────────────────────────────
     cutoff = now - timedelta(days=archive_older_than_days)
     old_memories = await db.agentmemory.find_many(
         where={
@@ -1161,42 +2072,107 @@ async def compact_memories(
             )
         results["archived"] += 1
 
-    # 3. Deduplicate similar memories (simplified version)
-    # Note: Full semantic deduplication would require embedding comparison
-    if deduplicate:
-        # Group by category and type, find exact content matches
-        all_memories = await db.agentmemory.find_many(
-            where={"projectId": project_id},
-            order={"createdAt": "asc"},
-        )
-
-        seen_content: dict[str, str] = {}  # content hash -> id
-        duplicates_to_delete: list[str] = []
-
-        for m in all_memories:
-            # Simple hash: first 100 chars + type
-            content_key = f"{m.type}:{m.content[:100]}"
-            if content_key in seen_content:
-                duplicates_to_delete.append(m.id)
-                results["duplicates_merged"] += 1
-                results["tokens_freed"] += len(m.content) // 4
-            else:
-                seen_content[content_key] = m.id
-
-        if not dry_run and duplicates_to_delete:
-            await db.agentmemory.delete_many(
-                where={"id": {"in": duplicates_to_delete}},
-            )
-
+    # Build summary message
     action = "Would have" if dry_run else "Successfully"
-    results["message"] = (
-        f"{action} promoted {results['promoted_to_critical']} learnings, "
-        f"archived {results['archived']} old memories, "
-        f"merged {results['duplicates_merged']} duplicates "
-        f"(~{results['tokens_freed']} tokens freed)"
-    )
+    parts = []
+
+    if results["dates_normalized"] > 0:
+        parts.append(f"normalized {results['dates_normalized']} dates")
+    if results["dead_refs_removed"] > 0:
+        parts.append(f"removed {results['dead_refs_removed']} dead refs")
+    if results["conflicts_resolved"] > 0:
+        parts.append(f"resolved {results['conflicts_resolved']} conflicts")
+    if results["conflicts_flagged"] > 0:
+        parts.append(f"flagged {results['conflicts_flagged']} for review")
+    if results["duplicates_merged"] > 0:
+        parts.append(f"merged {results['duplicates_merged']} duplicates")
+    if results["promoted_to_critical"] > 0:
+        parts.append(f"promoted {results['promoted_to_critical']} learnings")
+    if results["archived"] > 0:
+        parts.append(f"archived {results['archived']} old memories")
+
+    if parts:
+        results["message"] = f"{action}: {', '.join(parts)} (~{results['tokens_freed']} tokens freed)"
+    else:
+        results["message"] = f"{action}: No changes needed"
+
+    # Remove conflict_details if empty (to reduce response size)
+    if not results["conflict_details"]:
+        del results["conflict_details"]
 
     return results
+
+
+async def maybe_auto_compact(project_id: str) -> dict[str, Any] | None:
+    """Check if auto-compaction should run and trigger it if needed.
+
+    Auto-compaction runs when:
+    1. Memory count exceeds AUTO_COMPACT_THRESHOLD
+    2. At least AUTO_COMPACT_COOLDOWN seconds since last compaction
+
+    Args:
+        project_id: The project ID
+
+    Returns:
+        Compaction results if ran, None otherwise
+    """
+    db = await get_db()
+    redis = await get_redis()
+
+    # Check memory count
+    try:
+        memory_count = await db.agentmemory.count(
+            where={"projectId": project_id}
+        )
+
+        if memory_count < AUTO_COMPACT_THRESHOLD:
+            return None  # Not enough memories to compact
+
+        # Check cooldown
+        if redis:
+            cache_key = f"{AUTO_COMPACT_CACHE_KEY_PREFIX}{project_id}"
+            last_compact = await redis.get(cache_key)
+            if last_compact:
+                # Still in cooldown
+                logger.debug(f"Auto-compact skipped for {project_id}: cooldown active")
+                return None
+
+        logger.info(f"Auto-compacting memories for project {project_id} ({memory_count} memories)")
+
+        # Run compaction with consolidation features enabled
+        # Note: Auto-compact uses "newer" strategy to avoid flagging during automatic runs
+        results = await compact_memories(
+            project_id=project_id,
+            scope="project",
+            deduplicate=True,
+            promote_threshold=3,
+            archive_older_than_days=30,
+            dry_run=False,
+            # Consolidation features (enabled by default for auto-compact)
+            normalize_dates=True,
+            validate_refs=True,
+            conflict_strategy="newer",  # Auto-resolve, don't flag
+            similarity_threshold=0.85,
+        )
+
+        # Set cooldown in Redis
+        if redis:
+            await redis.setex(cache_key, AUTO_COMPACT_COOLDOWN, "1")
+
+        results["auto_triggered"] = True
+        results["memory_count_before"] = memory_count
+
+        logger.info(
+            f"Auto-compaction completed for {project_id}: "
+            f"{results['duplicates_merged']} duplicates, "
+            f"{results['archived']} archived"
+        )
+
+        return results
+
+    except Exception as e:
+        logger.warning(f"Auto-compaction failed for {project_id}: {e}")
+        return None
 
 
 async def get_daily_brief(

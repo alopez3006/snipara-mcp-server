@@ -140,6 +140,9 @@ TOOL_TIERS: dict[str, ToolTier] = {
     "rlm_session_memories": ToolTier.POWER_USER,
     "rlm_memory_compact": ToolTier.ADVANCED,
     "rlm_memory_daily_brief": ToolTier.POWER_USER,
+    # POWER_USER - Graveyard System
+    "rlm_bury": ToolTier.POWER_USER,
+    "rlm_unbury": ToolTier.UTILITY,
     # TEAM - Tenant Profile (Phase 20)
     "rlm_tenant_profile_create": ToolTier.TEAM,
     "rlm_tenant_profile_get": ToolTier.TEAM,
@@ -723,6 +726,49 @@ TOOL_DEFINITIONS: list[dict] = [
                 },
             },
             "required": [],
+        },
+    },
+    # ============ Graveyard Tools ============
+    {
+        "name": "rlm_bury",
+        "description": "Bury a memory or approach in the graveyard. Buried entries trigger warnings during rlm_recall to prevent re-suggesting abandoned approaches. Provide memory_id to bury an existing memory, or content to bury a new approach directly.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "memory_id": {
+                    "type": "string",
+                    "description": "ID of an existing memory to bury (optional if content is provided)",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Description of the abandoned approach (optional if memory_id is provided)",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Why this approach was abandoned (required)",
+                },
+            },
+            "required": ["reason"],
+        },
+    },
+    {
+        "name": "rlm_unbury",
+        "description": "Reinstate a memory from the graveyard. Use when a previously abandoned approach becomes viable again.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "memory_id": {
+                    "type": "string",
+                    "description": "ID of the graveyard memory to reinstate",
+                },
+                "reinstate_tier": {
+                    "type": "string",
+                    "enum": ["critical", "daily", "archive"],
+                    "default": "archive",
+                    "description": "Tier to restore the memory to",
+                },
+            },
+            "required": ["memory_id"],
         },
     },
     # ============ Daily Journal Tools ============
