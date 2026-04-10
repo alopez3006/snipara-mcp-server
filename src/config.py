@@ -92,6 +92,11 @@ class Settings(BaseSettings):
     # Environment name for Sentry
     environment: str = "development"
 
+    # Memory V2 rollout flags
+    memory_v2_dual_write: bool = False
+    memory_v2_dual_read: bool = False
+    memory_v2_primary_read: bool = False
+
     @property
     def cors_origins_list(self) -> list[str]:
         """Get CORS origins as a list."""

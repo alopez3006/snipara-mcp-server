@@ -12,7 +12,17 @@ import re
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from ..config import settings
 from ..db import get_db
+from ..models.enums import AgentMemoryType
+from ..models.memory_v2 import (
+    MemoryEvidencePayload,
+    MemoryMigrationMapPayload,
+    MemoryRelationPayload,
+    MemoryUpdatePayload,
+)
+from .memory_mapper import map_agent_memory_to_memory_payload
+from .memory_repository import MemoryRepository
 from .cache import get_redis
 from .embeddings import EMBEDDING_DIMENSION, get_embeddings_service
 
@@ -55,6 +65,12 @@ DATE_PATTERNS: list[tuple[str, Any]] = [
     # "recently" -> around date
     (r"\brecently\b", lambda ref: ref),
 ]
+
+_memory_repository = MemoryRepository()
+
+# Dual-write resolution settings
+DUAL_WRITE_RESOLUTION_ATTEMPTS = 5
+DUAL_WRITE_RESOLUTION_DELAY_SECONDS = 0.2
 
 
 def calculate_confidence_decay(
@@ -331,24 +347,21 @@ async def store_memory(
         logger.info(f"Stored memory {memory.id} with embedding")
     except Exception as e:
         logger.warning(f"Failed to generate embedding for memory {memory.id}: {e}")
-        embedding = None  # Mark as unavailable for contradiction check
-
-    # Check for contradictions with existing memories (non-fatal)
-    contradiction_info = None
-    if embedding is not None:
-        try:
-            contradiction_info = await _check_write_time_contradictions(
-                project_id=project_id,
-                new_memory_id=memory.id,
-                new_content=content,
-                new_embedding=embedding,
-                memory_type=memory_type_upper,
-            )
-        except Exception as e:
-            logger.warning(f"Contradiction check failed for {memory.id}: {e}")
+        # Memory is still created, just without embedding
 
     # Trigger auto-compaction check (non-blocking)
     asyncio.create_task(_safe_auto_compact(project_id))
+
+    if settings.memory_v2_dual_write:
+        asyncio.create_task(
+            _dual_write_memory_v2(
+                legacy_memory=memory,
+                memory_type=memory_type,
+                scope=scope,
+                ttl_days=ttl_days,
+                source=source,
+            )
+        )
 
     return {
         "memory_id": memory.id,
@@ -359,8 +372,86 @@ async def store_memory(
         "expires_at": expires_at.isoformat() if expires_at else None,
         "created": True,
         "message": f"Memory stored successfully (ID: {memory.id})",
-        "contradiction": contradiction_info,
     }
+
+
+async def _dual_write_legacy_memory_object(legacy_memory: Any) -> str | None:
+    """Persist a legacy AgentMemory ORM row into Memory V2."""
+
+    mapped = map_agent_memory_to_memory_payload(legacy_memory)
+    memory_v2 = await _memory_repository.create_memory(mapped.memory)
+
+    if mapped.evidence:
+        await _memory_repository.attach_evidence(memory_v2.id, mapped.evidence)
+
+    await _memory_repository.create_migration_map(
+        MemoryMigrationMapPayload(
+            legacy_agent_memory_id=legacy_memory.id,
+            new_memory_id=memory_v2.id,
+            checksum=mapped.checksum,
+        )
+    )
+
+    for related_legacy_id in mapped.related_legacy_ids:
+        related_v2_id = await _memory_repository.get_memory_id_for_legacy_id(related_legacy_id)
+        if related_v2_id:
+            await _memory_repository.create_relations(
+                memory_v2.id,
+                [MemoryRelationPayload(to_memory_id=related_v2_id, relation_type="RELATED_TO")],
+            )
+
+    return memory_v2.id
+
+
+async def _dual_write_memory_v2(
+    legacy_memory: Any,
+    memory_type: str,
+    scope: str,
+    ttl_days: int | None,
+    source: str | None,
+) -> None:
+    """Best-effort dual-write of legacy AgentMemory into Memory V2."""
+
+    try:
+        memory_v2_id = await _dual_write_legacy_memory_object(legacy_memory)
+        logger.info(f"Dual-wrote legacy memory {legacy_memory.id} to Memory V2 {memory_v2_id}")
+    except Exception as e:
+        logger.warning(
+            f"Memory V2 dual-write failed for legacy memory {getattr(legacy_memory, 'id', 'unknown')}: {e}"
+        )
+
+
+async def _resolve_memory_v2_id(memory_id: str) -> str | None:
+    """Resolve a Memory V2 ID from either a V2 or legacy memory ID.
+
+    When dual-write is enabled, a freshly-created legacy memory may not yet have
+    its migration map row because the V2 write runs in the background. In that
+    case, briefly poll for the map before returning not found.
+    """
+
+    memory = await _memory_repository.get_memory(memory_id)
+    if memory is not None:
+        return memory_id
+
+    resolved_id = await _memory_repository.get_memory_id_for_legacy_id(memory_id)
+    if resolved_id is not None:
+        return resolved_id
+
+    if not settings.memory_v2_dual_write:
+        return None
+
+    db = await get_db()
+    legacy_memory = await db.agentmemory.find_unique(where={"id": memory_id})
+    if legacy_memory is None:
+        return None
+
+    for _ in range(DUAL_WRITE_RESOLUTION_ATTEMPTS):
+        await asyncio.sleep(DUAL_WRITE_RESOLUTION_DELAY_SECONDS)
+        resolved_id = await _memory_repository.get_memory_id_for_legacy_id(memory_id)
+        if resolved_id is not None:
+            return resolved_id
+
+    return None
 
 
 async def _safe_auto_compact(project_id: str) -> None:
@@ -462,6 +553,15 @@ async def store_memories_bulk(
             logger.warning(f"Failed to generate batch embeddings: {e}")
             # Memories still created, just without embeddings
 
+    if settings.memory_v2_dual_write and created_memories:
+        try:
+            await asyncio.gather(
+                *(_dual_write_legacy_memory_object(memory) for memory in created_memories),
+                return_exceptions=True,
+            )
+        except Exception as e:
+            logger.warning(f"Bulk Memory V2 dual-write failed: {e}")
+
     return {
         "created": len(created_ids),
         "failed": len(failed),
@@ -537,7 +637,6 @@ async def semantic_recall(
         query_embedding = await embeddings_service.embed_text_async(query)
     except Exception as e:
         logger.error(f"Failed to embed query: {e}")
-        query_embedding = None
         # Fallback to text search if embedding fails
         return await _text_search_fallback(memories, query, limit, min_relevance, start_time)
 
@@ -621,28 +720,22 @@ async def semantic_recall(
                 relevance = min(relevance * boost, 1.0)
 
         if relevance >= min_relevance:
-            result_entry = {
-                "memory_id": memory.id,
-                "content": memory.content,
-                "type": memory.type.lower(),
-                "scope": memory.scope.lower(),
-                "category": memory.category,
-                "relevance": round(relevance, 4),
-                "confidence": round(decayed_confidence, 4),
-                "created_at": memory.createdAt.isoformat(),
-                "last_accessed_at": memory.lastAccessedAt.isoformat()
-                if memory.lastAccessedAt
-                else None,
-                "access_count": memory.accessCount,
-            }
-
-            # Include contradiction info if present
-            if getattr(memory, "contradictsId", None):
-                result_entry["contradicts"] = memory.contradictsId
-            if getattr(memory, "contradictedById", None):
-                result_entry["contradicted_by"] = memory.contradictedById
-
-            results.append(result_entry)
+            results.append(
+                {
+                    "memory_id": memory.id,
+                    "content": memory.content,
+                    "type": memory.type.lower(),
+                    "scope": memory.scope.lower(),
+                    "category": memory.category,
+                    "relevance": round(relevance, 4),
+                    "confidence": round(decayed_confidence, 4),
+                    "created_at": memory.createdAt.isoformat(),
+                    "last_accessed_at": memory.lastAccessedAt.isoformat()
+                    if memory.lastAccessedAt
+                    else None,
+                    "access_count": memory.accessCount,
+                }
+            )
 
     # Sort by relevance
     results.sort(key=lambda x: x["relevance"], reverse=True)
@@ -662,19 +755,11 @@ async def semantic_recall(
         except Exception as e:
             logger.warning(f"Failed to batch update access counts: {e}")
 
-    # Scan graveyard for abandoned approach warnings (non-fatal)
-    graveyard_warnings = []
-    try:
-        graveyard_warnings = await _scan_graveyard(project_id, query_embedding)
-    except Exception as e:
-        logger.warning(f"Graveyard scan failed: {e}")
-
     return {
         "memories": results,
         "total_searched": len(memories),
         "query": query,
         "timing_ms": int((time.time() - start_time) * 1000),
-        "graveyard_warnings": graveyard_warnings,
     }
 
 
@@ -1032,25 +1117,6 @@ async def delete_memories(
     to_delete = await db.agentmemory.find_many(where=where)
     memory_ids = [m.id for m in to_delete]
 
-    # Clean up contradiction links pointing to memories being deleted
-    for mem in to_delete:
-        if getattr(mem, "contradictsId", None):
-            try:
-                await db.agentmemory.update_many(
-                    where={"contradictedById": mem.id},
-                    data={"contradictedById": None, "contradictionScore": None},
-                )
-            except Exception as e:
-                logger.debug(f"Failed to clear contradiction link for {mem.id}: {e}")
-        if getattr(mem, "contradictedById", None):
-            try:
-                await db.agentmemory.update_many(
-                    where={"contradictsId": mem.id},
-                    data={"contradictsId": None, "contradictionScore": None},
-                )
-            except Exception as e:
-                logger.debug(f"Failed to clear contradiction link for {mem.id}: {e}")
-
     # Delete memories
     result = await db.agentmemory.delete_many(where=where)
     deleted_count = result
@@ -1071,257 +1137,168 @@ async def delete_memories(
     }
 
 
-# ============ GRAVEYARD SYSTEM ============
-
-# Cache key for graveyard count (fast emptiness check)
-GRAVEYARD_COUNT_PREFIX = "rlm:graveyard_count:"
-GRAVEYARD_COUNT_TTL = 60 * 5  # 5 minutes
-GRAVEYARD_SIMILARITY_THRESHOLD = 0.70  # Lower than contradiction — better to over-warn
-
-
-async def bury_memory(
-    project_id: str,
-    reason: str,
-    memory_id: str | None = None,
-    content: str | None = None,
-    buried_by: str | None = None,
-) -> dict[str, Any]:
-    """Bury a memory or approach in the graveyard.
-
-    Two modes:
-    - By memory_id: moves existing memory to GRAVEYARD tier
-    - By content: creates a new GRAVEYARD-tier memory with embedding
-
-    Args:
-        project_id: The project ID
-        reason: Why this approach was abandoned
-        memory_id: Existing memory to bury (optional)
-        content: New content to bury directly (optional, used if no memory_id)
-        buried_by: Who buried it (agent_id, "user", "system")
-
-    Returns:
-        Dict with burial details
-    """
-    if not memory_id and not content:
-        return {"error": "Either memory_id or content is required"}
-
-    db = await get_db()
-    now = datetime.now(UTC)
-
-    if memory_id:
-        # Move existing memory to GRAVEYARD
-        memory = await db.agentmemory.find_first(
-            where={"id": memory_id, "projectId": project_id}
-        )
-        if not memory:
-            return {"error": f"Memory {memory_id} not found"}
-
-        await db.agentmemory.update(
-            where={"id": memory_id},
-            data={
-                "tier": "GRAVEYARD",
-                "buriedAt": now,
-                "buriedReason": reason,
-                "buriedBy": buried_by or "user",
-            },
-        )
-
-        result = {
-            "memory_id": memory_id,
-            "content": memory.content[:200],
-            "buried_reason": reason,
-            "buried_at": now.isoformat(),
-            "was_existing": True,
-            "message": f"Memory {memory_id} buried in graveyard",
-        }
-    else:
-        # Create new GRAVEYARD memory
-        memory = await db.agentmemory.create(
-            data={
-                "projectId": project_id,
-                "content": content,
-                "type": "LEARNING",
-                "scope": "PROJECT",
-                "tier": "GRAVEYARD",
-                "buriedAt": now,
-                "buriedReason": reason,
-                "buriedBy": buried_by or "user",
-                "confidence": 1.0,
-                "accessCount": 0,
-            }
-        )
-
-        # Generate embedding for semantic matching during recall
-        try:
-            embeddings_service = get_embeddings_service()
-            embedding = await embeddings_service.embed_text_async(content)
-            await _store_memory_embedding(memory.id, embedding)
-        except Exception as e:
-            logger.warning(f"Failed to embed graveyard memory {memory.id}: {e}")
-
-        result = {
-            "memory_id": memory.id,
-            "content": content[:200],
-            "buried_reason": reason,
-            "buried_at": now.isoformat(),
-            "was_existing": False,
-            "message": f"Approach buried in graveyard (ID: {memory.id})",
-        }
-
-    # Invalidate graveyard count cache
-    redis = await get_redis()
-    if redis:
-        try:
-            await redis.delete(f"{GRAVEYARD_COUNT_PREFIX}{project_id}")
-        except Exception:
-            pass
-
-    return result
-
-
-async def unbury_memory(
-    project_id: str,
+async def invalidate_memory_v2(
     memory_id: str,
-    reinstate_tier: str = "ARCHIVE",
+    invalidated_at: datetime | None = None,
+    reason: str | None = None,
 ) -> dict[str, Any]:
-    """Reinstate a memory from the graveyard.
+    """Invalidate a Memory V2 record using a legacy or V2 memory ID."""
 
-    Args:
-        project_id: The project ID
-        memory_id: Memory to unbury
-        reinstate_tier: Tier to restore to (default: ARCHIVE)
+    target_time = invalidated_at or datetime.now(UTC)
+    resolved_id = await _resolve_memory_v2_id(memory_id)
+    if resolved_id is None:
+        return {
+            "error": f"Memory '{memory_id}' not found in Memory V2",
+            "memory_id": memory_id,
+        }
 
-    Returns:
-        Dict with reinstatement details
-    """
-    db = await get_db()
-
-    memory = await db.agentmemory.find_first(
-        where={"id": memory_id, "projectId": project_id, "tier": "GRAVEYARD"}
-    )
-    if not memory:
-        return {"error": f"Memory {memory_id} not found in graveyard"}
-
-    tier_upper = reinstate_tier.upper()
-    if tier_upper not in ("CRITICAL", "DAILY", "ARCHIVE"):
-        tier_upper = "ARCHIVE"
-
-    await db.agentmemory.update(
-        where={"id": memory_id},
-        data={
-            "tier": tier_upper,
-            "buriedAt": None,
-            "buriedReason": None,
-            "buriedBy": None,
-        },
-    )
-
-    # Invalidate graveyard count cache
-    redis = await get_redis()
-    if redis:
-        try:
-            await redis.delete(f"{GRAVEYARD_COUNT_PREFIX}{project_id}")
-        except Exception:
-            pass
-
+    await _memory_repository.invalidate_memory(resolved_id, target_time)
     return {
-        "memory_id": memory_id,
-        "content": memory.content[:200],
-        "reinstated_tier": tier_upper.lower(),
-        "message": f"Memory {memory_id} reinstated from graveyard to {tier_upper.lower()} tier",
+        "memory_id": resolved_id,
+        "invalidated": True,
+        "invalidated_at": target_time.isoformat(),
+        "reason": reason,
+        "message": f"Memory '{resolved_id}' invalidated",
     }
 
 
-async def _scan_graveyard(
-    project_id: str,
-    query_embedding: list[float],
-) -> list[dict[str, Any]]:
-    """Fast-path graveyard scan during recall.
+async def attach_memory_source_v2(
+    memory_id: str,
+    evidence_type: str,
+    document_id: str | None = None,
+    chunk_id: str | None = None,
+    external_ref: str | None = None,
+    snippet: str | None = None,
+    line_start: int | None = None,
+    line_end: int | None = None,
+    weight: float = 1.0,
+) -> dict[str, Any]:
+    """Attach evidence to a Memory V2 record using a legacy or V2 memory ID."""
 
-    Checks if any buried memories are semantically similar to the query.
-    Uses a lower similarity threshold (0.70) than contradiction detection
-    because it's better to over-warn than to silently re-suggest abandoned approaches.
+    resolved_id = await _resolve_memory_v2_id(memory_id)
+    if resolved_id is None:
+        return {
+            "error": f"Memory '{memory_id}' not found in Memory V2",
+            "memory_id": memory_id,
+        }
 
-    Args:
-        project_id: The project ID
-        query_embedding: Pre-computed query embedding
+    await _memory_repository.attach_evidence(
+        resolved_id,
+        [
+            MemoryEvidencePayload(
+                evidence_type=evidence_type,
+                document_id=document_id,
+                chunk_id=chunk_id,
+                external_ref=external_ref,
+                snippet=snippet,
+                line_start=line_start,
+                line_end=line_end,
+                weight=weight,
+            )
+        ],
+    )
+    return {
+        "memory_id": resolved_id,
+        "evidence_type": evidence_type,
+        "created": True,
+        "message": f"Attached {evidence_type} evidence to memory '{resolved_id}'",
+    }
 
-    Returns:
-        List of graveyard warnings (max 3), empty list if no graveyard entries
-    """
-    # Fast emptiness check via cached count
-    redis = await get_redis()
-    if redis:
-        try:
-            cached_count = await redis.get(f"{GRAVEYARD_COUNT_PREFIX}{project_id}")
-            if cached_count is not None and int(cached_count) == 0:
-                return []
-        except Exception:
-            pass
+
+async def supersede_memory_v2(
+    old_memory_id: str,
+    new_memory_id: str,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    """Mark one V2 memory as superseded by another."""
+
+    resolved_old_id = await _resolve_memory_v2_id(old_memory_id)
+    resolved_new_id = await _resolve_memory_v2_id(new_memory_id)
+
+    if resolved_old_id is None:
+        return {"error": f"Memory '{old_memory_id}' not found in Memory V2", "memory_id": old_memory_id}
+    if resolved_new_id is None:
+        return {"error": f"Memory '{new_memory_id}' not found in Memory V2", "memory_id": new_memory_id}
+
+    superseded_at = datetime.now(UTC)
+    await _memory_repository.supersede_memory(resolved_old_id, resolved_new_id, superseded_at)
+    return {
+        "old_memory_id": resolved_old_id,
+        "new_memory_id": resolved_new_id,
+        "superseded": True,
+        "superseded_at": superseded_at.isoformat(),
+        "reason": reason,
+        "message": f"Memory '{resolved_old_id}' superseded by '{resolved_new_id}'",
+    }
+
+
+async def verify_memory_v2(
+    memory_id: str,
+    mark_stale_if_missing: bool = True,
+) -> dict[str, Any]:
+    """Verify that a V2 memory still has valid supporting evidence."""
+
+    resolved_id = await _resolve_memory_v2_id(memory_id)
+    if resolved_id is None:
+        return {"error": f"Memory '{memory_id}' not found in Memory V2", "memory_id": memory_id}
+    memory = await _memory_repository.get_memory_with_evidence(resolved_id)
+    if memory is None:
+        return {"error": f"Memory '{memory_id}' not found in Memory V2", "memory_id": memory_id}
 
     db = await get_db()
-    embeddings_service = get_embeddings_service()
+    evidence_rows = list(getattr(memory, "evidenceLinks", []) or [])
+    total = len(evidence_rows)
+    valid = 0
+    invalid = 0
 
-    # Fetch all graveyard memories
-    graveyard = await db.agentmemory.find_many(
-        where={"projectId": project_id, "tier": "GRAVEYARD"},
-        order={"buriedAt": "desc"},
-        take=100,
-    )
+    for evidence in evidence_rows:
+        evidence_type = str(getattr(evidence, "evidenceType", ""))
+        document_id = getattr(evidence, "documentId", None)
+        chunk_id = getattr(evidence, "chunkId", None)
+        external_ref = getattr(evidence, "externalRef", None)
 
-    # Update cached count
-    if redis:
-        try:
-            await redis.setex(
-                f"{GRAVEYARD_COUNT_PREFIX}{project_id}",
-                GRAVEYARD_COUNT_TTL,
-                str(len(graveyard)),
-            )
-        except Exception:
-            pass
+        is_valid = False
+        if evidence_type == "DOCUMENT":
+            if document_id:
+                is_valid = await db.document.find_unique(where={"id": document_id}) is not None
+            elif external_ref and getattr(memory, "projectId", None):
+                is_valid = (
+                    await db.document.find_first(
+                        where={"projectId": memory.projectId, "path": external_ref, "deletedAt": None}
+                    )
+                ) is not None
+        elif evidence_type == "CHUNK":
+            if chunk_id:
+                is_valid = await db.documentchunk.find_unique(where={"id": chunk_id}) is not None
+        else:
+            is_valid = bool(external_ref or getattr(evidence, "snippet", None))
 
-    if not graveyard:
-        return []
+        if is_valid:
+            valid += 1
+        else:
+            invalid += 1
 
-    # Batch-fetch embeddings
-    graveyard_ids = [g.id for g in graveyard]
-    cached_embeddings = await _get_memory_embeddings_batch(graveyard_ids)
+    evidence_score = (valid / total) if total > 0 else 0.0
+    status = str(getattr(memory, "status", "ACTIVE"))
 
-    if not cached_embeddings:
-        return []
+    update = MemoryUpdatePayload(evidence_score=evidence_score)
+    if total > 0 and valid == 0 and mark_stale_if_missing and status == "ACTIVE":
+        update.status = "STALE"
+        update.stale_at = datetime.now(UTC)
+        status = "STALE"
 
-    # Compare query against graveyard embeddings
-    warnings = []
-    for memory in graveyard:
-        if memory.id not in cached_embeddings:
-            continue
+    await _memory_repository.update_memory(resolved_id, update)
 
-        try:
-            similarities = embeddings_service.cosine_similarity(
-                query_embedding, [cached_embeddings[memory.id]]
-            )
-            similarity = similarities[0] if similarities else 0
-        except Exception:
-            continue
-
-        if similarity >= GRAVEYARD_SIMILARITY_THRESHOLD:
-            content_preview = memory.content[:100]
-            buried_reason = memory.buriedReason or "No reason provided"
-            warnings.append({
-                "memory_id": memory.id,
-                "content": memory.content,
-                "buried_reason": buried_reason,
-                "buried_at": memory.buriedAt.isoformat() if memory.buriedAt else None,
-                "similarity": round(similarity, 4),
-                "warning": (
-                    f"Previously abandoned: {content_preview}... "
-                    f"Reason: {buried_reason}"
-                ),
-            })
-
-    # Sort by similarity, return top 3
-    warnings.sort(key=lambda x: x["similarity"], reverse=True)
-    return warnings[:3]
+    return {
+        "memory_id": resolved_id,
+        "verified": True,
+        "total_evidence": total,
+        "valid_evidence": valid,
+        "invalid_evidence": invalid,
+        "evidence_score": round(evidence_score, 4),
+        "status": status,
+        "message": f"Verified memory '{resolved_id}'",
+    }
 
 
 # ============ PHASE 20: MEMORY TIERS & COMPACTION ============
@@ -1495,114 +1472,6 @@ async def find_semantic_conflicts(
                     conflicts.append((m2, m1, similarity))  # m2 is older
 
     return conflicts
-
-
-async def _check_write_time_contradictions(
-    project_id: str,
-    new_memory_id: str,
-    new_content: str,
-    new_embedding: list[float],
-    memory_type: str,
-) -> dict[str, Any] | None:
-    """Check if a newly stored memory contradicts existing memories.
-
-    Runs at write-time with minimal overhead (~10-20ms) since the embedding
-    is already computed. Only checks the 50 most recent same-type memories.
-
-    Args:
-        project_id: The project ID
-        new_memory_id: ID of the newly created memory
-        new_content: Content of the new memory
-        new_embedding: Pre-computed embedding of the new memory
-        memory_type: Type of the new memory (uppercase)
-
-    Returns:
-        Dict with contradiction info if found, None otherwise
-    """
-    db = await get_db()
-    embeddings_service = get_embeddings_service()
-
-    # Fetch 50 most recent same-type memories (excluding the new one)
-    candidates = await db.agentmemory.find_many(
-        where={
-            "projectId": project_id,
-            "type": memory_type,
-            "id": {"not": new_memory_id},
-            "tier": {"not": "GRAVEYARD"},
-            "OR": [
-                {"expiresAt": None},
-                {"expiresAt": {"gt": datetime.now(UTC)}},
-            ],
-        },
-        order={"createdAt": "desc"},
-        take=50,
-    )
-
-    if not candidates:
-        return None
-
-    # Batch-fetch cached embeddings
-    candidate_ids = [c.id for c in candidates]
-    cached_embeddings = await _get_memory_embeddings_batch(candidate_ids)
-
-    if not cached_embeddings:
-        return None
-
-    # Compare against each candidate
-    best_conflict: dict[str, Any] | None = None
-    best_similarity = 0.0
-
-    for candidate in candidates:
-        if candidate.id not in cached_embeddings:
-            continue
-
-        try:
-            similarities = embeddings_service.cosine_similarity(
-                new_embedding, [cached_embeddings[candidate.id]]
-            )
-            similarity = similarities[0] if similarities else 0
-        except Exception:
-            continue
-
-        # Conflict zone: similar but not identical (0.85-0.98)
-        if 0.85 <= similarity < 0.98 and similarity > best_similarity:
-            best_similarity = similarity
-            best_conflict = {
-                "contradicts_memory_id": candidate.id,
-                "contradicts_content": candidate.content[:200],
-                "similarity": round(similarity, 4),
-            }
-
-    if not best_conflict:
-        return None
-
-    # Update both memory records with contradiction links
-    try:
-        contradicted_id = best_conflict["contradicts_memory_id"]
-
-        await db.agentmemory.update(
-            where={"id": new_memory_id},
-            data={
-                "contradictsId": contradicted_id,
-                "contradictionScore": best_conflict["similarity"],
-            },
-        )
-        await db.agentmemory.update(
-            where={"id": contradicted_id},
-            data={
-                "contradictedById": new_memory_id,
-                "contradictionScore": best_conflict["similarity"],
-            },
-        )
-
-        logger.info(
-            f"Contradiction detected: {new_memory_id} contradicts {contradicted_id} "
-            f"(similarity: {best_conflict['similarity']})"
-        )
-    except Exception as e:
-        logger.warning(f"Failed to update contradiction links: {e}")
-
-    return best_conflict
 
 
 async def resolve_conflict(

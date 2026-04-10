@@ -69,6 +69,8 @@ class ToolName(StrEnum):
     RLM_TASK_REASSIGN = "rlm_task_reassign"  # Reassign task to different agent
     RLM_TASK_DELETE = "rlm_task_delete"  # Delete a task (admin only)
     RLM_TASK_UPDATE = "rlm_task_update"  # Update task properties (admin only)
+    RLM_TASK_UNCLAIM = "rlm_task_unclaim"  # Unclaim a stuck task
+    RLM_TASK_RECOVER = "rlm_task_recover"  # Recover stuck tasks in batch
     # Phase 10: Document Sync Tools
     RLM_UPLOAD_DOCUMENT = "rlm_upload_document"
     RLM_SYNC_DOCUMENTS = "rlm_sync_documents"
@@ -114,9 +116,10 @@ class ToolName(StrEnum):
     RLM_MEMORY_COMPACT = "rlm_memory_compact"
     RLM_MEMORY_DAILY_BRIEF = "rlm_memory_daily_brief"
     RLM_SESSION_MEMORIES = "rlm_session_memories"
-    # Graveyard System
-    RLM_BURY = "rlm_bury"
-    RLM_UNBURY = "rlm_unbury"
+    RLM_MEMORY_INVALIDATE = "rlm_memory_invalidate"
+    RLM_MEMORY_ATTACH_SOURCE = "rlm_memory_attach_source"
+    RLM_MEMORY_SUPERSEDE = "rlm_memory_supersede"
+    RLM_MEMORY_VERIFY = "rlm_memory_verify"
     # Phase 20: Tenant Profile
     RLM_TENANT_PROFILE_CREATE = "rlm_tenant_profile_create"
     RLM_TENANT_PROFILE_GET = "rlm_tenant_profile_get"
@@ -206,6 +209,51 @@ class MemoryTier(StrEnum):
     def from_str(cls, value: str) -> "MemoryTier":
         """Convert string to MemoryTier enum."""
         return cls(value.upper())
+
+
+class MemoryStatus(StrEnum):
+    """Lifecycle status for Memory V2 records."""
+
+    CANDIDATE = "CANDIDATE"
+    ACTIVE = "ACTIVE"
+    STALE = "STALE"
+    SUPERSEDED = "SUPERSEDED"
+    INVALIDATED = "INVALIDATED"
+    ARCHIVED = "ARCHIVED"
+
+
+class MemorySource(StrEnum):
+    """Source type for Memory V2 records."""
+
+    MCP = "MCP"
+    SESSION_CAPTURE = "SESSION_CAPTURE"
+    DOC_DERIVED = "DOC_DERIVED"
+    WEBHOOK = "WEBHOOK"
+    IMPORT = "IMPORT"
+    MANUAL = "MANUAL"
+
+
+class EvidenceType(StrEnum):
+    """Supported evidence types for Memory V2."""
+
+    DOCUMENT = "DOCUMENT"
+    CHUNK = "CHUNK"
+    SESSION = "SESSION"
+    PR = "PR"
+    ISSUE = "ISSUE"
+    COMMIT = "COMMIT"
+    WEBHOOK = "WEBHOOK"
+    EXTERNAL_URL = "EXTERNAL_URL"
+
+
+class MemoryRelationType(StrEnum):
+    """Typed relations between memory records."""
+
+    SUPPORTS = "SUPPORTS"
+    CONTRADICTS = "CONTRADICTS"
+    SUPERSEDES = "SUPERSEDES"
+    DERIVED_FROM = "DERIVED_FROM"
+    RELATED_TO = "RELATED_TO"
 
 
 class IndexJobStatus(StrEnum):

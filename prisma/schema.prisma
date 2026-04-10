@@ -5,6 +5,7 @@ generator client {
   recursive_type_depth = 5
 }
 
+
 datasource db {
   provider   = "postgresql"
   url        = env("DATABASE_URL")
@@ -377,6 +378,7 @@ model Project {
   cacheStats     CacheStats?
   agentMemories  AgentMemory[]
   memoryStats    MemoryStats?
+  memories       Memory[]
   agentSwarms    AgentSwarm[]
 
   // Indexing jobs
@@ -828,14 +830,15 @@ model OAuthToken {
 // ============================================
 
 model Query {
-  id           String   @id @default(cuid())
-  tool         String
-  inputTokens  Int
-  outputTokens Int
-  latencyMs    Int
-  success      Boolean
-  errorMessage String?
-  createdAt    DateTime @default(now())
+  id              String   @id @default(cuid())
+  tool            String
+  inputTokens     Int      // Optimized context tokens actually sent to LLM
+  outputTokens    Int      // Tokens returned by LLM
+  retrievedTokens Int      @default(0) // Raw tokens from search results before optimization
+  latencyMs       Int
+  success         Boolean
+  errorMessage    String?
+  createdAt       DateTime @default(now())
 
   // Relations
   projectId String
@@ -1307,7 +1310,51 @@ enum MemoryTier {
   CRITICAL    // Auto-load, max 8K tokens (decisions, facts)
   DAILY       // Auto-load today+yesterday, max 4K tokens (context, todos)
   ARCHIVE     // Query-only, no auto-load (old learnings, preferences)
-  GRAVEYARD   // Abandoned approaches — warns during recall
+
+  @@schema("tenant_snipara")
+}
+
+enum MemoryStatus {
+  CANDIDATE
+  ACTIVE
+  STALE
+  SUPERSEDED
+  INVALIDATED
+  ARCHIVED
+
+  @@schema("tenant_snipara")
+}
+
+enum MemorySource {
+  MCP
+  SESSION_CAPTURE
+  DOC_DERIVED
+  WEBHOOK
+  IMPORT
+  MANUAL
+
+  @@schema("tenant_snipara")
+}
+
+enum EvidenceType {
+  DOCUMENT
+  CHUNK
+  SESSION
+  PR
+  ISSUE
+  COMMIT
+  WEBHOOK
+  EXTERNAL_URL
+
+  @@schema("tenant_snipara")
+}
+
+enum MemoryRelationType {
+  SUPPORTS
+  CONTRADICTS
+  SUPERSEDES
+  DERIVED_FROM
+  RELATED_TO
 
   @@schema("tenant_snipara")
 }
@@ -1342,16 +1389,6 @@ model AgentMemory {
   promotedAt    DateTime?    // When promoted to higher tier
   promotedBy    String?      // Who/what promoted (agent_id, "system", "manual")
 
-  // Contradiction tracking
-  contradictsId       String?   // ID of the memory this one contradicts
-  contradictedById    String?   // ID of the memory that later contradicted this one
-  contradictionScore  Float?    // Similarity score at detection time (0.85-0.98)
-
-  // Graveyard metadata
-  buriedAt            DateTime? // When this memory was buried
-  buriedReason        String?   @db.Text  // Why this approach was abandoned
-  buriedBy            String?   // Who buried it (agent_id, "user", "system")
-
   project       Project      @relation(fields: [projectId], references: [id], onDelete: Cascade)
 
   @@index([projectId, type])
@@ -1359,9 +1396,6 @@ model AgentMemory {
   @@index([projectId, scope])
   @@index([projectId, tier])
   @@index([expiresAt])
-  @@index([projectId, tier, buriedAt])
-  @@index([contradictsId])
-  @@index([contradictedById])
   @@map("agent_memories")
   @@schema("tenant_snipara")
 }
@@ -1389,6 +1423,106 @@ model MemoryStats {
   project       Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
 
   @@map("memory_stats")
+  @@schema("tenant_snipara")
+}
+
+model Memory {
+  id                 String       @id @default(cuid())
+  projectId          String?
+  teamId             String?
+  userId             String?
+  agentId            String?
+
+  type               MemoryType
+  scope              MemoryScope
+  status             MemoryStatus @default(ACTIVE)
+
+  title              String?
+  content            String       @db.Text
+  summary            String?      @db.Text
+  category           String?
+
+  confidence         Float        @default(0.7)
+  freshnessScore     Float        @default(1.0)
+  evidenceScore      Float        @default(0.0)
+
+  validFrom          DateTime?
+  validUntil         DateTime?
+  staleAt            DateTime?
+
+  source             MemorySource @default(MCP)
+  sourceSessionId    String?
+  createdBy          String?
+  reviewedBy         String?
+
+  supersedesMemoryId String?
+  canonicalMemoryId  String?
+
+  createdAt          DateTime     @default(now())
+  updatedAt          DateTime     @updatedAt
+  lastAccessedAt     DateTime?
+  archivedAt         DateTime?
+
+  project            Project?     @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  evidenceLinks      MemoryEvidence[]
+  relatedFrom        MemoryRelation[] @relation("MemoryRelationFrom")
+  relatedTo          MemoryRelation[] @relation("MemoryRelationTo")
+
+  @@index([projectId, type, status])
+  @@index([teamId, scope, status])
+  @@index([agentId, status])
+  @@index([validFrom])
+  @@index([validUntil])
+  @@index([staleAt])
+  @@map("memories")
+  @@schema("tenant_snipara")
+}
+
+model MemoryEvidence {
+  id            String       @id @default(cuid())
+  memoryId      String
+  evidenceType  EvidenceType
+  documentId    String?
+  chunkId       String?
+  externalRef   String?
+  snippet       String?      @db.Text
+  lineStart     Int?
+  lineEnd       Int?
+  weight        Float        @default(1.0)
+  createdAt     DateTime     @default(now())
+
+  memory        Memory       @relation(fields: [memoryId], references: [id], onDelete: Cascade)
+
+  @@index([memoryId])
+  @@index([documentId])
+  @@index([chunkId])
+  @@map("memory_evidence")
+  @@schema("tenant_snipara")
+}
+
+model MemoryRelation {
+  id            String             @id @default(cuid())
+  fromMemoryId  String
+  toMemoryId    String
+  relationType  MemoryRelationType
+  createdAt     DateTime           @default(now())
+
+  fromMemory    Memory             @relation("MemoryRelationFrom", fields: [fromMemoryId], references: [id], onDelete: Cascade)
+  toMemory      Memory             @relation("MemoryRelationTo", fields: [toMemoryId], references: [id], onDelete: Cascade)
+
+  @@index([fromMemoryId, relationType])
+  @@index([toMemoryId, relationType])
+  @@map("memory_relations")
+  @@schema("tenant_snipara")
+}
+
+model MemoryMigrationMap {
+  legacyAgentMemoryId String   @id
+  newMemoryId         String   @unique
+  checksum            String?
+  migratedAt          DateTime @default(now())
+
+  @@map("memory_migration_map")
   @@schema("tenant_snipara")
 }
 

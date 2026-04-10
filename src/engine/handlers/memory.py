@@ -13,12 +13,16 @@ from ...models import ToolResult
 from ...services.agent_limits import check_memory_limits
 from ...services.agent_memory import (
     append_journal,
+    attach_memory_source_v2,
     delete_memories,
     get_journal,
+    invalidate_memory_v2,
     list_memories,
     semantic_recall,
+    supersede_memory_v2,
     store_memory,
     summarize_journal,
+    verify_memory_v2,
 )
 from .base import HandlerContext, count_tokens
 
@@ -285,6 +289,149 @@ async def handle_forget(
     return ToolResult(
         data=result,
         input_tokens=0,
+        output_tokens=count_tokens(str(result)),
+    )
+
+
+async def handle_memory_invalidate(
+    params: dict[str, Any],
+    ctx: HandlerContext,
+) -> ToolResult:
+    """Invalidate a V2 memory using a legacy or V2 memory ID."""
+
+    memory_id = params.get("memory_id")
+    invalidated_at = params.get("invalidated_at")
+    reason = params.get("reason")
+
+    if not memory_id:
+        return ToolResult(
+            data={"error": "rlm_memory_invalidate: missing required parameter 'memory_id'"},
+            input_tokens=0,
+            output_tokens=0,
+        )
+
+    from datetime import datetime
+
+    parsed_invalidated_at = None
+    if invalidated_at:
+        try:
+            parsed_invalidated_at = datetime.fromisoformat(invalidated_at.replace("Z", "+00:00"))
+        except ValueError:
+            return ToolResult(
+                data={"error": "rlm_memory_invalidate: invalid ISO timestamp for 'invalidated_at'"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+    result = await invalidate_memory_v2(
+        memory_id=memory_id,
+        invalidated_at=parsed_invalidated_at,
+        reason=reason,
+    )
+    return ToolResult(
+        data=result,
+        input_tokens=count_tokens(memory_id),
+        output_tokens=count_tokens(str(result)),
+    )
+
+
+async def handle_memory_attach_source(
+    params: dict[str, Any],
+    ctx: HandlerContext,
+) -> ToolResult:
+    """Attach evidence to a V2 memory using a legacy or V2 memory ID."""
+
+    memory_id = params.get("memory_id")
+    evidence_type = params.get("evidence_type")
+
+    if not memory_id or not evidence_type:
+        missing = []
+        if not memory_id:
+            missing.append("memory_id")
+        if not evidence_type:
+            missing.append("evidence_type")
+        return ToolResult(
+            data={"error": f"rlm_memory_attach_source: missing required parameter(s): {', '.join(missing)}"},
+            input_tokens=0,
+            output_tokens=0,
+        )
+
+    result = await attach_memory_source_v2(
+        memory_id=memory_id,
+        evidence_type=evidence_type,
+        document_id=params.get("document_id"),
+        chunk_id=params.get("chunk_id"),
+        external_ref=params.get("external_ref"),
+        snippet=params.get("snippet"),
+        line_start=params.get("line_start"),
+        line_end=params.get("line_end"),
+        weight=params.get("weight", 1.0),
+    )
+    return ToolResult(
+        data=result,
+        input_tokens=count_tokens(memory_id),
+        output_tokens=count_tokens(str(result)),
+    )
+
+
+async def handle_memory_supersede(
+    params: dict[str, Any],
+    ctx: HandlerContext,
+) -> ToolResult:
+    """Supersede one Memory V2 record with another."""
+
+    old_memory_id = params.get("old_memory_id")
+    new_memory_id = params.get("new_memory_id")
+    reason = params.get("reason")
+
+    if not old_memory_id or not new_memory_id:
+        missing = []
+        if not old_memory_id:
+            missing.append("old_memory_id")
+        if not new_memory_id:
+            missing.append("new_memory_id")
+        return ToolResult(
+            data={"error": f"rlm_memory_supersede: missing required parameter(s): {', '.join(missing)}"},
+            input_tokens=0,
+            output_tokens=0,
+        )
+
+    result = await supersede_memory_v2(
+        old_memory_id=old_memory_id,
+        new_memory_id=new_memory_id,
+        reason=reason,
+    )
+    input_tokens = count_tokens(old_memory_id) + count_tokens(new_memory_id)
+    return ToolResult(
+        data=result,
+        input_tokens=input_tokens,
+        output_tokens=count_tokens(str(result)),
+    )
+
+
+async def handle_memory_verify(
+    params: dict[str, Any],
+    ctx: HandlerContext,
+) -> ToolResult:
+    """Verify whether a Memory V2 record still has valid evidence."""
+
+    memory_id = params.get("memory_id")
+    mark_stale_if_missing = params.get("mark_stale_if_missing", True)
+
+    if not memory_id:
+        return ToolResult(
+            data={"error": "rlm_memory_verify: missing required parameter 'memory_id'"},
+            input_tokens=0,
+            output_tokens=0,
+        )
+
+    result = await verify_memory_v2(
+        memory_id=memory_id,
+        mark_stale_if_missing=mark_stale_if_missing,
+    )
+    return ToolResult(
+        data=result,
+        input_tokens=count_tokens(memory_id),
         output_tokens=count_tokens(str(result)),
     )
 

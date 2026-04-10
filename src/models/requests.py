@@ -9,6 +9,7 @@ from .enums import (
     AgentMemoryType,
     DecomposeStrategy,
     DocumentCategoryEnum,
+    EvidenceType,
     PlanStrategy,
     SearchMode,
     SummaryType,
@@ -305,6 +306,49 @@ class ForgetParams(BaseModel):
     category: str | None = Field(default=None, description="Delete all memories in this category")
     older_than_days: int | None = Field(
         default=None, ge=1, description="Delete memories older than N days"
+    )
+
+
+class MemoryInvalidateParams(BaseModel):
+    """Parameters for rlm_memory_invalidate."""
+
+    memory_id: str = Field(..., description="Legacy or V2 memory ID")
+    invalidated_at: str | None = Field(
+        default=None,
+        description="Optional ISO timestamp. Defaults to now.",
+    )
+    reason: str | None = Field(default=None, description="Optional invalidation reason")
+
+
+class MemoryAttachSourceParams(BaseModel):
+    """Parameters for rlm_memory_attach_source."""
+
+    memory_id: str = Field(..., description="Legacy or V2 memory ID")
+    evidence_type: EvidenceType = Field(..., description="Evidence type")
+    document_id: str | None = Field(default=None, description="Optional document ID")
+    chunk_id: str | None = Field(default=None, description="Optional chunk ID")
+    external_ref: str | None = Field(default=None, description="External path or URL")
+    snippet: str | None = Field(default=None, description="Optional supporting excerpt")
+    line_start: int | None = Field(default=None, ge=1, description="Optional start line")
+    line_end: int | None = Field(default=None, ge=1, description="Optional end line")
+    weight: float = Field(default=1.0, ge=0.0, le=1.0, description="Evidence weight")
+
+
+class MemorySupersedeParams(BaseModel):
+    """Parameters for rlm_memory_supersede."""
+
+    old_memory_id: str = Field(..., description="Legacy or V2 memory ID being superseded")
+    new_memory_id: str = Field(..., description="Legacy or V2 replacement memory ID")
+    reason: str | None = Field(default=None, description="Optional supersession reason")
+
+
+class MemoryVerifyParams(BaseModel):
+    """Parameters for rlm_memory_verify."""
+
+    memory_id: str = Field(..., description="Legacy or V2 memory ID")
+    mark_stale_if_missing: bool = Field(
+        default=True,
+        description="Mark memory stale when all evidence is invalid",
     )
 
 

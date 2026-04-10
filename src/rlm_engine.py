@@ -17,8 +17,6 @@ from typing import Any
 
 from .config import settings
 from .db import get_db
-from .services.cache import get_tiered_cache
-from .services.cache_stats import generate_query_hash
 
 # Phase 4 Refactor: Import from extracted core module
 from .engine.core import (
@@ -296,6 +294,10 @@ WRITE_TOOLS = {
     ToolName.RLM_DELETE_SUMMARY,
     ToolName.RLM_REMEMBER,
     ToolName.RLM_FORGET,
+    ToolName.RLM_MEMORY_INVALIDATE,
+    ToolName.RLM_MEMORY_ATTACH_SOURCE,
+    ToolName.RLM_MEMORY_SUPERSEDE,
+    ToolName.RLM_MEMORY_VERIFY,
     ToolName.RLM_UPLOAD_DOCUMENT,
     ToolName.RLM_SYNC_DOCUMENTS,
     ToolName.RLM_STATE_SET,
@@ -314,12 +316,13 @@ WRITE_TOOLS = {
     ToolName.RLM_SWARM_LEAVE,  # Remove agent from swarm
     ToolName.RLM_SWARM_MEMBERS,  # List swarm agents
     ToolName.RLM_TASK_REASSIGN,  # Reassign tasks
+    # Swarm creation - moved from ADMIN to allow integrator clients to create swarms
+    ToolName.RLM_SWARM_CREATE,
 }
 
 # ADMIN_TOOLS: Available to ADMIN only
-# Only swarm creation, config updates, and cross-project queries require ADMIN
+# Only swarm config updates and cross-project queries require ADMIN
 ADMIN_TOOLS = {
-    ToolName.RLM_SWARM_CREATE,
     ToolName.RLM_SWARM_UPDATE,  # Config changes require admin
     ToolName.RLM_MULTI_PROJECT_QUERY,
 }
@@ -338,6 +341,10 @@ AGENT_TOOLS = {
     ToolName.RLM_RECALL,
     ToolName.RLM_MEMORIES,
     ToolName.RLM_FORGET,
+    ToolName.RLM_MEMORY_INVALIDATE,
+    ToolName.RLM_MEMORY_ATTACH_SOURCE,
+    ToolName.RLM_MEMORY_SUPERSEDE,
+    ToolName.RLM_MEMORY_VERIFY,
     # Swarm tools
     ToolName.RLM_SWARM_CREATE,
     ToolName.RLM_SWARM_JOIN,
@@ -950,9 +957,10 @@ class RLMEngine:
             ToolName.RLM_RECALL: self._handle_recall,
             ToolName.RLM_MEMORIES: self._handle_memories,
             ToolName.RLM_FORGET: self._handle_forget,
-            # Graveyard System
-            ToolName.RLM_BURY: self._handle_bury,
-            ToolName.RLM_UNBURY: self._handle_unbury,
+            ToolName.RLM_MEMORY_INVALIDATE: self._handle_memory_invalidate,
+            ToolName.RLM_MEMORY_ATTACH_SOURCE: self._handle_memory_attach_source,
+            ToolName.RLM_MEMORY_SUPERSEDE: self._handle_memory_supersede,
+            ToolName.RLM_MEMORY_VERIFY: self._handle_memory_verify,
             # Phase 18: Daily Journal Tools
             ToolName.RLM_JOURNAL_APPEND: self._handle_journal_append,
             ToolName.RLM_JOURNAL_GET: self._handle_journal_get,
@@ -989,6 +997,8 @@ class RLMEngine:
             ToolName.RLM_TASK_REASSIGN: self._handle_task_reassign,
             ToolName.RLM_TASK_DELETE: self._handle_task_delete,
             ToolName.RLM_TASK_UPDATE: self._handle_task_update,
+            ToolName.RLM_TASK_UNCLAIM: self._handle_task_unclaim,
+            ToolName.RLM_TASK_RECOVER: self._handle_task_recover,
             # Phase 19: Agent Profiles (Soul Layer)
             ToolName.RLM_AGENT_PROFILE_GET: self._handle_agent_profile_get,
             ToolName.RLM_AGENT_PROFILE_UPDATE: self._handle_agent_profile_update,
@@ -1497,9 +1507,9 @@ class RLMEngine:
             )
 
         # Mode 3: Recommend tools based on query
-        # Include team/admin tools based on license
-        include_team = self.license.plan in ["TEAM", "ENTERPRISE"]
-        include_admin = self.license.access_level == "ADMIN"
+        # Include team/admin tools based on plan and access level
+        include_team = self.plan in [Plan.TEAM, Plan.ENTERPRISE]
+        include_admin = self.access_level == "ADMIN"
 
         recommendations = recommend_tools(
             query=query,
@@ -1641,70 +1651,6 @@ class RLMEngine:
         # Set include_all_tiers=True to include COLD and ARCHIVE
         include_all_tiers = params.get("include_all_tiers", False)
         tier_filter = None if include_all_tiers else ["HOT", "WARM"]
-
-        # ============ CACHE CHECK (L1 + L2) ============
-        # Check tiered cache for Team+ plans before expensive operations
-        # This can save significant compute time for repeated queries
-        use_cache = self.plan in CACHE_ENABLED_PLANS and not return_references
-        tiered_cache = None
-
-        if use_cache:
-            tiered_cache = get_tiered_cache(self.project_id, search_mode_str or "keyword")
-
-            # Check cache - returns (result, cache_level) where level is "l1", "l2", or None
-            cached_result, cache_level = await tiered_cache.get(
-                query=query,
-                max_tokens=max_tokens,
-                estimate_compute_ms=200,  # Estimated compute time for cache savings calc
-            )
-
-            if cached_result:
-                # Cache hit - return early
-                timing["total_ms"] = int((time.perf_counter() - timing_start) * 1000)
-                timing["cache_hit"] = 1
-                # cache_level is passed to ContextQueryResult separately (string field)
-
-                # Reconstruct ContextQueryResult from cached data
-                cached_sections = cached_result.get("sections", [])
-                cached_total_tokens = cached_result.get("totalTokens", cached_result.get("total_tokens", 0))
-
-                # Convert cached sections back to ContextSection objects if needed
-                if cached_sections and isinstance(cached_sections[0], dict):
-                    cached_sections = [
-                        ContextSection(
-                            title=s.get("title", ""),
-                            content=s.get("content", ""),
-                            file=s.get("file"),
-                            lines=(s.get("start_line", 0), s.get("end_line", 0)),
-                            relevance_score=s.get("relevance_score", 0.0),
-                            token_count=s.get("tokens", s.get("token_count", 0)),
-                            truncated=s.get("truncated", False),
-                        )
-                        for s in cached_sections
-                    ]
-
-                result = ContextQueryResult(
-                    sections=cached_sections,
-                    total_tokens=cached_total_tokens,
-                    max_tokens=max_tokens,
-                    query=query,
-                    search_mode=SearchMode(search_mode_str) if search_mode_str else SearchMode.KEYWORD,
-                    suggestions=cached_result.get("suggestions", []),
-                    timing=timing,
-                    cached=True,
-                    cache_level=cache_level,
-                )
-
-                logger.info(
-                    f"Returning cached result ({cache_level}) for query: {query[:50]}... "
-                    f"({cached_total_tokens} tokens)"
-                )
-
-                return ToolResult(
-                    data=result.model_dump(),
-                    input_tokens=count_tokens(query),
-                    output_tokens=cached_total_tokens,
-                )
 
         # Check if we should auto-decompose this query (Pro+ only)
         decomposed = False
@@ -2360,36 +2306,6 @@ Rationale: {decision.rationale}"""
         # Calculate actual token usage for billing
         input_tokens = count_tokens(query)
         output_tokens = total_tokens
-
-        # ============ CACHE STORE ============
-        # Store result in tiered cache for Team+ plans
-        # Don't cache pass-by-reference results (they contain session-specific chunk IDs)
-        if use_cache and tiered_cache and not return_references:
-            # Prepare cacheable data (serialize sections to dicts)
-            cache_data = {
-                "sections": [
-                    {
-                        "title": s.title,
-                        "content": s.content,
-                        "file": s.file,
-                        "start_line": s.lines[0] if hasattr(s, "lines") else s.start_line,
-                        "end_line": s.lines[1] if hasattr(s, "lines") else s.end_line,
-                        "relevance_score": s.relevance_score,
-                        "tokens": s.token_count,
-                        "truncated": s.truncated,
-                    }
-                    for s in all_sections
-                ],
-                "totalTokens": total_tokens,
-                "suggestions": suggestions,
-            }
-
-            # Store in cache asynchronously (don't block response)
-            try:
-                await tiered_cache.set(query, max_tokens, cache_data)
-                logger.debug(f"Cached result for query: {query[:50]}... ({total_tokens} tokens)")
-            except Exception as e:
-                logger.warning(f"Failed to cache result: {e}")
 
         return ToolResult(
             data=result.model_dump(),
@@ -4806,66 +4722,122 @@ Rationale: {decision.rationale}"""
             output_tokens=count_tokens(str(result)),
         )
 
-    # ============ GRAVEYARD HANDLERS ============
-
-    async def _handle_bury(self, params: dict[str, Any]) -> ToolResult:
-        """Handle rlm_bury - bury a memory or approach in the graveyard."""
-        from .services.agent_memory import bury_memory
-
-        reason = params.get("reason")
-        if not reason:
-            return ToolResult(
-                data={"error": "rlm_bury: 'reason' is required"},
-                input_tokens=0,
-                output_tokens=0,
-            )
+    async def _handle_memory_invalidate(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_memory_invalidate - logically invalidate a Memory V2 record."""
+        from .services.agent_memory import invalidate_memory_v2
 
         memory_id = params.get("memory_id")
-        content = params.get("content")
-        if not memory_id and not content:
+        invalidated_at = params.get("invalidated_at")
+        reason = params.get("reason")
+
+        if not memory_id:
             return ToolResult(
-                data={"error": "rlm_bury: either 'memory_id' or 'content' is required"},
+                data={"error": "memory_id is required"},
                 input_tokens=0,
                 output_tokens=0,
             )
 
-        result = await bury_memory(
-            project_id=self.project_id,
-            reason=reason,
-            memory_id=memory_id,
-            content=content,
-            buried_by="mcp",
-        )
+        parsed_invalidated_at = None
+        if invalidated_at:
+            try:
+                parsed_invalidated_at = datetime.fromisoformat(invalidated_at.replace("Z", "+00:00"))
+            except ValueError:
+                return ToolResult(
+                    data={"error": "invalidated_at must be an ISO timestamp"},
+                    input_tokens=0,
+                    output_tokens=0,
+                )
 
+        result = await invalidate_memory_v2(
+            memory_id=memory_id,
+            invalidated_at=parsed_invalidated_at,
+            reason=reason,
+        )
         return ToolResult(
             data=result,
-            input_tokens=count_tokens(str(params)),
+            input_tokens=count_tokens(memory_id),
             output_tokens=count_tokens(str(result)),
         )
 
-    async def _handle_unbury(self, params: dict[str, Any]) -> ToolResult:
-        """Handle rlm_unbury - reinstate a memory from the graveyard."""
-        from .services.agent_memory import unbury_memory
+    async def _handle_memory_attach_source(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_memory_attach_source - attach evidence to a Memory V2 record."""
+        from .services.agent_memory import attach_memory_source_v2
 
         memory_id = params.get("memory_id")
-        if not memory_id:
+        evidence_type = params.get("evidence_type")
+
+        if not memory_id or not evidence_type:
             return ToolResult(
-                data={"error": "rlm_unbury: 'memory_id' is required"},
+                data={"error": "memory_id and evidence_type are required"},
                 input_tokens=0,
                 output_tokens=0,
             )
 
-        reinstate_tier = params.get("reinstate_tier", "archive")
-
-        result = await unbury_memory(
-            project_id=self.project_id,
+        result = await attach_memory_source_v2(
             memory_id=memory_id,
-            reinstate_tier=reinstate_tier,
+            evidence_type=evidence_type,
+            document_id=params.get("document_id"),
+            chunk_id=params.get("chunk_id"),
+            external_ref=params.get("external_ref"),
+            snippet=params.get("snippet"),
+            line_start=params.get("line_start"),
+            line_end=params.get("line_end"),
+            weight=params.get("weight", 1.0),
         )
-
         return ToolResult(
             data=result,
-            input_tokens=count_tokens(str(params)),
+            input_tokens=count_tokens(memory_id),
+            output_tokens=count_tokens(str(result)),
+        )
+
+    async def _handle_memory_supersede(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_memory_supersede - mark one memory superseded by another."""
+        from .services.agent_memory import supersede_memory_v2
+
+        old_memory_id = params.get("old_memory_id")
+        new_memory_id = params.get("new_memory_id")
+        reason = params.get("reason")
+
+        if not old_memory_id or not new_memory_id:
+            return ToolResult(
+                data={"error": "old_memory_id and new_memory_id are required"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        result = await supersede_memory_v2(
+            old_memory_id=old_memory_id,
+            new_memory_id=new_memory_id,
+            reason=reason,
+        )
+        input_tokens = count_tokens(old_memory_id) + count_tokens(new_memory_id)
+        return ToolResult(
+            data=result,
+            input_tokens=input_tokens,
+            output_tokens=count_tokens(str(result)),
+        )
+
+    async def _handle_memory_verify(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_memory_verify - validate evidence attached to a memory."""
+        from .services.agent_memory import verify_memory_v2
+
+        memory_id = params.get("memory_id")
+        mark_stale_if_missing = params.get("mark_stale_if_missing", True)
+
+        if not memory_id:
+            return ToolResult(
+                data={"error": "memory_id is required"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        result = await verify_memory_v2(
+            memory_id=memory_id,
+            mark_stale_if_missing=mark_stale_if_missing,
+        )
+        return ToolResult(
+            data=result,
+            input_tokens=count_tokens(memory_id),
             output_tokens=count_tokens(str(result)),
         )
 
@@ -6472,6 +6444,18 @@ Rationale: {decision.rationale}"""
             input_tokens=0,
             output_tokens=count_tokens(str(result)),
         )
+
+    async def _handle_task_unclaim(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_task_unclaim - unclaim a stuck task."""
+        from .engine.handlers.swarm import handle_task_unclaim
+
+        return await handle_task_unclaim(params, await self._get_handler_ctx())
+
+    async def _handle_task_recover(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_task_recover - recover stuck tasks in batch."""
+        from .engine.handlers.swarm import handle_task_recover
+
+        return await handle_task_recover(params, await self._get_handler_ctx())
 
     # ============ Phase 10: Document Sync Handlers ============
 

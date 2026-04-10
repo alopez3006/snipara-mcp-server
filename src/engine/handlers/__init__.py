@@ -28,9 +28,13 @@ from .memory import (
     handle_journal_append,
     handle_journal_get,
     handle_journal_summarize,
+    handle_memory_attach_source,
     handle_memories,
     handle_memory_compact,
     handle_memory_daily_brief,
+    handle_memory_invalidate,
+    handle_memory_supersede,
+    handle_memory_verify,
     handle_recall,
     handle_remember,
     handle_remember_bulk,
@@ -63,7 +67,9 @@ from .swarm import (
     handle_task_create,
     handle_task_events,
     handle_task_list,
+    handle_task_recover,
     handle_task_stats,
+    handle_task_unclaim,
     handle_tasks,
 )
 from .decisions import (
@@ -102,6 +108,10 @@ __all__ = [
     "handle_recall",
     "handle_memories",
     "handle_forget",
+    "handle_memory_invalidate",
+    "handle_memory_attach_source",
+    "handle_memory_supersede",
+    "handle_memory_verify",
     # Journal handlers
     "handle_journal_append",
     "handle_journal_get",
@@ -130,6 +140,8 @@ __all__ = [
     "handle_task_list",
     "handle_task_stats",
     "handle_task_events",
+    "handle_task_unclaim",
+    "handle_task_recover",
     # Session handlers
     "handle_inject",
     "handle_context",

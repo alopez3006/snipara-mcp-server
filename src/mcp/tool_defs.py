@@ -58,6 +58,10 @@ TOOL_TIERS: dict[str, ToolTier] = {
     "rlm_get_summaries": ToolTier.POWER_USER,
     "rlm_load_document": ToolTier.POWER_USER,
     "rlm_memories": ToolTier.POWER_USER,
+    "rlm_memory_invalidate": ToolTier.POWER_USER,
+    "rlm_memory_attach_source": ToolTier.POWER_USER,
+    "rlm_memory_supersede": ToolTier.POWER_USER,
+    "rlm_memory_verify": ToolTier.POWER_USER,
     # TEAM (🟡) - Team collaboration
     "rlm_multi_project_query": ToolTier.TEAM,
     "rlm_shared_context": ToolTier.TEAM,
@@ -102,6 +106,8 @@ TOOL_TIERS: dict[str, ToolTier] = {
     "rlm_task_reassign": ToolTier.ADVANCED,  # Reassign task
     "rlm_task_delete": ToolTier.ADVANCED,  # Delete task (admin only)
     "rlm_task_update": ToolTier.ADVANCED,  # Update task (admin only)
+    "rlm_task_unclaim": ToolTier.ADVANCED,  # Unclaim a stuck task
+    "rlm_task_recover": ToolTier.ADVANCED,  # Recover stuck tasks in batch
     # ADVANCED - Agent Profiles (Soul Layer)
     "rlm_agent_profile_get": ToolTier.ADVANCED,
     "rlm_agent_profile_update": ToolTier.ADVANCED,
@@ -140,9 +146,6 @@ TOOL_TIERS: dict[str, ToolTier] = {
     "rlm_session_memories": ToolTier.POWER_USER,
     "rlm_memory_compact": ToolTier.ADVANCED,
     "rlm_memory_daily_brief": ToolTier.POWER_USER,
-    # POWER_USER - Graveyard System
-    "rlm_bury": ToolTier.POWER_USER,
-    "rlm_unbury": ToolTier.UTILITY,
     # TEAM - Tenant Profile (Phase 20)
     "rlm_tenant_profile_create": ToolTier.TEAM,
     "rlm_tenant_profile_get": ToolTier.TEAM,
@@ -728,44 +731,78 @@ TOOL_DEFINITIONS: list[dict] = [
             "required": [],
         },
     },
-    # ============ Graveyard Tools ============
     {
-        "name": "rlm_bury",
-        "description": "Bury a memory or approach in the graveyard. Buried entries trigger warnings during rlm_recall to prevent re-suggesting abandoned approaches. Provide memory_id to bury an existing memory, or content to bury a new approach directly.",
+        "name": "rlm_memory_invalidate",
+        "description": "Invalidate a Memory V2 record without deleting it. Accepts a legacy memory ID if a migration map exists.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "memory_id": {
+                "memory_id": {"type": "string", "description": "Legacy or V2 memory ID"},
+                "invalidated_at": {
                     "type": "string",
-                    "description": "ID of an existing memory to bury (optional if content is provided)",
-                },
-                "content": {
-                    "type": "string",
-                    "description": "Description of the abandoned approach (optional if memory_id is provided)",
+                    "description": "Optional ISO timestamp. Defaults to now.",
                 },
                 "reason": {
                     "type": "string",
-                    "description": "Why this approach was abandoned (required)",
+                    "description": "Optional human-readable invalidation reason",
                 },
             },
-            "required": ["reason"],
+            "required": ["memory_id"],
         },
     },
     {
-        "name": "rlm_unbury",
-        "description": "Reinstate a memory from the graveyard. Use when a previously abandoned approach becomes viable again.",
+        "name": "rlm_memory_attach_source",
+        "description": "Attach structured evidence to a Memory V2 record. Accepts a legacy memory ID if a migration map exists.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "memory_id": {
+                "memory_id": {"type": "string", "description": "Legacy or V2 memory ID"},
+                "evidence_type": {
                     "type": "string",
-                    "description": "ID of the graveyard memory to reinstate",
+                    "enum": ["DOCUMENT", "CHUNK", "SESSION", "PR", "ISSUE", "COMMIT", "WEBHOOK", "EXTERNAL_URL"],
+                    "description": "Evidence type",
                 },
-                "reinstate_tier": {
-                    "type": "string",
-                    "enum": ["critical", "daily", "archive"],
-                    "default": "archive",
-                    "description": "Tier to restore the memory to",
+                "document_id": {"type": "string", "description": "Optional document ID"},
+                "chunk_id": {"type": "string", "description": "Optional chunk ID"},
+                "external_ref": {"type": "string", "description": "Optional path or URL"},
+                "snippet": {"type": "string", "description": "Optional supporting excerpt"},
+                "line_start": {"type": "integer", "description": "Optional start line"},
+                "line_end": {"type": "integer", "description": "Optional end line"},
+                "weight": {
+                    "type": "number",
+                    "default": 1.0,
+                    "minimum": 0.0,
+                    "maximum": 1.0,
+                    "description": "Evidence weight",
+                },
+            },
+            "required": ["memory_id", "evidence_type"],
+        },
+    },
+    {
+        "name": "rlm_memory_supersede",
+        "description": "Mark one Memory V2 record as superseded by another. Accepts legacy memory IDs if migration maps exist.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "old_memory_id": {"type": "string", "description": "Legacy or V2 memory ID being replaced"},
+                "new_memory_id": {"type": "string", "description": "Legacy or V2 replacement memory ID"},
+                "reason": {"type": "string", "description": "Optional supersession reason"},
+            },
+            "required": ["old_memory_id", "new_memory_id"],
+        },
+    },
+    {
+        "name": "rlm_memory_verify",
+        "description": "Verify whether a Memory V2 record still has valid supporting evidence.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "memory_id": {"type": "string", "description": "Legacy or V2 memory ID"},
+                "mark_stale_if_missing": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Mark memory stale when all evidence is invalid",
                 },
             },
             "required": ["memory_id"],
@@ -1647,6 +1684,58 @@ Note: Changing status to COMPLETED/FAILED sets completedAt automatically.""",
             "required": ["swarm_id", "task_id"],
         },
     },
+    {
+        "name": "rlm_task_unclaim",
+        "description": """Unclaim a task, returning it to PENDING status.
+
+Use this to recover tasks that are stuck (claimed but not progressing).
+The task will be available for any agent to claim again.""",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "swarm_id": {
+                    "type": "string",
+                    "description": "Swarm ID",
+                },
+                "task_id": {
+                    "type": "string",
+                    "description": "Task ID to unclaim",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Reason for unclaiming (optional)",
+                },
+            },
+            "required": ["swarm_id", "task_id"],
+        },
+    },
+    {
+        "name": "rlm_task_recover",
+        "description": """Find and recover stuck tasks in a swarm.
+
+A task is considered stuck if it's CLAIMED or IN_PROGRESS but hasn't been
+updated within the threshold. Use dry_run=true to preview before recovering.""",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "swarm_id": {
+                    "type": "string",
+                    "description": "Swarm ID",
+                },
+                "stuck_threshold_minutes": {
+                    "type": "integer",
+                    "default": 30,
+                    "description": "Minutes after which a task is considered stuck",
+                },
+                "dry_run": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "If true, only report stuck tasks without recovering",
+                },
+            },
+            "required": ["swarm_id"],
+        },
+    },
     # ============ Document Sync Tools ============
     {
         "name": "rlm_upload_document",
@@ -2131,6 +2220,10 @@ Tasks have owners, priorities, acceptance criteria, and evidence requirements.""
                     "items": {"type": "string"},
                     "description": "Context references (URLs, file paths)",
                 },
+                "context_query": {
+                    "type": "string",
+                    "description": "Auto-fetch relevant docs via rlm_context_query and add to context_refs (e.g., 'JWT authentication patterns')",
+                },
                 "evidence_required": {
                     "type": "array",
                     "items": {"type": "object"},
@@ -2162,6 +2255,11 @@ Creates a feature (N1) with automatic N2 workstreams: API, FRONTEND, QA, BUGFIX_
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "Workstream types to create (defaults to standard set)",
+                },
+                "workstream_owners": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                    "description": "Map of workstream type to owner (e.g., {'API': 'dev1', 'FRONTEND': 'dev2'})",
                 },
             },
             "required": ["swarm_id", "title", "description", "owner"],
@@ -2369,11 +2467,17 @@ Soft delete archives the task. Hard delete removes permanently (requires policy 
         "name": "rlm_htask_recommend_batch",
         "description": """Get recommended batch of N3 tasks ready to work on.
 
-Returns prioritized list of unblocked, pending N3 tasks.""",
+Returns prioritized list of unblocked, pending N3 tasks. Filter by feature_id or workstream_type for focused recommendations.""",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "swarm_id": {"type": "string", "description": "Swarm ID"},
+                "feature_id": {"type": "string", "description": "Filter to tasks under this N1 feature"},
+                "workstream_type": {
+                    "type": "string",
+                    "enum": ["API", "FRONTEND", "QA", "BUGFIX_HARDENING", "DEPLOY_PROD_VERIFY", "DATA", "SECURITY", "DOCUMENTATION", "CUSTOM", "OTHER"],
+                    "description": "Filter to tasks in this workstream type",
+                },
                 "limit": {
                     "type": "integer",
                     "default": 5,
