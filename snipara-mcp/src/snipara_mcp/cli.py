@@ -3,12 +3,16 @@
 Snipara CLI - Unified command-line interface.
 
 Usage:
-    snipara init           # Initialize Snipara in current directory
-    snipara login          # Sign in via browser (OAuth Device Flow)
-    snipara logout         # Clear stored tokens
-    snipara status         # Show current auth status
-    snipara upload <file>  # Upload a document
-    snipara query <text>   # Quick test query
+    snipara init              # Initialize Snipara in current directory
+    snipara login             # Sign in via browser (OAuth Device Flow)
+    snipara logout            # Clear stored tokens
+    snipara status            # Show current auth status
+    snipara upload <file>     # Upload a document
+    snipara sync [dir]        # Sync all docs from a directory
+    snipara query <text>      # Quick test query
+    snipara remember <text>   # Store a memory
+    snipara recall <query>    # Recall memories
+    snipara version           # Show version info
 """
 
 import asyncio
@@ -18,7 +22,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import httpx
 import typer
@@ -37,6 +41,11 @@ app = typer.Typer(
     no_args_is_help=True,
     add_completion=False,
 )
+tools_app = typer.Typer(
+    help="Inspect and call MCP tools exposed by a Snipara project",
+    no_args_is_help=True,
+)
+app.add_typer(tools_app, name="tools")
 
 
 # ANSI colors for terminal output
@@ -88,6 +97,113 @@ def print_error(text: str) -> None:
 # =============================================================================
 # Helper Functions
 # =============================================================================
+
+
+def resolve_project_slug(slug: Optional[str]) -> str:
+    """Resolve the project slug from CLI arg, git remote, or cwd name."""
+    if slug:
+        return slug
+
+    git_remote = get_git_remote()
+    if git_remote:
+        return slugify(git_remote)
+
+    return slugify(Path.cwd().name)
+
+
+def load_auth_header() -> str | None:
+    """Load auth header value from env or stored OAuth tokens."""
+    api_key = os.environ.get("SNIPARA_API_KEY")
+    if api_key:
+        return api_key
+
+    tokens = load_tokens()
+    if not tokens:
+        return None
+
+    matching = next(iter(tokens.values()))
+    if matching.get("access_token"):
+        return f"Bearer {matching['access_token']}"
+
+    return None
+
+
+def build_auth_headers(auth_header: str) -> dict[str, str]:
+    """Build HTTP headers for Snipara auth."""
+    headers = {"Content-Type": "application/json"}
+    if auth_header.startswith("Bearer"):
+        headers["Authorization"] = auth_header
+    else:
+        headers["X-API-Key"] = auth_header
+    return headers
+
+
+def decode_result_payload(payload: Any) -> Any:
+    """Decode JSON content blocks when the MCP response wraps text payloads."""
+    if not isinstance(payload, dict):
+        return payload
+
+    content = payload.get("content")
+    if not isinstance(content, list) or len(content) != 1:
+        return payload
+
+    first = content[0]
+    if first.get("type") != "text":
+        return payload
+
+    text = first.get("text", "")
+    if not isinstance(text, str):
+        return payload
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return text
+
+
+async def call_mcp_jsonrpc(
+    api_url: str,
+    project_slug: str,
+    auth_header: str,
+    method: str,
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    """Send a JSON-RPC request to the MCP proxy endpoint."""
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(
+            f"{api_url}/mcp/{project_slug}",
+            headers=build_auth_headers(auth_header),
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": method,
+                "params": params,
+            },
+        )
+        response.raise_for_status()
+        payload = response.json()
+
+    if "error" in payload:
+        raise RuntimeError(payload["error"].get("message", "Unknown MCP error"))
+
+    return payload
+
+
+async def call_mcp_tool(
+    api_url: str,
+    project_slug: str,
+    auth_header: str,
+    tool_name: str,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    """Call an MCP tool over JSON-RPC."""
+    return await call_mcp_jsonrpc(
+        api_url,
+        project_slug,
+        auth_header,
+        "tools/call",
+        {"name": tool_name, "arguments": arguments},
+    )
 
 
 def detect_project_type() -> dict:
@@ -398,7 +514,7 @@ def init(
         print_step(2, "Authentication")
         if api_key:
             auth_header = api_key
-            print(f"   Using SNIPARA_API_KEY from environment")
+            print("   Using SNIPARA_API_KEY from environment")
         else:
             tokens = load_tokens()
             if tokens:
@@ -721,6 +837,365 @@ def query(
             raise typer.Exit(1)
 
     asyncio.run(_query())
+
+
+@app.command()
+def sync(
+    directory: Path = typer.Argument(
+        Path("."),
+        help="Directory to sync (default: current)",
+        exists=True,
+        dir_okay=True,
+        file_okay=False,
+    ),
+    slug: Optional[str] = typer.Option(None, "--slug", "-s", help="Project slug"),
+    pattern: str = typer.Option("**/*.md", "--pattern", "-p", help="Glob pattern for files"),
+    dry_run: bool = typer.Option(False, "--dry-run", "-n", help="Preview without uploading"),
+) -> None:
+    """Sync all documents from a directory to Snipara."""
+
+    async def _sync() -> None:
+        api_url = os.environ.get("SNIPARA_API_URL", "https://api.snipara.com")
+
+        # Determine slug
+        project_slug = slug
+        if not project_slug:
+            git_remote = get_git_remote()
+            if git_remote:
+                project_slug = slugify(git_remote)
+            else:
+                project_slug = slugify(Path.cwd().name)
+
+        # Get auth
+        auth_header = None
+        api_key = os.environ.get("SNIPARA_API_KEY")
+        if api_key:
+            auth_header = api_key
+        else:
+            tokens = load_tokens()
+            if tokens:
+                matching = next(iter(tokens.values()))
+                if matching.get("access_token"):
+                    auth_header = f"Bearer {matching['access_token']}"
+
+        if not auth_header:
+            print_error("Not authenticated. Run `snipara login` first.")
+            raise typer.Exit(1)
+
+        # Find files
+        files = list(directory.glob(pattern))
+        if not files:
+            print_warning(f"No files matching '{pattern}' in {directory}")
+            raise typer.Exit(0)
+
+        print(f"Found {len(files)} file(s) matching '{pattern}'")
+        print(f"Project: {color(project_slug, Colors.GREEN)}")
+        print()
+
+        if dry_run:
+            print(color("DRY RUN - No changes will be made", Colors.YELLOW))
+            print()
+
+        uploaded = 0
+        failed = 0
+        total_tokens = 0
+
+        for file in files:
+            try:
+                content = file.read_text()
+                rel_path = str(file.relative_to(directory))
+                tokens_est = len(content) // 4
+                total_tokens += tokens_est
+
+                if dry_run:
+                    print(f"  Would upload: {rel_path} (~{tokens_est:,} tokens)")
+                    uploaded += 1
+                else:
+                    success = await upload_document_async(api_url, project_slug, rel_path, content, auth_header)
+                    if success:
+                        print_success(f"{rel_path} (~{tokens_est:,} tokens)")
+                        uploaded += 1
+                    else:
+                        print_error(f"Failed: {rel_path}")
+                        failed += 1
+            except Exception as e:
+                print_error(f"Error reading {file}: {e}")
+                failed += 1
+
+        print()
+        print(f"Total: {uploaded} uploaded, {failed} failed (~{total_tokens:,} tokens)")
+
+    asyncio.run(_sync())
+
+
+@app.command()
+def remember(
+    text: str = typer.Argument(..., help="Memory text to store"),
+    memory_type: str = typer.Option("fact", "--type", "-t", help="Memory type: fact, decision, learning, preference, todo, context"),
+    category: Optional[str] = typer.Option(None, "--category", "-c", help="Category for grouping"),
+    slug: Optional[str] = typer.Option(None, "--slug", "-s", help="Project slug"),
+) -> None:
+    """Store a memory for future recall."""
+
+    async def _remember() -> None:
+        api_url = os.environ.get("SNIPARA_API_URL", "https://api.snipara.com")
+
+        # Determine slug
+        project_slug = slug
+        if not project_slug:
+            git_remote = get_git_remote()
+            if git_remote:
+                project_slug = slugify(git_remote)
+            else:
+                project_slug = slugify(Path.cwd().name)
+
+        # Get auth
+        auth_header = None
+        api_key = os.environ.get("SNIPARA_API_KEY")
+        if api_key:
+            auth_header = api_key
+        else:
+            tokens = load_tokens()
+            if tokens:
+                matching = next(iter(tokens.values()))
+                if matching.get("access_token"):
+                    auth_header = f"Bearer {matching['access_token']}"
+
+        if not auth_header:
+            print_error("Not authenticated. Run `snipara login` first.")
+            raise typer.Exit(1)
+
+        # Call rlm_remember
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                headers = {"Content-Type": "application/json"}
+                if auth_header.startswith("Bearer"):
+                    headers["Authorization"] = auth_header
+                else:
+                    headers["X-API-Key"] = auth_header
+
+                args = {"text": text, "type": memory_type}
+                if category:
+                    args["category"] = category
+
+                response = await client.post(
+                    f"{api_url}/mcp/{project_slug}",
+                    headers=headers,
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/call",
+                        "params": {"name": "rlm_remember", "arguments": args},
+                    },
+                )
+
+                if response.status_code == 200:
+                    result = response.json()
+                    if "result" in result:
+                        print_success(f"Memory stored (type: {memory_type})")
+                        if category:
+                            print(f"   Category: {category}")
+                    elif "error" in result:
+                        print_error(result["error"].get("message", "Unknown error"))
+                        raise typer.Exit(1)
+                else:
+                    print_error(f"HTTP {response.status_code}")
+                    raise typer.Exit(1)
+        except httpx.HTTPError as e:
+            print_error(str(e))
+            raise typer.Exit(1)
+
+    asyncio.run(_remember())
+
+
+@app.command()
+def recall(
+    query: str = typer.Argument(..., help="Query to search memories"),
+    memory_type: Optional[str] = typer.Option(None, "--type", "-t", help="Filter by memory type"),
+    limit: int = typer.Option(5, "--limit", "-l", help="Max memories to return"),
+    slug: Optional[str] = typer.Option(None, "--slug", "-s", help="Project slug"),
+) -> None:
+    """Recall memories matching a query."""
+
+    async def _recall() -> None:
+        api_url = os.environ.get("SNIPARA_API_URL", "https://api.snipara.com")
+
+        # Determine slug
+        project_slug = slug
+        if not project_slug:
+            git_remote = get_git_remote()
+            if git_remote:
+                project_slug = slugify(git_remote)
+            else:
+                project_slug = slugify(Path.cwd().name)
+
+        # Get auth
+        auth_header = None
+        api_key = os.environ.get("SNIPARA_API_KEY")
+        if api_key:
+            auth_header = api_key
+        else:
+            tokens = load_tokens()
+            if tokens:
+                matching = next(iter(tokens.values()))
+                if matching.get("access_token"):
+                    auth_header = f"Bearer {matching['access_token']}"
+
+        if not auth_header:
+            print_error("Not authenticated. Run `snipara login` first.")
+            raise typer.Exit(1)
+
+        print(f"Searching: {color(query, Colors.BLUE)}")
+        print()
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                headers = {"Content-Type": "application/json"}
+                if auth_header.startswith("Bearer"):
+                    headers["Authorization"] = auth_header
+                else:
+                    headers["X-API-Key"] = auth_header
+
+                args = {"query": query, "limit": limit}
+                if memory_type:
+                    args["type"] = memory_type
+
+                response = await client.post(
+                    f"{api_url}/mcp/{project_slug}",
+                    headers=headers,
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/call",
+                        "params": {"name": "rlm_recall", "arguments": args},
+                    },
+                )
+
+                if response.status_code == 200:
+                    result = response.json()
+                    if "result" in result:
+                        # Parse the result
+                        content = result["result"].get("content", [])
+                        for item in content:
+                            if item.get("type") == "text":
+                                try:
+                                    data = json.loads(item["text"])
+                                    memories = data.get("memories", [])
+                                    print(f"Found {len(memories)} memory(ies)")
+                                    print()
+                                    for mem in memories:
+                                        mtype = mem.get("type", "unknown")
+                                        mtext = mem.get("text", "")[:200]
+                                        relevance = mem.get("relevance", 0)
+                                        print(color(f"[{mtype}]", Colors.BOLD), f"(relevance: {relevance:.2f})")
+                                        print(f"  {mtext}")
+                                        print()
+                                except Exception:
+                                    print(item["text"])
+                    elif "error" in result:
+                        print_error(result["error"].get("message", "Unknown error"))
+                        raise typer.Exit(1)
+                else:
+                    print_error(f"HTTP {response.status_code}")
+                    raise typer.Exit(1)
+        except httpx.HTTPError as e:
+            print_error(str(e))
+            raise typer.Exit(1)
+
+    asyncio.run(_recall())
+
+
+@tools_app.command("list")
+def tools_list(
+    slug: Optional[str] = typer.Option(None, "--slug", "-s", help="Project slug"),
+    json_output: bool = typer.Option(False, "--json", help="Print full tool definitions as JSON"),
+) -> None:
+    """List all MCP tools currently exposed by the project endpoint."""
+
+    async def _tools_list() -> None:
+        api_url = os.environ.get("SNIPARA_API_URL", "https://api.snipara.com")
+        project_slug = resolve_project_slug(slug)
+        auth_header = load_auth_header()
+
+        if not auth_header:
+            print_error("Not authenticated. Run `snipara login` first.")
+            raise typer.Exit(1)
+
+        try:
+            response = await call_mcp_jsonrpc(api_url, project_slug, auth_header, "tools/list", {})
+        except (httpx.HTTPError, RuntimeError) as err:
+            print_error(str(err))
+            raise typer.Exit(1)
+
+        tools = response.get("result", {}).get("tools", [])
+        if json_output:
+            print(json.dumps(tools, indent=2))
+            return
+
+        print(f"Project: {project_slug}")
+        print(f"Available MCP tools: {len(tools)}")
+        print()
+
+        for tool in tools:
+            description = (tool.get("description") or "").splitlines()[0]
+            print(f"- {tool.get('name', '<unknown>')}")
+            if description:
+                print(f"  {description}")
+
+    asyncio.run(_tools_list())
+
+
+@tools_app.command("call")
+def tools_call(
+    tool_name: str = typer.Argument(..., help="Tool name to execute"),
+    args_json: str = typer.Option("{}", "--args", "-a", help="Tool arguments as a JSON object"),
+    slug: Optional[str] = typer.Option(None, "--slug", "-s", help="Project slug"),
+) -> None:
+    """Call any MCP tool by name with JSON arguments."""
+
+    async def _tools_call() -> None:
+        api_url = os.environ.get("SNIPARA_API_URL", "https://api.snipara.com")
+        project_slug = resolve_project_slug(slug)
+        auth_header = load_auth_header()
+
+        if not auth_header:
+            print_error("Not authenticated. Run `snipara login` first.")
+            raise typer.Exit(1)
+
+        try:
+            arguments = json.loads(args_json)
+        except json.JSONDecodeError as err:
+            print_error(f"Invalid JSON for --args: {err}")
+            raise typer.Exit(1)
+
+        if not isinstance(arguments, dict):
+            print_error("Tool arguments must decode to a JSON object.")
+            raise typer.Exit(1)
+
+        try:
+            response = await call_mcp_tool(api_url, project_slug, auth_header, tool_name, arguments)
+        except (httpx.HTTPError, RuntimeError) as err:
+            print_error(str(err))
+            raise typer.Exit(1)
+
+        payload = decode_result_payload(response.get("result", {}))
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+
+    asyncio.run(_tools_call())
+
+
+@app.command()
+def version() -> None:
+    """Show version information."""
+    from . import __version__
+
+    print(f"Snipara CLI v{__version__}")
+    print()
+    print("Components:")
+    print(f"  snipara-mcp: {__version__}")
+    print(f"  Python: {sys.version.split()[0]}")
+    print()
+    print("More info: https://snipara.com")
 
 
 # =============================================================================

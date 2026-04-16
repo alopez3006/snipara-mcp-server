@@ -11,7 +11,7 @@ MCP server for [Snipara](https://snipara.com) - Context optimization and Agent i
 - **Snipara** - Context optimization with 90% token reduction
 - **Snipara Agents** - Multi-agent memory, swarms, and coordination
 
-**v2.1.0:** Full tool parity with FastAPI server - all 43 tools now available via stdio transport!
+The stdio package keeps full parity with the hosted backend contract. The packaged tool surface is generated from `apps/mcp-server/src/mcp/tool_defs.py`.
 
 Works with any MCP-compatible client including Claude Desktop, Cursor, Windsurf, Claude Code, Gemini, GPT, and more.
 
@@ -184,101 +184,16 @@ Get your API key and project ID from [snipara.com/dashboard](https://snipara.com
 
 ## Available Tools
 
-### Primary Tool
+The current stdio surface includes:
 
-- **`rlm_context_query`** - Query optimized context from your documentation
-  - `query`: Your question (required)
-  - `max_tokens`: Token budget (default: 4000)
-  - `search_mode`: `keyword`, `semantic`, or `hybrid` (default: hybrid)
+- Retrieval and query tools such as `rlm_context_query`, `rlm_ask`, `rlm_search`, `rlm_multi_query`, `rlm_plan`, `rlm_get_chunk`, `rlm_load_document`, and `rlm_load_project`
+- Shared context and template tools such as `rlm_shared_context`, `rlm_list_templates`, `rlm_get_template`, `rlm_list_collections`, and `rlm_upload_shared_document`
+- Summary and memory automation tools such as `rlm_store_summary`, `rlm_remember_if_novel`, `rlm_end_of_task_commit`, `rlm_memory_compact`, `rlm_journal_append`, and `rlm_tenant_profile_get`
+- Swarm and coordination tools such as `rlm_swarm_create`, `rlm_claim`, `rlm_state_poll`, `rlm_task_bulk_create`, `rlm_task_reassign`, and `rlm_agent_status`
+- Hierarchical task tools such as `rlm_htask_create_feature`, `rlm_htask_tree`, `rlm_htask_recommend_batch`, `rlm_htask_policy_update`, and `rlm_htask_audit_trail`
+- Decision and operational tools such as `rlm_decision_create`, `rlm_index_health`, `rlm_search_analytics`, `rlm_query_trends`, and `rlm_request_access`
 
-### Search & Navigation
-
-- **`rlm_search`** - Regex pattern search
-- **`rlm_sections`** - List all document sections
-- **`rlm_read`** - Read specific line ranges
-- **`rlm_stats`** - Documentation statistics
-
-### Advanced (Pro+)
-
-- **`rlm_decompose`** - Break complex queries into sub-queries
-- **`rlm_multi_query`** - Execute multiple queries with shared token budget
-- **`rlm_multi_project_query`** - Query across multiple projects in your team
-
-### Session Context
-
-- **`rlm_ask`** - Query with LLM-generated answer (uses server-side model)
-- **`rlm_inject`** - Set context for subsequent queries
-- **`rlm_context`** - Show current context
-- **`rlm_clear_context`** - Clear context
-- **`rlm_settings`** - Get project settings from dashboard
-- **`rlm_plan`** - Generate implementation plan from query
-
-### Summary Storage (New in 1.8.0)
-
-- **`rlm_store_summary`** - Store conversation summary for persistence
-  - `summary`: Summary text (required)
-  - `conversation_id`: Optional conversation identifier
-  - `metadata`: Optional JSON metadata
-- **`rlm_get_summaries`** - Retrieve stored summaries
-  - `conversation_id`: Filter by conversation
-  - `limit`: Max results (default: 10)
-- **`rlm_delete_summary`** - Delete a stored summary by ID
-
-### Document Management (New in 1.2.0)
-
-- **`rlm_upload_document`** - Upload or update a single document
-  - `path`: Document path (e.g., "CLAUDE.md")
-  - `content`: Document content (markdown)
-- **`rlm_sync_documents`** - Bulk sync multiple documents
-  - `documents`: Array of `{path, content}` objects
-  - `delete_missing`: Delete docs not in list (default: false)
-
-### Shared Context (Team+)
-
-- **`rlm_shared_context`** - Get merged context from linked shared collections
-  - `max_tokens`: Token budget (default: 4000)
-  - `categories`: Filter by priority (MANDATORY, BEST_PRACTICES, GUIDELINES, REFERENCE)
-- **`rlm_list_templates`** - List available prompt templates
-- **`rlm_get_template`** - Get and render a prompt template with variables
-
-### Agent Memory (New in 1.6.0)
-
-Persistent semantic memory for AI agents with confidence decay over time.
-
-- **`rlm_remember`** - Store a memory for later semantic recall
-  - `content`: Memory content (required)
-  - `type`: `fact`, `decision`, `learning`, `preference`, `todo`, `context`
-  - `scope`: `agent`, `project`, `team`, `user`
-  - `category`: Optional grouping
-  - `ttl_days`: Days until expiration (null = permanent)
-- **`rlm_recall`** - Semantically recall relevant memories
-  - `query`: Search query (required)
-  - `type`, `scope`, `category`: Filters
-  - `limit`: Max results (default: 5)
-  - `min_relevance`: Minimum score 0-1 (default: 0.5)
-- **`rlm_memories`** - List memories with filters
-- **`rlm_forget`** - Delete memories by ID or filter
-
-### Multi-Agent Swarms (New in 1.6.0)
-
-Coordinate multiple AI agents with shared state, resource claims, and task queues.
-
-- **`rlm_swarm_create`** - Create a new agent swarm
-  - `name`: Swarm name (required)
-  - `max_agents`: Maximum agents (default: 10)
-- **`rlm_swarm_join`** - Join an existing swarm
-  - `swarm_id`, `agent_id`: Required
-  - `role`: `coordinator`, `worker`, `observer`
-- **`rlm_claim`** - Claim exclusive access to a resource (file, function, module)
-  - Auto-expires to prevent deadlocks
-- **`rlm_release`** - Release a claimed resource
-- **`rlm_state_get`** / **`rlm_state_set`** - Read/write shared swarm state
-  - Optimistic locking with `expected_version`
-- **`rlm_broadcast`** - Send event to all agents in swarm
-- **`rlm_task_create`** - Create task in distributed queue
-  - Supports `depends_on` for task dependencies
-- **`rlm_task_claim`** - Claim next available task (respects dependencies)
-- **`rlm_task_complete`** - Mark task as completed or failed
+For the full current list of tools, required parameters, optional parameters, and descriptions, see the generated [MCP Tool Index](https://github.com/Snipara/snipara-server/blob/main/docs/reference/MCP_TOOL_INDEX.md).
 
 ## Example Usage
 
@@ -334,6 +249,33 @@ curl -X POST "https://api.snipara.com/v1/YOUR_PROJECT_ID/webhook/sync" \
 ```
 
 See [GitHub Action example](https://github.com/Snipara/snipara-server#github-action-example) for automated sync on push.
+
+## Development and Validation
+
+The packaged MCP contract is generated from the hosted backend source of truth at `apps/mcp-server/src/mcp/tool_defs.py`.
+
+When backend MCP tools change, regenerate the packaged contract before committing:
+
+```bash
+uv run --project apps/mcp-server python scripts/sync_snipara_mcp_contract.py
+```
+
+For deterministic local validation, use Python 3.11, which matches CI:
+
+```bash
+cd apps/mcp-server/snipara-mcp
+python3.11 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
+ruff check src/snipara_mcp tests
+pytest tests -v --tb=short
+python -m build
+```
+
+Repository CI now validates both:
+
+- backend MCP tests in `apps/mcp-server/tests/`
+- package-local lint, tests, and wheel/sdist builds in `apps/mcp-server/snipara-mcp/`
 
 ## Upgrading
 
@@ -449,54 +391,18 @@ rlm = RLM(model="claude-sonnet-4-20250514", tools=tools)
 
 ### Available Tools (Programmatic API)
 
-When using `get_snipara_tools()`, the following tools are returned:
+When using `get_snipara_tools()`, the programmatic wrappers now expose the full hosted `rlm_*` contract generated from `tool_contract.py`, while preserving the legacy high-level aliases defined in `src/snipara_mcp/rlm_tools.py` (`context_query`, `remember`, `task_create`, etc.).
 
-**Context Optimization:**
-| Tool | Description |
-|------|-------------|
-| `context_query` | Query optimized context (primary tool) |
-| `ask` | Query with LLM-generated answer |
-| `sections` | List all documentation sections |
-| `search` | Regex pattern search |
-| `read` | Read specific line ranges |
-| `shared_context` | Get team best practices and standards |
-| `decompose` | Break complex queries into sub-queries |
-| `multi_query` | Execute multiple queries with shared budget |
-| `multi_project_query` | Query across multiple projects in team |
-| `stats` | Documentation statistics |
-| `list_templates` | List available prompt templates |
-| `get_template` | Get and render a prompt template |
-| `inject` | Set context for subsequent queries |
-| `context` | Show current session context |
-| `clear_context` | Clear session context |
-| `settings` | Get project settings |
-| `plan` | Generate implementation plan |
+See [`src/snipara_mcp/rlm_tools.py`](./src/snipara_mcp/rlm_tools.py) for the exact wrapper surface and signatures.
 
-**Summary Storage (New in 1.8.0):**
-| Tool | Description |
-|------|-------------|
-| `store_summary` | Store conversation summary |
-| `get_summaries` | Retrieve stored summaries |
-| `delete_summary` | Delete a stored summary |
+### CLI Tool Introspection
 
-**Agent Memory (New in 1.6.0):**
-| Tool | Description |
-|------|-------------|
-| `remember` | Store memory for semantic recall |
-| `recall` | Semantically recall memories |
-| `memories` | List memories with filters |
-| `forget` | Delete memories |
+The `snipara` CLI also exposes generic MCP inspection helpers:
 
-**Multi-Agent Swarms (New in 1.6.0):**
-| Tool | Description |
-|------|-------------|
-| `swarm_create` | Create agent swarm |
-| `swarm_join` | Join existing swarm |
-| `claim` | Claim resource access |
-| `release` | Release resource |
-| `state_get` / `state_set` | Shared state with optimistic locking |
-| `broadcast` | Send event to swarm |
-| `task_create` / `task_claim` / `task_complete` | Distributed task queue |
+```bash
+snipara tools list --slug your-project
+snipara tools call rlm_help --slug your-project --args '{"query":"session automation"}'
+```
 
 ### Environment Variables
 
@@ -510,6 +416,7 @@ export SNIPARA_API_URL="https://api.snipara.com"  # Optional
 
 | Version | Date       | Changes                                                |
 | ------- | ---------- | ------------------------------------------------------ |
+| 2.6.1   | 2026-04-16 | Contract parity, package validation, mirror hardening  |
 | 2.4.0   | 2026-02-11 | Add `snipara-init` CLI for project initialization      |
 | 2.3.1   | 2026-01-31 | Fix device flow CLI: remove misleading code entry step |
 | 1.8.1   | 2025-01-25 | Add multi_project_query for cross-project search       |

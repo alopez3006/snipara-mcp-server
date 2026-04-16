@@ -21,6 +21,7 @@ import os
 from typing import Any, TYPE_CHECKING
 
 import httpx
+from .tool_contract import TOOL_DEFINITIONS
 
 if TYPE_CHECKING:
     from rlm.backends.base import Tool
@@ -49,6 +50,7 @@ class SniparaClient:
         self.project_slug = project_slug
         self.api_url = api_url or os.environ.get("SNIPARA_API_URL", DEFAULT_API_URL)
         self._client: httpx.AsyncClient | None = None
+        self._tool_endpoint_url: str | None = None
 
     async def _get_client(self) -> httpx.AsyncClient:
         """Get or create the HTTP client."""
@@ -73,23 +75,90 @@ class SniparaClient:
             Tool result dictionary
         """
         client = await self._get_client()
-        response = await client.post(
-            f"{self.api_url}/api/mcp/{self.project_slug}",
-            json={"tool": tool_name, "params": params},
-        )
-        response.raise_for_status()
-        result = response.json()
+        last_response: httpx.Response | None = None
 
-        if not result.get("success"):
-            raise RuntimeError(result.get("error", "Unknown error"))
+        for endpoint_url in self._candidate_tool_urls():
+            response = await client.post(
+                endpoint_url,
+                json={"tool": tool_name, "params": params},
+            )
 
-        return result.get("result", {})
+            if response.status_code == 404:
+                last_response = response
+                continue
+
+            response.raise_for_status()
+            result = response.json()
+
+            if not result.get("success"):
+                raise RuntimeError(result.get("error", "Unknown error"))
+
+            self._tool_endpoint_url = endpoint_url
+            return result.get("result", {})
+
+        if last_response is not None:
+            last_response.raise_for_status()
+
+        raise RuntimeError("Unable to resolve a working Snipara MCP tool endpoint.")
+
+    def _candidate_tool_urls(self) -> list[str]:
+        """Return candidate REST endpoints for tool calls.
+
+        Prefer the hosted MCP backend endpoint and fall back to the web proxy
+        route for self-hosted or older deployments.
+        """
+        if self._tool_endpoint_url:
+            return [self._tool_endpoint_url]
+
+        base_url = self.api_url.rstrip("/")
+        candidates = [
+            f"{base_url}/v1/{self.project_slug}/mcp",
+            f"{base_url}/api/mcp/{self.project_slug}",
+        ]
+
+        deduped: list[str] = []
+        for candidate in candidates:
+            if candidate not in deduped:
+                deduped.append(candidate)
+        return deduped
 
     async def close(self) -> None:
         """Close the HTTP client."""
         if self._client:
             await self._client.aclose()
             self._client = None
+
+
+def _build_contract_handler(client: SniparaClient, tool_name: str):
+    """Create a generic handler that forwards kwargs to a hosted MCP tool."""
+
+    async def _handler(**kwargs: Any) -> dict[str, Any]:
+        return await client.call_tool(tool_name, kwargs)
+
+    _handler.__name__ = tool_name
+    return _handler
+
+
+def _build_contract_tools(Tool: type["Tool"], client: SniparaClient, legacy_tools: list["Tool"]) -> list["Tool"]:
+    """Expose the full hosted tool contract alongside the legacy alias surface."""
+    legacy_names = {tool.name for tool in legacy_tools}
+    generated_tools: list["Tool"] = []
+
+    for tool_definition in TOOL_DEFINITIONS:
+        tool_name = tool_definition["name"]
+        if tool_name in legacy_names:
+            continue
+
+        generated_tools.append(
+            Tool(
+                name=tool_name,
+                description=tool_definition["description"],
+                parameters=tool_definition["inputSchema"],
+                handler=_build_contract_handler(client, tool_name),
+            )
+        )
+
+    return generated_tools
 
 
 def get_snipara_tools(
@@ -682,51 +751,6 @@ def get_snipara_tools(
             params["older_than_days"] = older_than_days
         return await client.call_tool("rlm_forget", params)
 
-    # ============ GRAVEYARD TOOLS ============
-
-    async def bury(
-        reason: str,
-        memory_id: str | None = None,
-        content: str | None = None,
-    ) -> dict[str, Any]:
-        """Bury a memory or approach in the graveyard.
-
-        Buried entries trigger warnings during rlm_recall to prevent
-        re-suggesting abandoned approaches.
-
-        Args:
-            reason: Why this approach was abandoned (required)
-            memory_id: ID of an existing memory to bury
-            content: Description of the abandoned approach (if no memory_id)
-
-        Returns:
-            Dictionary with burial details
-        """
-        params: dict[str, Any] = {"reason": reason}
-        if memory_id:
-            params["memory_id"] = memory_id
-        if content:
-            params["content"] = content
-        return await client.call_tool("rlm_bury", params)
-
-    async def unbury(
-        memory_id: str,
-        reinstate_tier: str = "archive",
-    ) -> dict[str, Any]:
-        """Reinstate a memory from the graveyard.
-
-        Args:
-            memory_id: ID of the graveyard memory to reinstate
-            reinstate_tier: Tier to restore to (critical, daily, archive)
-
-        Returns:
-            Dictionary with reinstatement details
-        """
-        return await client.call_tool("rlm_unbury", {
-            "memory_id": memory_id,
-            "reinstate_tier": reinstate_tier,
-        })
-
     # ============ SWARM COORDINATION TOOLS ============
 
     async def swarm_create(
@@ -1085,7 +1109,7 @@ def get_snipara_tools(
         })
 
     # Build and return tool list
-    return [
+    legacy_tools = [
         Tool(
             name="context_query",
             description=(
@@ -2204,3 +2228,5 @@ def get_snipara_tools(
             handler=query_trends,
         ),
     ]
+
+    return legacy_tools + _build_contract_tools(Tool, client, legacy_tools)
