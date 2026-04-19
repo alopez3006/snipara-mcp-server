@@ -132,6 +132,9 @@ model Team {
   ssoCertificate String? @db.Text
   ssoMetadataUrl String?
 
+  // Auto-create projects when an unknown slug is queried with a team API key
+  autoCreateProjects Boolean @default(true)
+
   // Relations
   members           TeamMember[]
   invites           TeamInvite[]
@@ -327,6 +330,7 @@ model Project {
   githubRepo  String?
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
+  deletedAt   DateTime? // Soft-delete for auto-created stale projects
 
   // GitHub sync settings
   githubBranch        String?   // Branch to sync (default: main)
@@ -391,6 +395,8 @@ model Project {
   integratorClient IntegratorClient?
 
   @@unique([teamId, slug])
+  @@index([githubRepo])
+  @@index([deletedAt])
   @@map("projects")
   @@schema("tenant_snipara")
 }

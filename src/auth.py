@@ -2,24 +2,49 @@
 API key validation module.
 
 This module handles authentication for the MCP server, supporting both API keys
-and OAuth tokens. All functions that accept a project identifier support both:
-- Database ID (e.g., "cm5xyz123abc...")
-- Project slug (e.g., "snipara", "my-project")
+and OAuth tokens. Functions that accept a project identifier support THREE forms:
+- Database ID        (e.g., "cm5xyz123abc...")
+- Project slug       (e.g., "snipara", "my-project")
+- GitHub repo ref    (e.g., "owner/repo")  ← resolved against Project.githubRepo
 
-This flexibility allows users to use human-readable slugs in their MCP
-configuration URLs instead of opaque database IDs. For example:
-    https://api.snipara.com/mcp/snipara  (using slug)
-    https://api.snipara.com/mcp/cm5xyz...  (using ID)
+This flexibility lets the CLI auto-resolve a project from the local workspace
+(git remote, package.json, etc.) without any manual config.
 
-Both formats are resolved in a single database query using OR conditions
-to avoid extra round-trips.
+On the team-API-key path only (never on per-project API keys used by integrators),
+if the project does not exist yet and the team has `autoCreateProjects=true`, the
+project is auto-created under the team's plan quota.
 """
 
 import hashlib
+import re
 from datetime import UTC, datetime
 
 from .db import get_db
 from .models import Plan
+
+
+# FREE=1, PRO=5, TEAM/ENTERPRISE=unlimited (mirrors packages/shared/src/constants.ts)
+PLAN_PROJECT_LIMITS: dict[str, int | None] = {
+    "FREE": 1,
+    "PRO": 5,
+    "TEAM": None,        # unlimited
+    "ENTERPRISE": None,  # unlimited
+}
+
+
+def _parse_project_identifier(identifier: str) -> tuple[str, str | None]:
+    """
+    Parse a project identifier into (slug, github_repo).
+
+    - "owner/repo"  → ("repo", "owner/repo")
+    - "owner/repo.git" → ("repo", "owner/repo")
+    - "my-project"  → ("my-project", None)
+    - db-id         → treated as slug ("cm5xyz...", None)
+    """
+    m = re.fullmatch(r"([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(\.git)?", identifier)
+    if m:
+        return m.group(2), f"{m.group(1)}/{m.group(2)}"
+    return identifier, None
 
 
 def hash_api_key(key: str) -> str:
@@ -108,14 +133,17 @@ async def validate_api_key(api_key: str, project_id_or_slug: str) -> dict | None
             "is_integrator_project": is_integrator_project,
         }
 
-    # If no project key found, try team API key
-    # First get the project to find its team
+    # If no project key found, try team API key.
+    # Project lookup now matches id, slug, OR githubRepo ("owner/repo") so the
+    # CLI can send any of those three interchangeably.
     project = await db.project.find_first(
         where={
+            "deletedAt": None,
             "OR": [
                 {"id": project_id_or_slug},
                 {"slug": project_id_or_slug},
-            ]
+                {"githubRepo": project_id_or_slug},
+            ],
         },
         include={
             "team": {
@@ -126,27 +154,110 @@ async def validate_api_key(api_key: str, project_id_or_slug: str) -> dict | None
         },
     )
 
-    if not project:
-        return None
-
-    # Now try to find a team API key for this project's team
-    team_key_record = await db.teamapikey.find_first(
-        where={
-            "keyHash": key_hash,
-            "teamId": project.teamId,
-        },
-        include={
-            "team": {
-                "include": {
-                    "subscription": True,
-                }
+    if project:
+        team_key_record = await db.teamapikey.find_first(
+            where={
+                "keyHash": key_hash,
+                "teamId": project.teamId,
             },
-            "user": True,
-        },
-    )
+            include={
+                "team": {
+                    "include": {
+                        "subscription": True,
+                    }
+                },
+                "user": True,
+            },
+        )
 
-    if not team_key_record:
-        return None
+        if not team_key_record:
+            return None
+    else:
+        # Project does not exist. Match team key by hash alone and auto-create
+        # the project if the team allows it and is under its plan quota.
+        # This path is ONLY reached for TeamApiKey auth — integrator per-project
+        # ApiKeys were already handled above and never reach here.
+        team_key_record = await db.teamapikey.find_first(
+            where={"keyHash": key_hash},
+            include={
+                "team": {
+                    "include": {
+                        "subscription": True,
+                    }
+                },
+                "user": True,
+            },
+        )
+
+        if not team_key_record:
+            return None
+
+        if team_key_record.revokedAt:
+            return None
+        if team_key_record.expiresAt and team_key_record.expiresAt < datetime.now(UTC):
+            return None
+
+        team = team_key_record.team
+        if not team or not getattr(team, "autoCreateProjects", True):
+            return None
+
+        slug, github_repo = _parse_project_identifier(project_id_or_slug)
+        if github_repo:
+            existing_by_repo = await db.project.find_first(
+                where={
+                    "teamId": team.id,
+                    "githubRepo": github_repo,
+                    "deletedAt": None,
+                },
+                include={
+                    "team": {
+                        "include": {
+                            "subscription": True,
+                        }
+                    }
+                },
+            )
+            if existing_by_repo:
+                project = existing_by_repo
+
+        if not project:
+            effective_plan = get_effective_plan(team.subscription)
+            limit = PLAN_PROJECT_LIMITS.get(effective_plan.value)
+            if limit is not None:
+                active_count = await db.project.count(
+                    where={"teamId": team.id, "deletedAt": None}
+                )
+                if active_count >= limit:
+                    return {
+                        "id": None,
+                        "auth_type": "team_key",
+                        "access_denied": True,
+                        "quota_exceeded": True,
+                        "quota_limit": limit,
+                        "quota_plan": effective_plan.value,
+                    }
+
+            slug_collision = await db.project.find_first(
+                where={"teamId": team.id, "slug": slug, "deletedAt": None}
+            )
+            if slug_collision:
+                return None
+
+            project = await db.project.create(
+                data={
+                    "name": slug,
+                    "slug": slug,
+                    "githubRepo": github_repo,
+                    "teamId": team.id,
+                },
+                include={
+                    "team": {
+                        "include": {
+                            "subscription": True,
+                        }
+                    }
+                },
+            )
 
     # Check if team key is revoked
     if team_key_record.revokedAt:
@@ -318,20 +429,22 @@ async def get_project_with_team(project_id_or_slug: str) -> dict | None:
     Get project details including team and subscription info.
 
     Args:
-        project_id_or_slug: The project ID or slug
+        project_id_or_slug: The project ID, slug, or "owner/repo" (matched
+            against Project.githubRepo). Excludes soft-deleted projects.
 
     Returns:
         Project record with team and subscription, or None
     """
     db = await get_db()
 
-    # Try by ID first, then by slug
     project = await db.project.find_first(
         where={
+            "deletedAt": None,
             "OR": [
                 {"id": project_id_or_slug},
                 {"slug": project_id_or_slug},
-            ]
+                {"githubRepo": project_id_or_slug},
+            ],
         },
         include={
             "team": {
@@ -390,15 +503,17 @@ async def validate_oauth_token(token: str, project_id_or_slug: str) -> dict | No
     # Hash the token to compare with stored hash
     token_hash = hash_api_key(token)
 
-    # Find the OAuth token by hash and project (matching either id or slug)
+    # Find the OAuth token by hash and project (matching id, slug, or githubRepo)
     oauth_token = await db.oauthtoken.find_first(
         where={
             "accessTokenHash": token_hash,
             "project": {
+                "deletedAt": None,
                 "OR": [
                     {"id": project_id_or_slug},
                     {"slug": project_id_or_slug},
-                ]
+                    {"githubRepo": project_id_or_slug},
+                ],
             },
         },
         include={
@@ -562,13 +677,15 @@ async def get_project_settings(project_id_or_slug: str) -> dict | None:
     """
     db = await get_db()
 
-    # Find by ID or slug
+    # Find by ID, slug, or githubRepo (excluding soft-deleted)
     project = await db.project.find_first(
         where={
+            "deletedAt": None,
             "OR": [
                 {"id": project_id_or_slug},
                 {"slug": project_id_or_slug},
-            ]
+                {"githubRepo": project_id_or_slug},
+            ],
         },
         include=None,  # No relations needed, just the project fields
     )
