@@ -75,14 +75,15 @@ def _filter_sentry_event(event: dict) -> dict:
 
 
 # Initialize Sentry if DSN is configured
-if settings.sentry_dsn:
+sentry_dsn = (settings.sentry_dsn or "").strip()
+if sentry_dsn and "://" in sentry_dsn:
     try:
         import sentry_sdk
         from sentry_sdk.integrations.fastapi import FastApiIntegration
         from sentry_sdk.integrations.starlette import StarletteIntegration
 
         sentry_sdk.init(
-            dsn=settings.sentry_dsn,
+            dsn=sentry_dsn,
             environment=settings.environment,
             traces_sample_rate=0.1 if settings.environment == "production" else 1.0,
             integrations=[
@@ -94,6 +95,8 @@ if settings.sentry_dsn:
         logger.info("Sentry error tracking initialized")
     except ImportError:
         logger.warning("Sentry DSN configured but sentry-sdk not installed")
+    except Exception as exc:
+        logger.warning("Sentry error tracking disabled: %s", exc)
 else:
     logger.debug("Sentry DSN not configured - error tracking disabled")
 

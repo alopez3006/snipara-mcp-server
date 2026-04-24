@@ -1,9 +1,14 @@
 """Snipara MCP Server - Context optimization for LLMs."""
 
-from .server import main
-
-__version__ = "2.4.0"
+__version__ = "2.6.1"
 __all__ = ["main", "get_snipara_tools"]
+
+
+def main(*args, **kwargs):
+    """Run the MCP server without importing server dependencies at package import time."""
+    from .server import main as _main
+
+    return _main(*args, **kwargs)
 
 
 def get_snipara_tools(*args, **kwargs):

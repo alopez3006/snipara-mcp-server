@@ -1,8 +1,9 @@
 """Tests for snipara_mcp.rlm_tools endpoint resolution."""
 
-from pathlib import Path
+import importlib
 import sys
 import types
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -14,8 +15,11 @@ SNIPARA_MCP_SRC = PROJECT_ROOT / "snipara-mcp/src"
 if str(SNIPARA_MCP_SRC) not in sys.path:
     sys.path.insert(0, str(SNIPARA_MCP_SRC))
 
-from snipara_mcp.rlm_tools import SniparaClient, get_snipara_tools
-from snipara_mcp.tool_contract import TOOL_DEFINITIONS
+rlm_tools = importlib.import_module("snipara_mcp.rlm_tools")
+tool_contract = importlib.import_module("snipara_mcp.tool_contract")
+SniparaClient = rlm_tools.SniparaClient
+get_snipara_tools = rlm_tools.get_snipara_tools
+TOOL_DEFINITIONS = tool_contract.TOOL_DEFINITIONS
 
 
 class FakeTool:
