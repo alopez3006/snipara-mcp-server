@@ -71,34 +71,46 @@ class TestReplContextWithDocs:
                 "",
                 "Authentication uses JWT tokens.",
                 "Tokens expire after 24 hours.",
+                "Refresh tokens rotate on every login to keep long-running sessions safe.",
+                "Middleware validates user scopes before protected handlers run.",
                 "",
                 "# API Reference",
                 "",
                 "The API supports REST and GraphQL.",
                 "All endpoints require authentication.",
+                "Responses use consistent JSON envelopes for success and error states.",
             ],
             sections=[
                 Section(
                     id="s1",
                     title="Auth Guide",
-                    content="Authentication uses JWT tokens.\nTokens expire after 24 hours.",
+                    content=(
+                        "Authentication uses JWT tokens.\n"
+                        "Tokens expire after 24 hours.\n"
+                        "Refresh tokens rotate on every login to keep long-running sessions safe.\n"
+                        "Middleware validates user scopes before protected handlers run."
+                    ),
                     start_line=1,
-                    end_line=4,
+                    end_line=6,
                     level=1,
                 ),
                 Section(
                     id="s2",
                     title="API Reference",
-                    content="The API supports REST and GraphQL.\nAll endpoints require authentication.",
-                    start_line=6,
-                    end_line=9,
+                    content=(
+                        "The API supports REST and GraphQL.\n"
+                        "All endpoints require authentication.\n"
+                        "Responses use consistent JSON envelopes for success and error states."
+                    ),
+                    start_line=8,
+                    end_line=12,
                     level=1,
                 ),
             ],
             files=["docs/auth.md", "docs/api.md"],
             file_boundaries={
-                "docs/auth.md": (0, 4),
-                "docs/api.md": (5, 9),
+                "docs/auth.md": (0, 6),
+                "docs/api.md": (7, 12),
             },
         )
 
