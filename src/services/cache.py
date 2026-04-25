@@ -35,10 +35,17 @@ async def get_redis():
     return _redis
 
 
-def _generate_cache_key(project_id: str, query: str, max_tokens: int) -> str:
+def _generate_cache_key(
+    project_id: str,
+    query: str,
+    max_tokens: int,
+    variant: str | None = None,
+) -> str:
     """Generate a cache key for a query."""
     # Normalize query (lowercase, strip whitespace)
     normalized_query = query.lower().strip()
+    if variant:
+        normalized_query = f"{normalized_query}::{variant}"
 
     # Create hash of normalized query
     query_hash = hashlib.sha256(normalized_query.encode()).hexdigest()[:16]
@@ -60,7 +67,12 @@ class QueryCache:
         """
         self.project_id = project_id
 
-    async def get(self, query: str, max_tokens: int) -> dict[str, Any] | None:
+    async def get(
+        self,
+        query: str,
+        max_tokens: int,
+        variant: str | None = None,
+    ) -> dict[str, Any] | None:
         """Get cached result for a query.
 
         Args:
@@ -75,7 +87,7 @@ class QueryCache:
             return None
 
         try:
-            cache_key = _generate_cache_key(self.project_id, query, max_tokens)
+            cache_key = _generate_cache_key(self.project_id, query, max_tokens, variant)
             cached = await redis.get(cache_key)
 
             if cached:
@@ -95,6 +107,7 @@ class QueryCache:
         max_tokens: int,
         result: dict[str, Any],
         ttl: int | None = None,
+        variant: str | None = None,
     ) -> bool:
         """Cache a query result.
 
@@ -112,7 +125,7 @@ class QueryCache:
             return False
 
         try:
-            cache_key = _generate_cache_key(self.project_id, query, max_tokens)
+            cache_key = _generate_cache_key(self.project_id, query, max_tokens, variant)
             ttl = ttl or self.DEFAULT_TTL
 
             await redis.setex(
@@ -219,7 +232,12 @@ class SimilarQueryCache:
         self.project_id = project_id
         self.base_cache = QueryCache(project_id)
 
-    async def get(self, query: str, max_tokens: int) -> tuple[dict[str, Any] | None, bool]:
+    async def get(
+        self,
+        query: str,
+        max_tokens: int,
+        variant: str | None = None,
+    ) -> tuple[dict[str, Any] | None, bool]:
         """Get cached result, including similar query matches.
 
         Args:
@@ -230,7 +248,7 @@ class SimilarQueryCache:
             Tuple of (cached result, is_exact_match)
         """
         # First try exact match
-        exact_result = await self.base_cache.get(query, max_tokens)
+        exact_result = await self.base_cache.get(query, max_tokens, variant=variant)
         if exact_result:
             return exact_result, True
 
@@ -246,6 +264,7 @@ class SimilarQueryCache:
         max_tokens: int,
         result: dict[str, Any],
         ttl: int | None = None,
+        variant: str | None = None,
     ) -> bool:
         """Cache a query result.
 
@@ -258,7 +277,7 @@ class SimilarQueryCache:
         Returns:
             True if cached successfully
         """
-        return await self.base_cache.set(query, max_tokens, result, ttl)
+        return await self.base_cache.set(query, max_tokens, result, ttl, variant=variant)
 
 
 # Factory function

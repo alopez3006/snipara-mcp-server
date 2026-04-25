@@ -7,13 +7,16 @@ and provides various query tools.
 
 import asyncio
 import hashlib
+import json
 import logging
 import re
 import time
 import uuid
 from collections import deque
+from datetime import UTC, datetime
 from typing import Any
 
+from .config import settings
 from .db import get_db
 
 # Phase 4 Refactor: Import from extracted core module
@@ -33,6 +36,7 @@ from .engine.core import (
     is_list_query,
     is_numbered_section,
 )
+from .engine.handlers.base import HandlerContext
 
 # Phase 3 Refactor: Import extracted handlers
 # These are available for integration - handlers are extracted but methods
@@ -45,13 +49,19 @@ from .engine.scoring import (
     STOP_WORDS,
 )
 from .engine.scoring import (
+    adjust_score_for_query_intent as _adjust_score_for_query_intent,
+)
+from .engine.scoring import (
+    calculate_keyword_score as _calculate_keyword_score_extracted,
+)
+from .engine.scoring import (
+    compute_keyword_weights as _compute_keyword_weights,
+)
+from .engine.scoring import (
     stem_keyword as _stem_keyword,
 )
 from .engine.scoring.constants import (
     CONCEPTUAL_PREFIXES as _CONCEPTUAL_PREFIXES,
-)
-from .engine.scoring.constants import (
-    GENERIC_TITLE_TERMS as _GENERIC_TITLE_TERMS,
 )
 from .engine.scoring.constants import (
     HYBRID_BALANCED as _HYBRID_BALANCED,
@@ -116,22 +126,37 @@ from .services.agent_limits import (
 from .services.agent_memory import (
     delete_memories,
     list_memories,
+    remember_if_novel,
+    resolve_review_status_for_source,
     semantic_recall,
     store_memories_bulk,
     store_memory,
 )
+from .services.agent_memory import (
+    invalidate_memory_v2 as invalidate_memory,
+)
+from .services.agent_memory import (
+    supersede_memory_v2 as supersede_memory,
+)
+from .services.binary_parsers import SUPPORTED_BINARY_FORMATS, get_rag_ready_document_content
+from .services.cache import get_cache
 from .services.chunker import get_chunker
+from .services.code_graph import CodeGraphQueryService
 from .services.embeddings import get_light_embeddings_service
 from .services.query_router import route_query
 from .services.shared_context import (
     DocumentCategory,
     allocate_shared_context_budget,
     compute_context_hash,
+    create_shared_collection,
     create_shared_document,
+    get_collection_documents,
     get_shared_prompt_templates,
+    link_shared_collection_to_project,
     list_shared_collections,
     load_project_shared_context,
     merge_shared_context_with_project_docs,
+    unlink_shared_collection_from_project,
 )
 from .services.swarm_coordinator import (
     acquire_claim,
@@ -204,10 +229,46 @@ AUTO_DECOMPOSE_PLANS = {Plan.PRO, Plan.TEAM, Plan.ENTERPRISE}
 # Auto-decompose detection heuristics
 AUTO_DECOMPOSE_MIN_WORDS = 50  # Queries longer than this may be decomposed
 AUTO_DECOMPOSE_COMPARISON_KEYWORDS = {"vs", "versus", "compare", "comparison", "difference", "differences", "between"}
+AUTO_DECOMPOSE_SIMPLE_COMPARISON_MAX_WORDS = 12
+AUTO_DECOMPOSE_COMPLEX_COMPARISON_MARKERS = {
+    ",",
+    ";",
+    " then ",
+    " also ",
+    " plus ",
+    " as well as ",
+    " while ",
+    " whereas ",
+    " tradeoff ",
+    " trade-off ",
+}
 AUTO_DECOMPOSE_CONJUNCTION_PATTERNS = [
     r"\band\b.*\band\b",  # Multiple "and" conjunctions
     r"\bor\b.*\bor\b",  # Multiple "or" conjunctions
 ]
+
+
+def _is_simple_comparison_query(query: str) -> bool:
+    """Detect short binary comparison queries that should stay as one retrieval."""
+    query_lower = query.lower()
+    words = re.findall(r"\b[\w-]+\b", query_lower)
+
+    if len(words) > AUTO_DECOMPOSE_SIMPLE_COMPARISON_MAX_WORDS:
+        return False
+
+    if not any(kw in words for kw in AUTO_DECOMPOSE_COMPARISON_KEYWORDS):
+        return False
+
+    if query.count("?") > 1:
+        return False
+
+    if query_lower.count(" and ") > 1 or query_lower.count(" or ") > 1:
+        return False
+
+    if any(marker in query_lower for marker in AUTO_DECOMPOSE_COMPLEX_COMPARISON_MARKERS):
+        return False
+
+    return True
 
 
 def _should_auto_decompose(query: str) -> bool:
@@ -218,12 +279,17 @@ def _should_auto_decompose(query: str) -> bool:
     - Multiple question marks (asking multiple questions)
     - Contains comparison keywords (vs, compare, difference)
     - Contains multiple conjunctions joining distinct concepts
+    - Short binary comparisons stay as a single retrieval because direct
+      hybrid search ranks them better than broad term splitting
 
     Returns:
         True if the query should be auto-decomposed
     """
     query_lower = query.lower()
     words = query_lower.split()
+
+    if _is_simple_comparison_query(query):
+        return False
 
     # Check word count
     if len(words) >= AUTO_DECOMPOSE_MIN_WORDS:
@@ -255,6 +321,10 @@ READ_TOOLS = {
     ToolName.RLM_SECTIONS,
     ToolName.RLM_READ,
     ToolName.RLM_CONTEXT_QUERY,
+    ToolName.RLM_CODE_CALLERS,
+    ToolName.RLM_CODE_IMPORTS,
+    ToolName.RLM_CODE_NEIGHBORS,
+    ToolName.RLM_CODE_SHORTEST_PATH,
     ToolName.RLM_DECOMPOSE,
     ToolName.RLM_MULTI_QUERY,
     ToolName.RLM_PLAN,
@@ -275,6 +345,14 @@ READ_TOOLS = {
     ToolName.RLM_REPL_CONTEXT,
     # Phase 14: Pass-by-Reference
     ToolName.RLM_GET_CHUNK,
+    # Phase 15: Decision Log
+    ToolName.RLM_DECISION_QUERY,
+    # Phase 16: Index Health & Analytics (Sprint 3)
+    ToolName.RLM_INDEX_HEALTH,
+    ToolName.RLM_INDEX_RECOMMENDATIONS,
+    ToolName.RLM_REINDEX,
+    ToolName.RLM_SEARCH_ANALYTICS,
+    ToolName.RLM_QUERY_TRENDS,
 }
 
 # WRITE_TOOLS: Available to EDITOR and above
@@ -284,22 +362,40 @@ WRITE_TOOLS = {
     ToolName.RLM_STORE_SUMMARY,
     ToolName.RLM_DELETE_SUMMARY,
     ToolName.RLM_REMEMBER,
+    ToolName.RLM_MEMORY_INVALIDATE,
+    ToolName.RLM_MEMORY_SUPERSEDE,
     ToolName.RLM_FORGET,
+    ToolName.RLM_MEMORY_INVALIDATE,
+    ToolName.RLM_MEMORY_ATTACH_SOURCE,
+    ToolName.RLM_MEMORY_SUPERSEDE,
+    ToolName.RLM_MEMORY_VERIFY,
     ToolName.RLM_UPLOAD_DOCUMENT,
     ToolName.RLM_SYNC_DOCUMENTS,
+    ToolName.RLM_REINDEX,
     ToolName.RLM_STATE_SET,
     ToolName.RLM_BROADCAST,
     ToolName.RLM_TASK_COMPLETE,
-}
-
-# ADMIN_TOOLS: Available to ADMIN only
-ADMIN_TOOLS = {
-    ToolName.RLM_SWARM_CREATE,
+    # Phase 15: Decision Log
+    ToolName.RLM_DECISION_CREATE,
+    ToolName.RLM_DECISION_SUPERSEDE,
+    # Swarm worker tools - agents need EDITOR to participate in swarms
     ToolName.RLM_SWARM_JOIN,
     ToolName.RLM_CLAIM,
     ToolName.RLM_RELEASE,
     ToolName.RLM_TASK_CREATE,
     ToolName.RLM_TASK_BULK_CREATE,
+    ToolName.RLM_AGENT_STATUS,  # Agents need EDITOR to check their status
+    ToolName.RLM_SWARM_LEAVE,  # Remove agent from swarm
+    ToolName.RLM_SWARM_MEMBERS,  # List swarm agents
+    ToolName.RLM_TASK_REASSIGN,  # Reassign tasks
+    # Swarm creation - moved from ADMIN to allow integrator clients to create swarms
+    ToolName.RLM_SWARM_CREATE,
+}
+
+# ADMIN_TOOLS: Available to ADMIN only
+# Only swarm config updates and cross-project queries require ADMIN
+ADMIN_TOOLS = {
+    ToolName.RLM_SWARM_UPDATE,  # Config changes require admin
     ToolName.RLM_MULTI_PROJECT_QUERY,
 }
 
@@ -313,10 +409,18 @@ NONE_ALLOWED_TOOLS = {
 AGENT_TOOLS = {
     # Memory tools
     ToolName.RLM_REMEMBER,
+    ToolName.RLM_REMEMBER_IF_NOVEL,
+    ToolName.RLM_END_OF_TASK_COMMIT,
     ToolName.RLM_REMEMBER_BULK,
     ToolName.RLM_RECALL,
     ToolName.RLM_MEMORIES,
+    ToolName.RLM_MEMORY_INVALIDATE,
+    ToolName.RLM_MEMORY_SUPERSEDE,
     ToolName.RLM_FORGET,
+    ToolName.RLM_MEMORY_INVALIDATE,
+    ToolName.RLM_MEMORY_ATTACH_SOURCE,
+    ToolName.RLM_MEMORY_SUPERSEDE,
+    ToolName.RLM_MEMORY_VERIFY,
     # Swarm tools
     ToolName.RLM_SWARM_CREATE,
     ToolName.RLM_SWARM_JOIN,
@@ -331,6 +435,32 @@ AGENT_TOOLS = {
     ToolName.RLM_TASK_BULK_CREATE,
     ToolName.RLM_TASK_CLAIM,
     ToolName.RLM_TASK_COMPLETE,
+    ToolName.RLM_TASK_LIST,
+    ToolName.RLM_TASK_STATS,
+    ToolName.RLM_TASK_EVENTS,
+    ToolName.RLM_AGENT_STATUS,
+    ToolName.RLM_SWARM_LEAVE,
+    ToolName.RLM_SWARM_MEMBERS,
+    ToolName.RLM_SWARM_UPDATE,
+    ToolName.RLM_TASK_REASSIGN,
+    # Hierarchical Task tools
+    ToolName.RLM_HTASK_CREATE,
+    ToolName.RLM_HTASK_CREATE_FEATURE,
+    ToolName.RLM_HTASK_GET,
+    ToolName.RLM_HTASK_TREE,
+    ToolName.RLM_HTASK_UPDATE,
+    ToolName.RLM_HTASK_BLOCK,
+    ToolName.RLM_HTASK_UNBLOCK,
+    ToolName.RLM_HTASK_COMPLETE,
+    ToolName.RLM_HTASK_VERIFY_CLOSURE,
+    ToolName.RLM_HTASK_CLOSE,
+    ToolName.RLM_HTASK_DELETE,
+    ToolName.RLM_HTASK_RECOMMEND_BATCH,
+    ToolName.RLM_HTASK_POLICY_GET,
+    ToolName.RLM_HTASK_POLICY_UPDATE,
+    ToolName.RLM_HTASK_METRICS,
+    ToolName.RLM_HTASK_AUDIT_TRAIL,
+    ToolName.RLM_HTASK_CHECKPOINT_DELTA,
 }
 
 # Default system instructions injected into every query response
@@ -415,6 +545,7 @@ _MULTI_HOP_PATTERNS = (
 # Local definitions removed - see src/engine/core/*.py
 
 logger = logging.getLogger(__name__)
+INDEXABLE_BINARY_FORMATS_SQL = ", ".join(f"'{format_name}'" for format_name in SUPPORTED_BINARY_FORMATS)
 
 
 class RLMEngine:
@@ -459,9 +590,109 @@ class RLMEngine:
                 auto_inject_context=settings.get("auto_inject_context", False),
                 memory_save_on_commit=settings.get("memory_save_on_commit", False),
                 memory_inject_types=settings.get("memory_inject_types", ["DECISION", "LEARNING"]),
+                memory_injection_enabled=settings.get("memory_injection_enabled", False),
+                memory_exclude_session_checkpoints=settings.get(
+                    "memory_exclude_session_checkpoints", False
+                ),
+                memory_min_confidence=settings.get("memory_min_confidence", 0.2),
+                memory_recall_query=settings.get("memory_recall_query"),
+                memory_auto_recall_on_session_start=settings.get(
+                    "memory_auto_recall_on_session_start", True
+                ),
+                memory_auto_recall_on_resume=settings.get(
+                    "memory_auto_recall_on_resume", True
+                ),
+                memory_deduplicate_before_write=settings.get(
+                    "memory_deduplicate_before_write", True
+                ),
+                memory_end_of_task_commit_enabled=settings.get(
+                    "memory_end_of_task_commit_enabled", True
+                ),
+                memory_workspace_profile_enabled=settings.get(
+                    "memory_workspace_profile_enabled", True
+                ),
+                memory_novelty_threshold=settings.get("memory_novelty_threshold", 0.92),
+                memory_resume_window_minutes=settings.get("memory_resume_window_minutes", 180),
+                memory_review_mode=settings.get("memory_review_mode", "AUTO"),
+                memory_capture_tool_results=settings.get("memory_capture_tool_results", True),
+                memory_capture_failures=settings.get("memory_capture_failures", False),
             )
         else:
             self.settings = ProjectSettings()
+
+        # Handler context cache (lazily initialized)
+        self._cached_handler_ctx: HandlerContext | None = None
+
+    async def _get_handler_ctx(self) -> "HandlerContext":
+        """Get or create handler context for this engine instance."""
+        from .engine.handlers.base import HandlerContext
+
+        db = await get_db()
+        return HandlerContext(
+            project_id=self.project_id,
+            user_id=self.user_id,
+            team_id=None,  # TODO: Add team_id to RLMEngine if needed
+            plan=self.plan,
+            access_level=self.access_level,
+            settings=self.settings,
+            session_context=self.session_context,
+            tips_shown=self._tips_shown_this_session,
+            index=self.index,
+            db=db,
+        )
+
+    async def _get_code_graph_query_service(self) -> CodeGraphQueryService:
+        """Create a code graph query service with a live Prisma client."""
+        db = await get_db()
+        return CodeGraphQueryService(db, self.project_id)
+
+    def _get_context_query_cache(self):
+        """Return the hosted context-query cache when the plan supports it."""
+        if self.plan not in CACHE_ENABLED_PLANS:
+            return None
+        return get_cache(self.project_id)
+
+    def _build_context_query_cache_variant(
+        self,
+        *,
+        requested_search_mode: str,
+        effective_search_mode: SearchMode,
+        prefer_summaries: bool,
+        include_shared_context: bool,
+        shared_context_budget_percent: int,
+        include_all_tiers: bool,
+        auto_decompose: bool,
+        expand_query: bool,
+    ) -> str:
+        """Build a stable cache variant key for exact query replays."""
+        instructions = self.settings.system_instructions or DEFAULT_SYSTEM_INSTRUCTIONS
+        payload = {
+            "requested_search_mode": requested_search_mode,
+            "effective_search_mode": effective_search_mode.value,
+            "prefer_summaries": prefer_summaries,
+            "include_shared_context": include_shared_context,
+            "shared_context_budget_percent": shared_context_budget_percent,
+            "include_all_tiers": include_all_tiers,
+            "auto_decompose": auto_decompose,
+            "expand_query": expand_query,
+            "session_context_hash": hashlib.sha256(self.session_context.encode()).hexdigest()[:12]
+            if self.session_context
+            else "",
+            "tips_shown": self._tips_shown_this_session,
+            "instructions_hash": hashlib.sha256(instructions.encode()).hexdigest()[:12],
+        }
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+    async def _invalidate_context_query_cache(self) -> None:
+        """Best-effort cache invalidation after document mutations."""
+        cache = self._get_context_query_cache()
+        if cache is None:
+            return
+
+        try:
+            await cache.invalidate()
+        except Exception as exc:
+            logger.warning(f"Failed to invalidate context query cache: {exc}")
 
     def _generate_chunk_id(self, section_id: str) -> str:
         """Generate a unique chunk ID for pass-by-reference retrieval.
@@ -518,21 +749,32 @@ class RLMEngine:
         project = await db.project.find_unique(where={"id": self.project_id})
         project_slug = project.slug if project else None
 
+        # Exclude soft-deleted documents
         documents = await db.document.find_many(
-            where={"projectId": self.project_id},
+            where={
+                "projectId": self.project_id,
+                "deletedAt": None,
+                "OR": [
+                    {"kind": "DOC"},
+                    {"kind": "BINARY", "format": {"in": list(SUPPORTED_BINARY_FORMATS)}},
+                ],
+            },
             order={"path": "asc"},
         )
 
         self.index = DocumentationIndex()
 
         for doc in documents:
+            content = get_rag_ready_document_content(doc)
+            if not content:
+                continue
             self.index.files.append(doc.path)
-            doc_lines = doc.content.split("\n")
+            doc_lines = content.split("\n")
 
             # Track line offset for this file
             line_offset = len(self.index.lines)
             self.index.lines.extend(doc_lines)
-            self.index.total_chars += len(doc.content)
+            self.index.total_chars += len(content)
 
             # Track file boundaries for rlm_load_document
             self.index.file_boundaries[doc.path] = (line_offset, line_offset + len(doc_lines))
@@ -754,10 +996,14 @@ class RLMEngine:
         db = await get_db()
         try:
             count = await db.query_raw(
-                """
+                f"""
                 SELECT COUNT(*) as count FROM document_chunks dc
                 JOIN documents d ON dc."documentId" = d.id
                 WHERE d."projectId" = $1
+                  AND (
+                    d.kind = 'DOC'
+                    OR (d.kind = 'BINARY' AND COALESCE(d.format, '') IN ({INDEXABLE_BINARY_FORMATS_SQL}))
+                  )
                 LIMIT 1
                 """,
                 self.project_id,
@@ -770,7 +1016,11 @@ class RLMEngine:
         return self._chunks_available
 
     async def _calculate_semantic_scores_from_chunks(
-        self, query: str, limit: int = 50, min_similarity: float = 0.3
+        self,
+        query: str,
+        limit: int = 50,
+        min_similarity: float = 0.3,
+        tier_filter: list[str] | None = None,
     ) -> dict[str, float]:
         """Calculate semantic scores using pre-computed chunk embeddings via pgvector.
 
@@ -781,6 +1031,8 @@ class RLMEngine:
             query: The search query string.
             limit: Maximum number of chunks to retrieve.
             min_similarity: Minimum cosine similarity threshold (0-1).
+            tier_filter: Optional list of tiers to include (e.g., ["HOT", "WARM"]).
+                         If None, searches all tiers.
 
         Returns:
             Dictionary mapping section IDs to their semantic similarity scores (0-1).
@@ -799,6 +1051,7 @@ class RLMEngine:
                 query=query,
                 limit=limit,
                 min_similarity=min_similarity,
+                tier_filter=tier_filter,
             )
 
             # Map chunk results back to section IDs by line overlap
@@ -853,6 +1106,10 @@ class RLMEngine:
             ToolName.RLM_SECTIONS: self._handle_sections,
             ToolName.RLM_READ: self._handle_read,
             ToolName.RLM_CONTEXT_QUERY: self._handle_context_query,
+            ToolName.RLM_CODE_CALLERS: self._handle_code_callers,
+            ToolName.RLM_CODE_IMPORTS: self._handle_code_imports,
+            ToolName.RLM_CODE_NEIGHBORS: self._handle_code_neighbors,
+            ToolName.RLM_CODE_SHORTEST_PATH: self._handle_code_shortest_path,
             # Phase 4.5: Recursive Context Tools
             ToolName.RLM_DECOMPOSE: self._handle_decompose,
             ToolName.RLM_MULTI_QUERY: self._handle_multi_query,
@@ -867,13 +1124,36 @@ class RLMEngine:
             ToolName.RLM_LIST_TEMPLATES: self._handle_list_templates,
             ToolName.RLM_GET_TEMPLATE: self._handle_get_template,
             ToolName.RLM_LIST_COLLECTIONS: self._handle_list_collections,
+            ToolName.RLM_CREATE_COLLECTION: self._handle_create_collection,
+            ToolName.RLM_GET_COLLECTION_DOCUMENTS: self._handle_get_collection_documents,
+            ToolName.RLM_LINK_COLLECTION: self._handle_link_collection,
+            ToolName.RLM_UNLINK_COLLECTION: self._handle_unlink_collection,
             ToolName.RLM_UPLOAD_SHARED_DOCUMENT: self._handle_upload_shared_document,
             # Phase 8.2: Agent Memory Tools
             ToolName.RLM_REMEMBER: self._handle_remember,
+            ToolName.RLM_REMEMBER_IF_NOVEL: self._handle_remember_if_novel,
+            ToolName.RLM_END_OF_TASK_COMMIT: self._handle_end_of_task_commit,
             ToolName.RLM_REMEMBER_BULK: self._handle_remember_bulk,
             ToolName.RLM_RECALL: self._handle_recall,
             ToolName.RLM_MEMORIES: self._handle_memories,
+            ToolName.RLM_MEMORY_INVALIDATE: self._handle_memory_invalidate,
+            ToolName.RLM_MEMORY_SUPERSEDE: self._handle_memory_supersede,
             ToolName.RLM_FORGET: self._handle_forget,
+            ToolName.RLM_MEMORY_INVALIDATE: self._handle_memory_invalidate,
+            ToolName.RLM_MEMORY_ATTACH_SOURCE: self._handle_memory_attach_source,
+            ToolName.RLM_MEMORY_SUPERSEDE: self._handle_memory_supersede,
+            ToolName.RLM_MEMORY_VERIFY: self._handle_memory_verify,
+            # Phase 18: Daily Journal Tools
+            ToolName.RLM_JOURNAL_APPEND: self._handle_journal_append,
+            ToolName.RLM_JOURNAL_GET: self._handle_journal_get,
+            ToolName.RLM_JOURNAL_SUMMARIZE: self._handle_journal_summarize,
+            # Phase 20: Memory Tiers & Compaction
+            ToolName.RLM_SESSION_MEMORIES: self._handle_session_memories,
+            ToolName.RLM_MEMORY_COMPACT: self._handle_memory_compact,
+            ToolName.RLM_MEMORY_DAILY_BRIEF: self._handle_memory_daily_brief,
+            # Phase 20: Tenant Profile
+            ToolName.RLM_TENANT_PROFILE_CREATE: self._handle_tenant_profile_create,
+            ToolName.RLM_TENANT_PROFILE_GET: self._handle_tenant_profile_get,
             # Phase 9.1: Multi-Agent Swarm Tools
             ToolName.RLM_SWARM_CREATE: self._handle_swarm_create,
             ToolName.RLM_SWARM_JOIN: self._handle_swarm_join,
@@ -888,6 +1168,22 @@ class RLMEngine:
             ToolName.RLM_TASK_BULK_CREATE: self._handle_task_bulk_create,
             ToolName.RLM_TASK_CLAIM: self._handle_task_claim,
             ToolName.RLM_TASK_COMPLETE: self._handle_task_complete,
+            ToolName.RLM_TASKS: self._handle_tasks,
+            ToolName.RLM_TASK_LIST: self._handle_task_list,
+            ToolName.RLM_TASK_STATS: self._handle_task_stats,
+            ToolName.RLM_TASK_EVENTS: self._handle_task_events,
+            ToolName.RLM_AGENT_STATUS: self._handle_agent_status,
+            ToolName.RLM_SWARM_LEAVE: self._handle_swarm_leave,
+            ToolName.RLM_SWARM_MEMBERS: self._handle_swarm_members,
+            ToolName.RLM_SWARM_UPDATE: self._handle_swarm_update,
+            ToolName.RLM_TASK_REASSIGN: self._handle_task_reassign,
+            ToolName.RLM_TASK_DELETE: self._handle_task_delete,
+            ToolName.RLM_TASK_UPDATE: self._handle_task_update,
+            ToolName.RLM_TASK_UNCLAIM: self._handle_task_unclaim,
+            ToolName.RLM_TASK_RECOVER: self._handle_task_recover,
+            # Phase 19: Agent Profiles (Soul Layer)
+            ToolName.RLM_AGENT_PROFILE_GET: self._handle_agent_profile_get,
+            ToolName.RLM_AGENT_PROFILE_UPDATE: self._handle_agent_profile_update,
             # Phase 10: Document Sync Tools
             ToolName.RLM_UPLOAD_DOCUMENT: self._handle_upload_document,
             ToolName.RLM_SYNC_DOCUMENTS: self._handle_sync_documents,
@@ -902,6 +1198,34 @@ class RLMEngine:
             ToolName.RLM_REPL_CONTEXT: self._handle_repl_context,
             # Phase 14: Pass-by-Reference
             ToolName.RLM_GET_CHUNK: self._handle_get_chunk,
+            # Phase 15: Decision Log
+            ToolName.RLM_DECISION_CREATE: self._handle_decision_create,
+            ToolName.RLM_DECISION_QUERY: self._handle_decision_query,
+            ToolName.RLM_DECISION_SUPERSEDE: self._handle_decision_supersede,
+            # Phase 16: Index Health & Search Analytics (Sprint 3)
+            ToolName.RLM_INDEX_HEALTH: self._handle_index_health,
+            ToolName.RLM_INDEX_RECOMMENDATIONS: self._handle_index_recommendations,
+            ToolName.RLM_REINDEX: self._handle_reindex,
+            ToolName.RLM_SEARCH_ANALYTICS: self._handle_search_analytics,
+            ToolName.RLM_QUERY_TRENDS: self._handle_query_trends,
+            # Phase 17: Hierarchical Tasks
+            ToolName.RLM_HTASK_CREATE: self._handle_htask_create,
+            ToolName.RLM_HTASK_CREATE_FEATURE: self._handle_htask_create_feature,
+            ToolName.RLM_HTASK_GET: self._handle_htask_get,
+            ToolName.RLM_HTASK_TREE: self._handle_htask_tree,
+            ToolName.RLM_HTASK_UPDATE: self._handle_htask_update,
+            ToolName.RLM_HTASK_BLOCK: self._handle_htask_block,
+            ToolName.RLM_HTASK_UNBLOCK: self._handle_htask_unblock,
+            ToolName.RLM_HTASK_COMPLETE: self._handle_htask_complete,
+            ToolName.RLM_HTASK_VERIFY_CLOSURE: self._handle_htask_verify_closure,
+            ToolName.RLM_HTASK_CLOSE: self._handle_htask_close,
+            ToolName.RLM_HTASK_DELETE: self._handle_htask_delete,
+            ToolName.RLM_HTASK_RECOMMEND_BATCH: self._handle_htask_recommend_batch,
+            ToolName.RLM_HTASK_POLICY_GET: self._handle_htask_policy_get,
+            ToolName.RLM_HTASK_POLICY_UPDATE: self._handle_htask_policy_update,
+            ToolName.RLM_HTASK_METRICS: self._handle_htask_metrics,
+            ToolName.RLM_HTASK_AUDIT_TRAIL: self._handle_htask_audit_trail,
+            ToolName.RLM_HTASK_CHECKPOINT_DELTA: self._handle_htask_checkpoint_delta,
         }
 
         handler = handlers.get(tool)
@@ -1073,40 +1397,68 @@ class RLMEngine:
         relevant_sections.sort(key=lambda x: x[1], reverse=True)
         top_sections = relevant_sections[:5]
 
-        # Build response
+        # Normalize scores for relevance (0-1 scale)
+        max_score = max((s for _, s in relevant_sections), default=1) if relevant_sections else 1
+
+        # Build response as structured data instead of text (better DX)
         if not top_sections:
             # Provide helpful guidance when keyword matching fails
-            response = (
-                f"No relevant documentation found for: \"{query}\"\n\n"
-                "**Tips:**\n"
-                "- `rlm_ask` uses simple keyword matching\n"
-                "- Try `rlm_context_query` for semantic search (recommended)\n"
-                "- Check indexed docs with `rlm_stats`\n"
-                "- Use `rlm_search` for regex patterns"
-            )
+            response = {
+                "query": query,
+                "sections": [],
+                "total_matches": 0,
+                "message": f"No relevant documentation found for: \"{query}\"",
+                "tips": [
+                    "rlm_ask uses simple keyword matching",
+                    "Try rlm_context_query for semantic search (recommended)",
+                    "Check indexed docs with rlm_stats",
+                    "Use rlm_search for regex patterns"
+                ],
+                "recommendation": "Use rlm_context_query for better results with semantic search"
+            }
         else:
-            response_parts = [f"**Relevant Documentation for:** {query}\n"]
+            # Build reverse lookup: line_number -> file_path
+            line_to_file: dict[int, str] = {}
+            for file_path, (start, end) in self.index.file_boundaries.items():
+                for line_idx in range(start, end):
+                    line_to_file[line_idx + 1] = file_path
 
-            if self.session_context:
-                response_parts.append(f"**Session Context:**\n{self.session_context}\n")
-
+            sections_data = []
             for section, score in top_sections:
-                response_parts.append(
-                    f"\n## {section.title} (lines {section.start_line}-{section.end_line})"
-                )
+                # Normalize score to 0-1 scale
+                relevance = round(score / max_score, 3) if max_score > 0 else 0
+
+                # Find file path for this section
+                file_path = line_to_file.get(section.start_line, "unknown")
+
                 # Truncate content if too long
                 content = (
                     section.content[:2000] + "..."
                     if len(section.content) > 2000
                     else section.content
                 )
-                response_parts.append(content)
 
-            response = "\n".join(response_parts)
+                sections_data.append({
+                    "title": section.title,
+                    "content": content,
+                    "file_path": file_path,
+                    "lines": (section.start_line, section.end_line),
+                    "relevance_score": relevance,
+                    "raw_score": score,
+                })
 
-        # Estimate tokens (rough: 4 chars per token)
-        input_tokens = len(query) // 4
-        output_tokens = len(response) // 4
+            response = {
+                "query": query,
+                "sections": sections_data,
+                "total_matches": len(relevant_sections),
+                "shown": len(top_sections),
+                "session_context_included": bool(self.session_context),
+                "recommendation": "Use rlm_context_query for semantic search with better results"
+            }
+
+        # Estimate tokens
+        input_tokens = count_tokens(query)
+        output_tokens = count_tokens(str(response))
 
         return ToolResult(data=response, input_tokens=input_tokens, output_tokens=output_tokens)
 
@@ -1154,6 +1506,13 @@ class RLMEngine:
 
         results: list[dict[str, Any]] = []
 
+        # Build reverse lookup: line_number -> file_path
+        line_to_file: dict[int, str] = {}
+        for file_path, (start, end) in self.index.file_boundaries.items():
+            for line_idx in range(start, end):
+                # line_number is 1-indexed, start/end are 0-indexed
+                line_to_file[line_idx + 1] = file_path
+
         # Execute search with timeout protection using thread pool
         def search_sync():
             """Synchronous search function to run in thread pool."""
@@ -1165,6 +1524,7 @@ class RLMEngine:
                         results.append(
                             {
                                 "line_number": i,
+                                "file_path": line_to_file.get(i, "unknown"),
                                 "content": line.strip()[:500],  # Limit content length in results
                             }
                         )
@@ -1262,6 +1622,23 @@ class RLMEngine:
         if not self.index:
             return ToolResult(data="No documentation loaded", input_tokens=0, output_tokens=0)
 
+        health_snapshot: dict[str, Any] | None = None
+        try:
+            from src.services.index_health import compute_index_health
+
+            db = await get_db()
+            health = await compute_index_health(db, self.project_id)
+            health_snapshot = {
+                "indexed_documents": health.indexed_documents,
+                "unindexed_documents": health.unindexed_documents,
+                "coverage_percent": health.coverage_percent,
+                "stale_count": health.stale_count,
+                "health_score": health.health_score,
+                "health_status": health.health_status,
+            }
+        except Exception as exc:
+            logger.debug(f"rlm_stats could not load index health snapshot: {exc}")
+
         response = {
             "files_loaded": len(self.index.files),
             "total_lines": len(self.index.lines),
@@ -1269,6 +1646,11 @@ class RLMEngine:
             "sections": len(self.index.sections),
             "files": self.index.files,
             "project_id": self.project_id,
+            "index_health": health_snapshot,
+            "notes": [
+                "files_loaded/sections describe the in-memory document index loaded by the engine",
+                "index_health describes persisted chunk coverage and staleness from the database",
+            ],
         }
 
         return ToolResult(data=response, input_tokens=0, output_tokens=50)
@@ -1330,9 +1712,9 @@ class RLMEngine:
             )
 
         # Mode 3: Recommend tools based on query
-        # Include team/admin tools based on license
-        include_team = self.license.plan in ["TEAM", "ENTERPRISE"]
-        include_admin = self.license.access_level == "ADMIN"
+        # Include team/admin tools based on plan and access level
+        include_team = self.plan in [Plan.TEAM, Plan.ENTERPRISE]
+        include_admin = self.access_level == "ADMIN"
 
         recommendations = recommend_tools(
             query=query,
@@ -1424,6 +1806,98 @@ class RLMEngine:
 
         return ToolResult(data=response, input_tokens=0, output_tokens=len(content) // 4)
 
+    async def _handle_code_callers(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_code_callers - reverse call traversal for a symbol."""
+        qualified_name = params.get("qualified_name")
+        symbol_key = params.get("symbol_key")
+        if not qualified_name and not symbol_key:
+            return ToolResult(
+                data={"error": "qualified_name or symbol_key is required"},
+                input_tokens=0,
+                output_tokens=12,
+            )
+
+        service = await self._get_code_graph_query_service()
+        response = await service.get_callers(
+            qualified_name=qualified_name,
+            symbol_key=symbol_key,
+            depth=params.get("depth", 1),
+            limit=params.get("limit", 50),
+        )
+        output_tokens = len(json.dumps(response, default=str)) // 4
+        return ToolResult(data=response, input_tokens=0, output_tokens=output_tokens)
+
+    async def _handle_code_imports(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_code_imports - import traversal for code symbols or files."""
+        qualified_name = params.get("qualified_name")
+        symbol_key = params.get("symbol_key")
+        file_path = params.get("file_path")
+        if not qualified_name and not symbol_key and not file_path:
+            return ToolResult(
+                data={"error": "qualified_name, symbol_key, or file_path is required"},
+                input_tokens=0,
+                output_tokens=14,
+            )
+
+        service = await self._get_code_graph_query_service()
+        response = await service.get_imports(
+            qualified_name=qualified_name,
+            symbol_key=symbol_key,
+            file_path=file_path,
+            direction=params.get("direction", "out"),
+            limit=params.get("limit", 50),
+            include_file_nodes=params.get("include_file_nodes", False),
+        )
+        output_tokens = len(json.dumps(response, default=str)) // 4
+        return ToolResult(data=response, input_tokens=0, output_tokens=output_tokens)
+
+    async def _handle_code_neighbors(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_code_neighbors - local subgraph traversal."""
+        qualified_name = params.get("qualified_name")
+        symbol_key = params.get("symbol_key")
+        if not qualified_name and not symbol_key:
+            return ToolResult(
+                data={"error": "qualified_name or symbol_key is required"},
+                input_tokens=0,
+                output_tokens=12,
+            )
+
+        service = await self._get_code_graph_query_service()
+        response = await service.get_neighbors(
+            qualified_name=qualified_name,
+            symbol_key=symbol_key,
+            depth=params.get("depth", 2),
+            edge_kinds=params.get("edge_kinds"),
+            limit=params.get("limit", 200),
+        )
+        output_tokens = len(json.dumps(response, default=str)) // 4
+        return ToolResult(data=response, input_tokens=0, output_tokens=output_tokens)
+
+    async def _handle_code_shortest_path(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_code_shortest_path - shortest structural path in the code graph."""
+        from_qualified_name = params.get("from")
+        from_symbol_key = params.get("from_symbol_key")
+        to_qualified_name = params.get("to")
+        to_symbol_key = params.get("to_symbol_key")
+        if not (from_qualified_name or from_symbol_key) or not (to_qualified_name or to_symbol_key):
+            return ToolResult(
+                data={"error": "from/to or from_symbol_key/to_symbol_key are required"},
+                input_tokens=0,
+                output_tokens=14,
+            )
+
+        service = await self._get_code_graph_query_service()
+        response = await service.get_shortest_path(
+            from_qualified_name=from_qualified_name,
+            from_symbol_key=from_symbol_key,
+            to_qualified_name=to_qualified_name,
+            to_symbol_key=to_symbol_key,
+            edge_kinds=params.get("edge_kinds"),
+            max_hops=params.get("max_hops", 6),
+        )
+        output_tokens = len(json.dumps(response, default=str)) // 4
+        return ToolResult(data=response, input_tokens=0, output_tokens=output_tokens)
+
     async def _handle_context_query(self, params: dict[str, Any]) -> ToolResult:
         """
         Handle rlm_context_query - the main context optimization tool.
@@ -1448,9 +1922,15 @@ class RLMEngine:
         Returns:
             ToolResult with ContextQueryResult containing ranked sections
         """
+        import time
+        timing_start = time.perf_counter()
+        timing: dict[str, int] = {}
+
         original_query = params.get("query", "")
-        # Expand abstract queries with concrete keywords for better search recall
-        query = _expand_query(original_query)
+        expand_query = params.get("expand_query", self.settings.enrich_prompts)
+        # Query expansion is opt-in because project-specific expansions can
+        # contaminate results when applied blindly across unrelated workspaces.
+        query = _expand_query(original_query) if expand_query else original_query
 
         # Use dashboard settings as defaults, allow request params to override
         max_tokens = params.get("max_tokens", self.settings.max_tokens_per_query)
@@ -1466,8 +1946,74 @@ class RLMEngine:
         # Disable by setting auto_decompose=False in params
         auto_decompose = params.get("auto_decompose", True)
 
+        # Tier filtering: by default only search HOT and WARM tiers
+        # Set include_all_tiers=True to include COLD and ARCHIVE
+        include_all_tiers = params.get("include_all_tiers", False)
+        tier_filter = None if include_all_tiers else ["HOT", "WARM"]
+        cache_max_tokens = max_tokens
+
+        # Parse search mode
+        try:
+            search_mode = SearchMode(search_mode_str)
+        except ValueError:
+            search_mode = SearchMode.KEYWORD
+
+        requested_search_mode = (
+            search_mode_str.value if isinstance(search_mode_str, SearchMode) else str(search_mode_str)
+        )
+
+        # Plan gating: Free users can only use keyword search
+        original_search_mode = search_mode
+        if search_mode != SearchMode.KEYWORD and self.plan not in SEMANTIC_SEARCH_PLANS:
+            logger.info(
+                f"Downgrading search mode from {search_mode.value} to keyword "
+                f"(plan: {self.plan.value})"
+            )
+            search_mode = SearchMode.KEYWORD
+
+        # Plan gating: prefer_summaries requires Pro+ plan
+        if prefer_summaries and self.plan not in SUMMARY_STORAGE_PLANS:
+            prefer_summaries = False
+
+        # Plan gating: shared context requires Pro+ plan
+        if include_shared_context and self.plan not in SHARED_CONTEXT_PLANS:
+            include_shared_context = False
+
+        cache_variant = None
+        query_cache = None
+        if not return_references:
+            query_cache = self._get_context_query_cache()
+            if query_cache is not None:
+                cache_variant = self._build_context_query_cache_variant(
+                    requested_search_mode=requested_search_mode,
+                    effective_search_mode=search_mode,
+                    prefer_summaries=prefer_summaries,
+                    include_shared_context=include_shared_context,
+                    shared_context_budget_percent=shared_context_budget_percent,
+                    include_all_tiers=include_all_tiers,
+                    auto_decompose=auto_decompose,
+                    expand_query=bool(expand_query),
+                )
+                cached_result = await query_cache.get(
+                    query,
+                    cache_max_tokens,
+                    variant=cache_variant,
+                )
+                if cached_result:
+                    cache_lookup_ms = int((time.perf_counter() - timing_start) * 1000)
+                    cached_timing = dict(cached_result.get("timing") or {})
+                    cached_timing["cache_lookup_ms"] = cache_lookup_ms
+                    cached_timing["total_ms"] = cache_lookup_ms
+                    cached_result["timing"] = cached_timing
+                    self._tips_shown_this_session = True
+                    logger.info(f"Context query cache hit: {query[:100]}...")
+                    return ToolResult(
+                        data=cached_result,
+                        input_tokens=count_tokens(query),
+                        output_tokens=int(cached_result.get("total_tokens", 0)),
+                    )
+
         # Check if we should auto-decompose this query (Pro+ only)
-        decomposed = False
         sub_queries_used: list[str] = []
 
         if (
@@ -1519,17 +2065,16 @@ class RLMEngine:
                     if all_sections:
                         # Sort by relevance and apply token budget
                         all_sections.sort(key=lambda s: s.relevance_score, reverse=True)
-                        decomposed = True
 
                         # Build final result with merged sections
-                        total_tokens = sum(s.tokens for s in all_sections)
+                        total_tokens = sum(s.token_count for s in all_sections)
                         sections_within_budget: list[ContextSection] = []
                         budget_used = 0
 
                         for section in all_sections:
-                            if budget_used + section.tokens <= max_tokens:
+                            if budget_used + section.token_count <= max_tokens:
                                 sections_within_budget.append(section)
-                                budget_used += section.tokens
+                                budget_used += section.token_count
 
                         # Return decomposed result
                         result = ContextQueryResult(
@@ -1537,13 +2082,22 @@ class RLMEngine:
                             total_tokens=budget_used,
                             max_tokens=max_tokens,
                             query=query,
-                            search_mode=SearchMode(search_mode_str) if search_mode_str else SearchMode.KEYWORD,
+                            search_mode=search_mode,
                             decomposed=True,
                             sub_queries=sub_queries_used,
                         )
 
+                        result_data = result.model_dump()
+                        if query_cache is not None and cache_variant is not None:
+                            await query_cache.set(
+                                query,
+                                cache_max_tokens,
+                                result_data,
+                                variant=cache_variant,
+                            )
+
                         return ToolResult(
-                            data=result.model_dump(),
+                            data=result_data,
                             input_tokens=count_tokens(query),
                             output_tokens=budget_used,
                         )
@@ -1568,29 +2122,6 @@ class RLMEngine:
                 f"{max_tokens} → {CONCEPTUAL_QUERY_MIN_TOKENS}"
             )
             max_tokens = CONCEPTUAL_QUERY_MIN_TOKENS
-
-        # Parse search mode
-        try:
-            search_mode = SearchMode(search_mode_str)
-        except ValueError:
-            search_mode = SearchMode.KEYWORD
-
-        # Plan gating: Free users can only use keyword search
-        original_search_mode = search_mode
-        if search_mode != SearchMode.KEYWORD and self.plan not in SEMANTIC_SEARCH_PLANS:
-            logger.info(
-                f"Downgrading search mode from {search_mode.value} to keyword "
-                f"(plan: {self.plan.value})"
-            )
-            search_mode = SearchMode.KEYWORD
-
-        # Plan gating: prefer_summaries requires Pro+ plan
-        if prefer_summaries and self.plan not in SUMMARY_STORAGE_PLANS:
-            prefer_summaries = False
-
-        # Plan gating: shared context requires Pro+ plan
-        if include_shared_context and self.plan not in SHARED_CONTEXT_PLANS:
-            include_shared_context = False
 
         # First-query tool tips injection
         # Inject tips only on the first query of this session to help users
@@ -1718,9 +2249,71 @@ class RLMEngine:
             except Exception as e:
                 logger.warning(f"Failed to load shared context: {e}")
 
+        # ============ ACTIVE DECISIONS ============
+        # Auto-include active CRITICAL/HIGH impact decisions in context
+        # This ensures architectural decisions are always visible when querying
+        decision_sections: list[ContextSection] = []
+        decision_tokens = 0
+
+        try:
+            from src.engine.handlers.decisions import handle_decision_query
+            from src.models.decision import DecisionQueryParams
+
+            db = await get_db()
+
+            # Query active decisions with HIGH or CRITICAL impact
+            for impact in ["CRITICAL", "HIGH"]:
+                query_params = DecisionQueryParams(
+                    status="ACTIVE",
+                    impact=impact,
+                    limit=5,  # Max 5 per impact level
+                    include_superseded=False,
+                )
+                decision_result = await handle_decision_query(
+                    db, self.project_id, query_params
+                )
+
+                for decision in decision_result.decisions:
+                    # Format decision as context section
+                    decision_content = f"""**{decision.title}** (DEC-{decision.id[-3:]})
+Impact: {decision.impact} | Scope: {decision.scope} | Owner: {decision.owner}
+
+Context: {decision.context}
+
+Decision: {decision.decision}
+
+Rationale: {decision.rationale}"""
+
+                    if decision.alternatives:
+                        decision_content += f"\n\nAlternatives considered: {', '.join(decision.alternatives)}"
+
+                    section_tokens = count_tokens(decision_content)
+                    if decision_tokens + section_tokens <= remaining_budget * 0.1:  # Max 10% for decisions
+                        decision_sections.append(
+                            ContextSection(
+                                title=f"[DECISION:{decision.impact}] {decision.title}",
+                                content=decision_content,
+                                file="decisions",
+                                lines=(0, 0),
+                                relevance_score=1.0,  # Decisions always high priority
+                                token_count=section_tokens,
+                                truncated=False,
+                            )
+                        )
+                        decision_tokens += section_tokens
+
+            if decision_sections:
+                remaining_budget -= decision_tokens
+                logger.info(
+                    f"Loaded {len(decision_sections)} active decisions "
+                    f"({decision_tokens} tokens), {remaining_budget} tokens remaining"
+                )
+        except Exception as e:
+            logger.warning(f"Failed to load decisions for context: {e}")
+
         # ============ LOCAL PROJECT SCOPE ============
         # Score and rank sections from local project
-        scored_sections = await self._score_sections(query, search_mode)
+        scored_sections = await self._score_sections(query, search_mode, tier_filter=tier_filter)
 
         # ============ CONFIDENCE-BASED EXPANSION ============
         # If top results have low scores, expand token budget and add grounding.
@@ -1953,8 +2546,36 @@ class RLMEngine:
                 removed = selected_sections.pop()
                 total_tokens -= removed.token_count
 
-        # Build result - shared context sections come FIRST
-        all_sections = shared_context_sections + selected_sections
+        # Smart routing: analyze query and recommend execution mode
+        routing_decision = route_query(query, context_tokens=total_tokens)
+        graph_context_section: ContextSection | None = None
+        graph_context_summary: str | None = None
+        if not return_references and routing_decision.recommended_tool:
+            graph_context_section = await self._build_graph_hybrid_section(
+                routing_decision.recommended_tool,
+                routing_decision.recommended_tool_arguments,
+                max_tokens=max_tokens,
+            )
+            if graph_context_section is not None:
+                while total_tokens + graph_context_section.token_count > max_tokens and selected_sections:
+                    removed = selected_sections.pop()
+                    total_tokens -= removed.token_count
+                    if len(suggestions) < 5:
+                        suggestions.append(f"{removed.title} (trimmed for code graph context)")
+
+                if total_tokens + graph_context_section.token_count <= max_tokens:
+                    total_tokens += graph_context_section.token_count
+                    graph_context_summary = graph_context_section.content
+                else:
+                    graph_context_section = None
+
+        # Build result - code graph summary first when present, then shared context, decisions, local
+        all_sections = shared_context_sections + decision_sections + selected_sections
+        if graph_context_section is not None:
+            if routing_decision.is_direct:
+                all_sections = [graph_context_section] + all_sections
+            else:
+                all_sections = all_sections + [graph_context_section]
         search_mode_downgraded = original_search_mode != search_mode
 
         # Include system instructions (custom from project or default)
@@ -1968,9 +2589,6 @@ class RLMEngine:
         if low_confidence:
             instructions = instructions + STRICT_GROUNDING_INSTRUCTIONS
             logger.info("Added grounding instructions due to low confidence results")
-
-        # Smart routing: analyze query and recommend execution mode
-        routing_decision = route_query(query, context_tokens=total_tokens)
 
         # Pass-by-reference mode: convert sections to chunk references
         section_refs: list[ContextSectionRef] = []
@@ -1997,7 +2615,6 @@ class RLMEngine:
                         start_line=section.lines[0],
                         end_line=section.lines[1],
                         level=1,
-                        parent_titles=[],
                     ),
                     file_path=section.file,
                     score=section.relevance_score * 100,
@@ -2025,6 +2642,9 @@ class RLMEngine:
                 f"{preview_tokens} preview tokens (vs {total_tokens} full tokens)"
             )
 
+        # Calculate total timing
+        timing["total_ms"] = int((time.perf_counter() - timing_start) * 1000)
+
         result = ContextQueryResult(
             sections=[] if return_references else all_sections,
             section_refs=section_refs if return_references else [],
@@ -2037,26 +2657,253 @@ class RLMEngine:
             session_context_included=session_context_included,
             suggestions=suggestions,
             summaries_used=summaries_used,
+            timing=timing,  # Include timing breakdown
             system_instructions=instructions,
             shared_context_included=len(shared_context_sections) > 0,
             shared_context_tokens=shared_context_tokens,
             first_query_tips_included=is_first_query and session_context_included,
+            # Decision log metadata
+            decisions_included=len(decision_sections),
+            decision_tokens=decision_tokens,
             # Smart routing hints
             routing_recommendation=routing_decision.mode.value,
             routing_confidence=routing_decision.confidence,
             routing_reason=routing_decision.reason,
             query_complexity=routing_decision.complexity.value,
+            recommended_tool=routing_decision.recommended_tool,
+            recommended_tool_arguments=routing_decision.recommended_tool_arguments,
+            graph_hybrid_used=graph_context_section is not None,
+            graph_context_tool=routing_decision.recommended_tool if graph_context_section else None,
+            graph_context_summary=graph_context_summary,
         )
+
+        result_data = result.model_dump()
+        if query_cache is not None and cache_variant is not None:
+            await query_cache.set(
+                query,
+                cache_max_tokens,
+                result_data,
+                variant=cache_variant,
+            )
 
         # Calculate actual token usage for billing
         input_tokens = count_tokens(query)
         output_tokens = total_tokens
 
         return ToolResult(
-            data=result.model_dump(),
+            data=result_data,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
         )
+
+    async def _build_graph_hybrid_section(
+        self,
+        tool_name: str,
+        tool_arguments: dict[str, Any],
+        *,
+        max_tokens: int,
+    ) -> ContextSection | None:
+        """Build a concise structural summary for code-graph-aware context answers."""
+        service = await self._get_code_graph_query_service()
+        compact_args = self._compact_graph_tool_arguments(tool_name, tool_arguments)
+
+        try:
+            if tool_name == ToolName.RLM_CODE_CALLERS.value:
+                payload = await service.get_callers(
+                    qualified_name=compact_args.get("qualified_name"),
+                    symbol_key=compact_args.get("symbol_key"),
+                    depth=compact_args.get("depth", 1),
+                    limit=compact_args.get("limit", 8),
+                )
+            elif tool_name == ToolName.RLM_CODE_IMPORTS.value:
+                payload = await service.get_imports(
+                    qualified_name=compact_args.get("qualified_name"),
+                    symbol_key=compact_args.get("symbol_key"),
+                    file_path=compact_args.get("file_path"),
+                    direction=compact_args.get("direction", "out"),
+                    limit=compact_args.get("limit", 12),
+                )
+            elif tool_name == ToolName.RLM_CODE_NEIGHBORS.value:
+                payload = await service.get_neighbors(
+                    qualified_name=compact_args.get("qualified_name"),
+                    symbol_key=compact_args.get("symbol_key"),
+                    depth=compact_args.get("depth", 2),
+                    edge_kinds=compact_args.get("edge_kinds"),
+                    limit=compact_args.get("limit", 16),
+                )
+            elif tool_name == ToolName.RLM_CODE_SHORTEST_PATH.value:
+                payload = await service.get_shortest_path(
+                    from_qualified_name=compact_args.get("from"),
+                    from_symbol_key=compact_args.get("from_symbol_key"),
+                    to_qualified_name=compact_args.get("to"),
+                    to_symbol_key=compact_args.get("to_symbol_key"),
+                    edge_kinds=compact_args.get("edge_kinds"),
+                    max_hops=compact_args.get("max_hops", 6),
+                )
+            else:
+                return None
+        except Exception as exc:
+            logger.warning("Code graph hybrid context failed for %s: %s", tool_name, exc)
+            return None
+
+        summary = self._render_graph_hybrid_summary(tool_name, payload)
+        if not summary:
+            return None
+
+        graph_budget = min(600, max(120, max_tokens // 4))
+        if count_tokens(summary) > graph_budget:
+            summary = self._smart_truncate(summary, graph_budget)
+
+        token_count = count_tokens(summary)
+        if token_count <= 0:
+            return None
+
+        return ContextSection(
+            title=self._graph_hybrid_title(tool_name, payload),
+            content=summary,
+            file="(code graph)",
+            lines=(0, 0),
+            relevance_score=1.0,
+            token_count=token_count,
+            truncated=False,
+        )
+
+    @staticmethod
+    def _compact_graph_tool_arguments(
+        tool_name: str, tool_arguments: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        compact_args = dict(tool_arguments or {})
+        if tool_name == ToolName.RLM_CODE_CALLERS.value:
+            compact_args["limit"] = min(int(compact_args.get("limit", 50)), 8)
+            compact_args["depth"] = min(int(compact_args.get("depth", 1)), 2)
+        elif tool_name == ToolName.RLM_CODE_IMPORTS.value:
+            compact_args["limit"] = min(int(compact_args.get("limit", 50)), 12)
+        elif tool_name == ToolName.RLM_CODE_NEIGHBORS.value:
+            compact_args["limit"] = min(int(compact_args.get("limit", 200)), 16)
+            compact_args["depth"] = min(int(compact_args.get("depth", 2)), 2)
+        elif tool_name == ToolName.RLM_CODE_SHORTEST_PATH.value:
+            compact_args["max_hops"] = min(int(compact_args.get("max_hops", 6)), 6)
+        return compact_args
+
+    @staticmethod
+    def _graph_hybrid_title(tool_name: str, payload: dict[str, Any]) -> str:
+        if tool_name == ToolName.RLM_CODE_CALLERS.value:
+            target = (payload.get("matched_targets") or [{}])[0].get("qualified_name")
+            return f"Code Graph: Callers of {target or 'target symbol'}"
+        if tool_name == ToolName.RLM_CODE_IMPORTS.value:
+            direction = payload.get("direction", "out")
+            target = (payload.get("matched_targets") or [{}])[0].get("qualified_name")
+            label = "Importers of" if direction == "in" else "Imports for"
+            return f"Code Graph: {label} {target or 'requested file'}"
+        if tool_name == ToolName.RLM_CODE_NEIGHBORS.value:
+            target = (payload.get("matched_targets") or [{}])[0].get("qualified_name")
+            return f"Code Graph: Neighborhood of {target or 'target symbol'}"
+        if tool_name == ToolName.RLM_CODE_SHORTEST_PATH.value:
+            return "Code Graph: Structural path"
+        return "Code Graph"
+
+    @staticmethod
+    def _format_graph_node(node: dict[str, Any]) -> str:
+        qualified_name = node.get("qualified_name") or node.get("symbol_key") or "(unknown)"
+        kind = node.get("kind")
+        file_path = node.get("file_path")
+        line = node.get("start_line")
+
+        meta_parts = [part for part in (kind, file_path) if part]
+        if isinstance(line, int) and line > 0:
+            meta_parts.append(f"line {line}")
+
+        if meta_parts:
+            return f"{qualified_name} [{', '.join(meta_parts)}]"
+        return str(qualified_name)
+
+    def _render_graph_hybrid_summary(self, tool_name: str, payload: dict[str, Any]) -> str:
+        if tool_name == ToolName.RLM_CODE_CALLERS.value:
+            target = (payload.get("matched_targets") or [{}])[0]
+            callers = payload.get("callers") or []
+            if not callers:
+                return (
+                    f"No callers were found for {target.get('qualified_name') or 'the target symbol'} "
+                    "in the persisted code graph."
+                )
+
+            lines = [
+                f"Target: {self._format_graph_node(target)}",
+                f"Reverse callers found: {payload.get('total_callers', len(callers))}",
+            ]
+            lines.extend(f"- {self._format_graph_node(node)}" for node in callers[:8])
+            return "\n".join(lines)
+
+        if tool_name == ToolName.RLM_CODE_IMPORTS.value:
+            targets = payload.get("matched_targets") or []
+            imports = payload.get("imports") or []
+            direction = payload.get("direction", "out")
+            subject = self._format_graph_node(targets[0]) if targets else "requested file"
+            if not imports:
+                label = "importers" if direction == "in" else "imports"
+                return f"No {label} were found for {subject} in the persisted code graph."
+
+            header = "Importers" if direction == "in" else "Imports"
+            lines = [
+                f"Target: {subject}",
+                f"{header} found: {payload.get('total_imports', len(imports))}",
+            ]
+            lines.extend(f"- {self._format_graph_node(node)}" for node in imports[:10])
+            return "\n".join(lines)
+
+        if tool_name == ToolName.RLM_CODE_NEIGHBORS.value:
+            targets = payload.get("matched_targets") or []
+            nodes = payload.get("nodes") or []
+            edges = payload.get("edges") or []
+            if not nodes:
+                return (
+                    f"No neighboring symbols were found for "
+                    f"{self._format_graph_node(targets[0]) if targets else 'the target symbol'}."
+                )
+
+            lines = [
+                f"Target: {self._format_graph_node(targets[0]) if targets else 'target symbol'}",
+                f"Neighborhood depth: {payload.get('depth', 0)}",
+                f"Nodes: {len(nodes)} | Edges: {len(edges)}",
+            ]
+            lines.extend(f"- {self._format_graph_node(node)}" for node in nodes[:8])
+            if edges:
+                lines.append("Relationships:")
+                lines.extend(
+                    f"- {edge.get('from_qualified_name') or edge.get('from_symbol_key')} "
+                    f"-[{edge.get('kind')}]-> "
+                    f"{edge.get('to_qualified_name') or edge.get('to_symbol_key')}"
+                    for edge in edges[:6]
+                )
+            return "\n".join(lines)
+
+        if tool_name == ToolName.RLM_CODE_SHORTEST_PATH.value:
+            path = payload.get("path") or []
+            if not payload.get("found") or not path:
+                sources = payload.get("matched_sources") or []
+                targets = payload.get("matched_targets") or []
+                return (
+                    "No structural path was found between "
+                    f"{self._format_graph_node(sources[0]) if sources else 'the source'} and "
+                    f"{self._format_graph_node(targets[0]) if targets else 'the target'}."
+                )
+
+            chain = " -> ".join(
+                node.get("qualified_name") or node.get("symbol_key") or "(unknown)" for node in path
+            )
+            lines = [
+                f"Structural path found in {payload.get('hops', max(0, len(path) - 1))} hop(s).",
+                chain,
+            ]
+            for edge in (payload.get("edges") or [])[:8]:
+                lines.append(
+                    f"- {edge.get('from_qualified_name') or edge.get('from_symbol_key')} "
+                    f"-[{edge.get('kind')}]-> "
+                    f"{edge.get('to_qualified_name') or edge.get('to_symbol_key')}"
+                )
+            return "\n".join(lines)
+
+        return ""
 
     async def _load_summaries_for_project(self) -> dict[str, dict[str, str]]:
         """
@@ -2141,11 +2988,11 @@ class RLMEngine:
                 ContextSection(
                     title=section.title,
                     content=content,
-                    relevance_score=round(score, 4),
-                    file=file_path,
-                    start_line=section.start_line,
-                    end_line=section.end_line,
-                    tokens=tokens,
+                    relevance_score=min(round(score / 100.0, 4), 1.0),
+                    file=file_path or "(unknown)",
+                    lines=(section.start_line, section.end_line),
+                    token_count=tokens,
+                    truncated=tokens < count_tokens(section.content),
                 )
             )
             total_tokens += tokens
@@ -2153,7 +3000,10 @@ class RLMEngine:
         return sections
 
     async def _score_sections(
-        self, query: str, search_mode: SearchMode
+        self,
+        query: str,
+        search_mode: SearchMode,
+        tier_filter: list[str] | None = None,
     ) -> list[tuple[Section, float]]:
         """
         Score sections by relevance to the query.
@@ -2165,7 +3015,17 @@ class RLMEngine:
 
         Uses pre-computed chunks with pgvector for fast semantic search when available,
         falling back to on-the-fly embedding generation if chunks don't exist.
+
+        Args:
+            query: The search query string.
+            search_mode: The search mode to use.
+            tier_filter: Optional list of tiers to include in semantic search.
+                         Defaults to ["HOT", "WARM"] to exclude cold/archived content.
+                         Pass None to include all tiers.
         """
+        # Default tier filter: exclude COLD and ARCHIVE for faster, more relevant results
+        if tier_filter is None:
+            tier_filter = ["HOT", "WARM"]
         if not self.index:
             return []
 
@@ -2194,9 +3054,15 @@ class RLMEngine:
             logger.info(f"List query detected: '{query[:60]}...' - boosting numbered sections")
 
         # Calculate keyword scores for all sections (always in-memory, fast)
+        keyword_weights = _compute_keyword_weights(sections_to_score, keywords)
         keyword_scores: dict[str, float] = {}
         for section in sections_to_score:
-            base_score = self._calculate_keyword_score(section, keywords)
+            base_score = self._calculate_keyword_score(
+                section,
+                keywords,
+                query=query,
+                keyword_weights=keyword_weights,
+            )
 
             # Boost numbered sections for list queries (Fix #1: Query-intent detection)
             # E.g., "Article #3" should rank higher than "Example Article Structure"
@@ -2263,9 +3129,12 @@ class RLMEngine:
             use_chunks = await self._has_precomputed_chunks()
 
             if use_chunks:
-                semantic_scores = await self._calculate_semantic_scores_from_chunks(query)
+                semantic_scores = await self._calculate_semantic_scores_from_chunks(
+                    query, tier_filter=tier_filter
+                )
                 logger.info(
-                    f"Using pre-computed chunks for semantic search (project: {self.project_id})"
+                    f"Using pre-computed chunks for semantic search (project: {self.project_id}, "
+                    f"tiers={tier_filter})"
                 )
             else:
                 semantic_scores = await self._calculate_semantic_scores(query)
@@ -2275,6 +3144,7 @@ class RLMEngine:
 
             for section in sections_to_score:
                 score = semantic_scores.get(section.id, 0.0) * 100  # Scale to 0-100
+                score = _adjust_score_for_query_intent(section, query, score, keywords=keywords)
                 if score > 10:  # Minimum similarity threshold
                     scored.append((section, score))
 
@@ -2292,9 +3162,12 @@ class RLMEngine:
             use_chunks = await self._has_precomputed_chunks()
 
             if use_chunks:
-                semantic_scores = await self._calculate_semantic_scores_from_chunks(query)
+                semantic_scores = await self._calculate_semantic_scores_from_chunks(
+                    query, tier_filter=tier_filter
+                )
                 logger.info(
-                    f"Using pre-computed chunks for hybrid search (project: {self.project_id})"
+                    f"Using pre-computed chunks for hybrid search (project: {self.project_id}, "
+                    f"tiers={tier_filter})"
                 )
             else:
                 # Pre-filter to top keyword candidates to avoid embedding all sections.
@@ -2326,6 +3199,16 @@ class RLMEngine:
                     f"(0 keyword candidates, project: {self.project_id})"
                 )
 
+            semantic_scores = {
+                section.id: _adjust_score_for_query_intent(
+                    section,
+                    query,
+                    semantic_scores.get(section.id, 0.0) * 100,
+                    keywords=keywords,
+                ) / 100.0
+                for section in sections_to_score
+            }
+
             # Adaptive weights: classify query to pick keyword/semantic balance
             kw_weight, sem_weight = self._classify_query_weights(query, keyword_scores)
             logger.info(
@@ -2356,8 +3239,8 @@ class RLMEngine:
                 final_score = graded_score
                 kw = keyword_scores.get(sid, 0)
                 sem = semantic_scores.get(sid, 0.0) * 100
-                if kw > 5 and sem > 30:
-                    final_score *= 1.10  # Smaller boost since graded already separates
+                if kw > 5 and sem > 30 and final_score < 100:
+                    final_score = min(final_score * 1.05, 99.0)
 
                 # Filter out sections with insufficient relevance for multi-keyword queries.
                 # Problem: Project-specific terms appear everywhere, so sections like "VS Code Extension"
@@ -2437,7 +3320,7 @@ class RLMEngine:
             query: The search query string.
             candidate_ids: If provided, only embed these section IDs (e.g. top keyword hits).
             max_sections: Hard cap on sections to embed (default 30). bge-small-en-v1.5
-                takes ~0.3s per text on Railway CPU; 30 sections ≈ 3-5s.
+                takes ~0.3s per text on Infomaniak VPS CPU; 30 sections ≈ 3-5s.
         """
         if not self.index or not self.index.sections:
             return {}
@@ -2476,7 +3359,13 @@ class RLMEngine:
             logger.warning(f"Semantic search failed, falling back to empty scores: {e}")
             return {}
 
-    def _calculate_keyword_score(self, section: Section, keywords: list[str]) -> float:
+    def _calculate_keyword_score(
+        self,
+        section: Section,
+        keywords: list[str],
+        query: str | None = None,
+        keyword_weights: dict[str, float] | None = None,
+    ) -> float:
         """
         Calculate keyword relevance score for a section.
 
@@ -2486,69 +3375,12 @@ class RLMEngine:
         - Section level bonus (higher level = more important)
         - Title keyword coverage boost (multi-keyword title match)
         """
-        score = 0.0
-        title_lower = section.title.lower()
-        content_lower = section.content.lower()
-
-        # BM25-style length normalization for content scoring.
-        # Prevents long sections from dominating via raw keyword counts.
-        # avgdl ~2000 chars is a reasonable average section length.
-        content_length = len(content_lower)
-        length_norm = 1.0 / (1.0 + 0.75 * (content_length / 2000.0 - 1.0))
-        length_norm = max(length_norm, 0.15)  # Floor to avoid near-zero
-
-        title_keyword_hits = 0
-
-        for keyword in keywords:
-            if len(keyword) < 2:  # Skip very short words
-                continue
-
-            stem = _stem_keyword(keyword)
-
-            # Title matches — reduced weight for generic terms
-            title_count = title_lower.count(keyword)
-            # Fall back to stem match for morphological variants
-            # e.g. "prices" (stem "pric") matches title containing "pricing"
-            if title_count == 0 and stem != keyword:
-                title_count = title_lower.count(stem)
-            if title_count > 0:
-                title_keyword_hits += 1
-                # Generic terms get 1.5x weight, specific terms get 5x
-                # This prevents "Snipara tools not available" ranking above
-                # actual tool documentation for "What tools does Snipara expose?"
-                if keyword in _GENERIC_TITLE_TERMS or stem in _GENERIC_TITLE_TERMS:
-                    score += title_count * 1.5
-                else:
-                    score += title_count * 5.0
-
-            # Content matches (length-normalized)
-            content_count = content_lower.count(keyword)
-            if content_count == 0 and stem != keyword:
-                content_count = content_lower.count(stem)
-            score += content_count * length_norm
-
-        # Bonus for higher-level sections (h1, h2 more important)
-        level_bonus = max(0, 4 - section.level) * 0.5
-        score += level_bonus if score > 0 else 0
-
-        # Title keyword coverage boost: when multiple query keywords appear
-        # in the section title, this section is likely a direct topical match.
-        # Apply multiplicative boost proportional to the number of title hits.
-        if title_keyword_hits >= 2:
-            coverage_boost = 1.0 + title_keyword_hits * 2.0
-            score *= coverage_boost
-
-        # Exact phrase match bonus: if the entire query (or a significant portion)
-        # appears verbatim in the title, this is very likely the right section.
-        # This dramatically improves NDCG for specific queries.
-        query_words = [w for w in keywords if len(w) >= 3]
-        if len(query_words) >= 2:
-            query_phrase = " ".join(query_words[:4])  # First 4 significant words
-            if query_phrase.lower() in title_lower:
-                score *= 3.0  # 3x bonus for exact phrase in title
-                logger.debug(f"Exact phrase match in title: '{query_phrase}' → '{section.title}'")
-
-        return score
+        return _calculate_keyword_score_extracted(
+            section,
+            keywords,
+            keyword_weights=keyword_weights,
+            query=query,
+        )
 
     # ------------------------------------------------------------------
     # Adaptive Hybrid Search helpers
@@ -3846,6 +4678,9 @@ class RLMEngine:
                     merged_content=None,
                     total_tokens=0,
                     collections_loaded=0,
+                    linked_collections_loaded=0,
+                    team_context_documents_loaded=0,
+                    linked_collection_documents_loaded=0,
                     context_hash="",
                 ).model_dump(),
                 input_tokens=0,
@@ -3853,9 +4688,14 @@ class RLMEngine:
             )
 
         # Apply category filter if specified
+        # When filtering for MANDATORY, also include documents with is_mandatory=True
         if category_filter:
+            mandatory_in_filter = DocumentCategory.MANDATORY in category_filter
             shared_ctx.documents = [
-                d for d in shared_ctx.documents if d.category in category_filter
+                d
+                for d in shared_ctx.documents
+                if d.category in category_filter
+                or (mandatory_in_filter and d.is_mandatory)
             ]
 
         # Allocate budget
@@ -3863,19 +4703,28 @@ class RLMEngine:
 
         # Build response
         doc_infos: list[SharedDocumentInfo] = []
+        team_context_documents_loaded = 0
+        linked_collection_documents_loaded = 0
         for doc in allocated_docs:
             try:
                 cat_enum = DocumentCategoryEnum(doc.category.value)
             except ValueError:
                 cat_enum = DocumentCategoryEnum.BEST_PRACTICES
 
+            if doc.source_type == "TEAM_CONTEXT":
+                team_context_documents_loaded += 1
+            else:
+                linked_collection_documents_loaded += 1
+
             doc_infos.append(
                 SharedDocumentInfo(
                     id=doc.id,
                     title=doc.title,
                     category=cat_enum,
+                    is_mandatory=doc.is_mandatory,
                     token_count=doc.token_count,
                     collection_name=doc.collection_name,
+                    source_type=doc.source_type,
                     tags=doc.tags,
                 )
             )
@@ -3896,6 +4745,9 @@ class RLMEngine:
             merged_content=merged_content,
             total_tokens=total_tokens,
             collections_loaded=len(shared_ctx.collection_versions),
+            linked_collections_loaded=len(shared_ctx.collection_versions),
+            team_context_documents_loaded=team_context_documents_loaded,
+            linked_collection_documents_loaded=linked_collection_documents_loaded,
             context_hash=context_hash,
         )
 
@@ -4070,9 +4922,18 @@ class RLMEngine:
         """
         include_public = params.get("include_public", True)
 
+        # Validate: need user_id for non-public collections
+        user_id = self.user_id if self.user_id else None
+        if not user_id and not include_public:
+            return ToolResult(
+                data={"error": "user_id required when include_public=False"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
         try:
             collections = await list_shared_collections(
-                user_id=self.user_id,
+                user_id=user_id,
                 include_public=include_public,
             )
 
@@ -4088,6 +4949,245 @@ class RLMEngine:
             logger.error(f"Error listing collections: {e}")
             return ToolResult(
                 data={"error": f"Failed to list collections: {str(e)}"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+    async def _handle_create_collection(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_create_collection - create a TEAM shared context collection."""
+        name = params.get("name", "").strip()
+        slug = params.get("slug")
+        description = params.get("description")
+        is_public = params.get("is_public", False)
+
+        if not name:
+            return ToolResult(
+                data={"error": "name is required"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        if self.plan not in {Plan.TEAM, Plan.ENTERPRISE}:
+            return ToolResult(
+                data={
+                    "error": "rlm_create_collection requires Team plan or higher",
+                    "upgrade_url": "/billing/upgrade",
+                },
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        if not self.user_id:
+            return ToolResult(
+                data={"error": "user_id required to create shared collections"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        try:
+            db = await get_db()
+            project = await db.project.find_unique(where={"id": self.project_id})
+            if not project or not project.teamId:
+                return ToolResult(
+                    data={"error": "Current project is not attached to a team"},
+                    input_tokens=0,
+                    output_tokens=0,
+                )
+
+            result = await create_shared_collection(
+                user_id=self.user_id,
+                team_id=project.teamId,
+                name=name,
+                slug=slug,
+                description=description,
+                is_public=is_public,
+            )
+
+            return ToolResult(
+                data=result,
+                input_tokens=count_tokens("\n".join(filter(None, [name, slug or "", description or ""]))),
+                output_tokens=0,
+            )
+        except ValueError as e:
+            return ToolResult(
+                data={"error": str(e)},
+                input_tokens=0,
+                output_tokens=0,
+            )
+        except Exception as e:
+            logger.error(f"Error creating shared collection: {e}")
+            return ToolResult(
+                data={"error": f"Failed to create collection: {str(e)}"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+    async def _handle_get_collection_documents(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_get_collection_documents - inspect documents in a shared collection."""
+        collection_id = params.get("collection_id", "")
+        include_content = params.get("include_content", True)
+
+        if not collection_id:
+            return ToolResult(
+                data={"error": "collection_id is required"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        if self.plan not in {Plan.TEAM, Plan.ENTERPRISE}:
+            return ToolResult(
+                data={
+                    "error": "rlm_get_collection_documents requires Team plan or higher",
+                    "upgrade_url": "/billing/upgrade",
+                },
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        try:
+            result = await get_collection_documents(
+                collection_id=collection_id,
+                user_id=self.user_id,
+                include_content=include_content,
+            )
+
+            output_tokens = 0
+            if include_content:
+                output_tokens = sum(
+                    doc.get("token_count", 0) for doc in result.get("documents", [])
+                )
+
+            return ToolResult(
+                data=result,
+                input_tokens=0,
+                output_tokens=output_tokens,
+            )
+        except ValueError as e:
+            return ToolResult(
+                data={"error": str(e)},
+                input_tokens=0,
+                output_tokens=0,
+            )
+        except Exception as e:
+            logger.error(f"Error reading shared collection documents: {e}")
+            return ToolResult(
+                data={"error": f"Failed to read collection: {str(e)}"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+    async def _handle_link_collection(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_link_collection - link a shared collection to a project."""
+        collection_id = params.get("collection_id", "")
+        project_id_or_slug = params.get("project_id_or_slug") or self.project_id
+        priority = params.get("priority")
+        token_budget_percent = params.get("token_budget_percent")
+        enabled_categories = params.get("enabled_categories")
+
+        if not collection_id:
+            return ToolResult(
+                data={"error": "collection_id is required"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        if self.plan not in {Plan.TEAM, Plan.ENTERPRISE}:
+            return ToolResult(
+                data={
+                    "error": "rlm_link_collection requires Team plan or higher",
+                    "upgrade_url": "/billing/upgrade",
+                },
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        if not self.user_id:
+            return ToolResult(
+                data={"error": "user_id required to link shared collections"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        try:
+            result = await link_shared_collection_to_project(
+                collection_id=collection_id,
+                project_id_or_slug=project_id_or_slug,
+                user_id=self.user_id,
+                priority=priority,
+                token_budget_percent=token_budget_percent,
+                enabled_categories=enabled_categories,
+            )
+
+            return ToolResult(
+                data=result,
+                input_tokens=count_tokens(f"{collection_id}\n{project_id_or_slug}"),
+                output_tokens=0,
+            )
+        except ValueError as e:
+            return ToolResult(
+                data={"error": str(e)},
+                input_tokens=0,
+                output_tokens=0,
+            )
+        except Exception as e:
+            logger.error(f"Error linking shared collection: {e}")
+            return ToolResult(
+                data={"error": f"Failed to link collection: {str(e)}"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+    async def _handle_unlink_collection(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_unlink_collection - unlink a shared collection from a project."""
+        collection_id = params.get("collection_id", "")
+        project_id_or_slug = params.get("project_id_or_slug") or self.project_id
+
+        if not collection_id:
+            return ToolResult(
+                data={"error": "collection_id is required"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        if self.plan not in {Plan.TEAM, Plan.ENTERPRISE}:
+            return ToolResult(
+                data={
+                    "error": "rlm_unlink_collection requires Team plan or higher",
+                    "upgrade_url": "/billing/upgrade",
+                },
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        if not self.user_id:
+            return ToolResult(
+                data={"error": "user_id required to unlink shared collections"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        try:
+            result = await unlink_shared_collection_from_project(
+                collection_id=collection_id,
+                project_id_or_slug=project_id_or_slug,
+                user_id=self.user_id,
+            )
+
+            return ToolResult(
+                data=result,
+                input_tokens=count_tokens(f"{collection_id}\n{project_id_or_slug}"),
+                output_tokens=0,
+            )
+        except ValueError as e:
+            return ToolResult(
+                data={"error": str(e)},
+                input_tokens=0,
+                output_tokens=0,
+            )
+        except Exception as e:
+            logger.error(f"Error unlinking shared collection: {e}")
+            return ToolResult(
+                data={"error": f"Failed to unlink collection: {str(e)}"},
                 input_tokens=0,
                 output_tokens=0,
             )
@@ -4204,6 +5304,12 @@ class RLMEngine:
         ttl_days = params.get("ttl_days")
         related_to = params.get("related_to")
         document_refs = params.get("document_refs")
+        source = params.get("source") or "mcp"
+        review_status = resolve_review_status_for_source(
+            self.settings,
+            source=source,
+            requested_review_status=params.get("review_status"),
+        )
 
         if not content:
             return ToolResult(
@@ -4230,12 +5336,115 @@ class RLMEngine:
             ttl_days=ttl_days,
             related_to=related_to,
             document_refs=document_refs,
-            source="mcp",
+            source=source,
+            review_status=review_status,
         )
 
         return ToolResult(
             data=result,
             input_tokens=count_tokens(content),
+            output_tokens=count_tokens(str(result)),
+        )
+
+    async def _handle_remember_if_novel(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_remember_if_novel - store a memory only when it is novel."""
+        content = params.get("text") or params.get("content", "")
+        memory_type = params.get("type", "fact")
+        scope = params.get("scope", "project")
+        category = params.get("category")
+        ttl_days = params.get("ttl_days")
+        related_to = params.get("related_to")
+        document_refs = params.get("document_refs")
+        novelty_threshold = params.get(
+            "novelty_threshold", self.settings.memory_novelty_threshold
+        )
+        dedupe_limit = params.get("dedupe_limit", 5)
+        allow_supersede = params.get("allow_supersede", True)
+        source = params.get("source") or "mcp"
+        review_status = resolve_review_status_for_source(
+            self.settings,
+            source=source,
+            requested_review_status=params.get("review_status"),
+        )
+
+        if not content:
+            return ToolResult(
+                data={"error": "rlm_remember_if_novel: missing required parameter 'text' (or 'content')"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        allowed, error = await check_memory_limits(self.project_id, self.user_id)
+        if not allowed:
+            return ToolResult(
+                data={"error": error, "upgrade_url": "/billing/upgrade"},
+                input_tokens=count_tokens(content),
+                output_tokens=0,
+            )
+
+        result = await remember_if_novel(
+            project_id=self.project_id,
+            content=content,
+            memory_type=memory_type,
+            scope=scope,
+            category=category,
+            ttl_days=ttl_days,
+            related_to=related_to,
+            document_refs=document_refs,
+            novelty_threshold=novelty_threshold,
+            dedupe_limit=dedupe_limit,
+            allow_supersede=allow_supersede,
+            source=source,
+            review_status=review_status,
+        )
+
+        return ToolResult(
+            data=result,
+            input_tokens=count_tokens(content),
+            output_tokens=count_tokens(str(result)),
+        )
+
+    async def _handle_end_of_task_commit(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_end_of_task_commit - persist durable knowledge from a task summary."""
+        summary = params.get("summary", "")
+        if not summary:
+            return ToolResult(
+                data={"error": "rlm_end_of_task_commit: missing required parameter 'summary'"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        if not self.settings.memory_end_of_task_commit_enabled:
+            return ToolResult(
+                data={"error": "Task commit memory persistence is disabled for this project"},
+                input_tokens=count_tokens(summary),
+                output_tokens=0,
+            )
+
+        from .services.agent_memory import end_of_task_commit
+
+        result = await end_of_task_commit(
+            project_id=self.project_id,
+            summary=summary,
+            outcome=params.get("outcome", "completed"),
+            files_touched=params.get("files_touched"),
+            artifacts=params.get("artifacts"),
+            persist_types=params.get("persist_types"),
+            category=params.get("category"),
+            dry_run=params.get("dry_run", False),
+            novelty_threshold=self.settings.memory_novelty_threshold,
+            review_status=resolve_review_status_for_source(
+                self.settings,
+                source=params.get("source") or "task_commit",
+                requested_review_status=params.get("review_status"),
+            ),
+            deduplicate_before_write=self.settings.memory_deduplicate_before_write,
+            source=params.get("source") or "task_commit",
+        )
+
+        return ToolResult(
+            data=result,
+            input_tokens=count_tokens(summary),
             output_tokens=count_tokens(str(result)),
         )
 
@@ -4286,10 +5495,16 @@ class RLMEngine:
             )
 
         # Store memories in bulk
+        source = params.get("source") or "mcp"
+        review_status = resolve_review_status_for_source(
+            self.settings,
+            source=source,
+            requested_review_status=params.get("review_status"),
+        )
         result = await store_memories_bulk(
             project_id=self.project_id,
-            memories=memories,
-            source="mcp",
+            memories=[{**memory, "review_status": memory.get("review_status", review_status)} for memory in memories],
+            source=source,
         )
 
         input_tokens = sum(count_tokens(m.get("text", "")) for m in memories)
@@ -4339,6 +5554,8 @@ class RLMEngine:
             category=category,
             limit=limit,
             min_relevance=min_relevance,
+            include_inactive=params.get("include_inactive", False),
+            warning_threshold=params.get("warning_threshold", 0.72),
         )
 
         return ToolResult(
@@ -4373,6 +5590,8 @@ class RLMEngine:
         offset = params.get("offset", 0)
         sort_by = params.get("sort_by", "created_at")
         sort_order = params.get("sort_order", "desc")
+        status = params.get("status")
+        include_inactive = params.get("include_inactive", False)
 
         result = await list_memories(
             project_id=self.project_id,
@@ -4384,11 +5603,70 @@ class RLMEngine:
             offset=offset,
             sort_by=sort_by,
             sort_order=sort_order,
+            status=status,
+            include_inactive=include_inactive,
         )
 
         return ToolResult(
             data=result,
             input_tokens=0,
+            output_tokens=count_tokens(str(result)),
+        )
+
+    async def _handle_memory_invalidate(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_memory_invalidate."""
+        memory_id = params.get("memory_id")
+        reason = params.get("reason")
+        invalidated_at = params.get("invalidated_at")
+
+        if not memory_id:
+            return ToolResult(
+                data={"error": "memory_id is required"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        result = await invalidate_memory(
+            memory_id=memory_id,
+            invalidated_at=invalidated_at,
+            reason=reason,
+        )
+
+        return ToolResult(
+            data=result,
+            input_tokens=count_tokens(f"{reason or ''}{invalidated_at or ''}"),
+            output_tokens=count_tokens(str(result)),
+        )
+
+    async def _handle_memory_supersede(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_memory_supersede."""
+        old_memory_id = params.get("old_memory_id")
+        new_memory_id = params.get("new_memory_id")
+        reason = params.get("reason")
+
+        if not old_memory_id:
+            return ToolResult(
+                data={"error": "old_memory_id is required"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        if not new_memory_id:
+            return ToolResult(
+                data={"error": "new_memory_id is required"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        result = await supersede_memory(
+            old_memory_id=old_memory_id,
+            new_memory_id=new_memory_id,
+            reason=reason,
+        )
+
+        return ToolResult(
+            data=result,
+            input_tokens=count_tokens(f"{old_memory_id}{new_memory_id}{reason or ''}"),
             output_tokens=count_tokens(str(result)),
         )
 
@@ -4430,6 +5708,463 @@ class RLMEngine:
         return ToolResult(
             data=result,
             input_tokens=0,
+            output_tokens=count_tokens(str(result)),
+        )
+
+    async def _handle_memory_invalidate(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_memory_invalidate - logically invalidate a Memory V2 record."""
+        from .services.agent_memory import invalidate_memory_v2
+
+        memory_id = params.get("memory_id")
+        invalidated_at = params.get("invalidated_at")
+        reason = params.get("reason")
+
+        if not memory_id:
+            return ToolResult(
+                data={"error": "memory_id is required"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        parsed_invalidated_at = None
+        if invalidated_at:
+            try:
+                parsed_invalidated_at = datetime.fromisoformat(invalidated_at.replace("Z", "+00:00"))
+            except ValueError:
+                return ToolResult(
+                    data={"error": "invalidated_at must be an ISO timestamp"},
+                    input_tokens=0,
+                    output_tokens=0,
+                )
+
+        result = await invalidate_memory_v2(
+            memory_id=memory_id,
+            invalidated_at=parsed_invalidated_at,
+            reason=reason,
+        )
+        return ToolResult(
+            data=result,
+            input_tokens=count_tokens(memory_id),
+            output_tokens=count_tokens(str(result)),
+        )
+
+    async def _handle_memory_attach_source(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_memory_attach_source - attach evidence to a Memory V2 record."""
+        from .services.agent_memory import attach_memory_source_v2
+
+        memory_id = params.get("memory_id")
+        evidence_type = params.get("evidence_type")
+
+        if not memory_id or not evidence_type:
+            return ToolResult(
+                data={"error": "memory_id and evidence_type are required"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        result = await attach_memory_source_v2(
+            memory_id=memory_id,
+            evidence_type=evidence_type,
+            document_id=params.get("document_id"),
+            chunk_id=params.get("chunk_id"),
+            external_ref=params.get("external_ref"),
+            snippet=params.get("snippet"),
+            line_start=params.get("line_start"),
+            line_end=params.get("line_end"),
+            weight=params.get("weight", 1.0),
+        )
+        return ToolResult(
+            data=result,
+            input_tokens=count_tokens(memory_id),
+            output_tokens=count_tokens(str(result)),
+        )
+
+    async def _handle_memory_supersede(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_memory_supersede - mark one memory superseded by another."""
+        from .services.agent_memory import supersede_memory_v2
+
+        old_memory_id = params.get("old_memory_id")
+        new_memory_id = params.get("new_memory_id")
+        reason = params.get("reason")
+
+        if not old_memory_id or not new_memory_id:
+            return ToolResult(
+                data={"error": "old_memory_id and new_memory_id are required"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        result = await supersede_memory_v2(
+            old_memory_id=old_memory_id,
+            new_memory_id=new_memory_id,
+            reason=reason,
+        )
+        input_tokens = count_tokens(old_memory_id) + count_tokens(new_memory_id)
+        return ToolResult(
+            data=result,
+            input_tokens=input_tokens,
+            output_tokens=count_tokens(str(result)),
+        )
+
+    async def _handle_memory_verify(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_memory_verify - validate evidence attached to a memory."""
+        from .services.agent_memory import verify_memory_v2
+
+        memory_id = params.get("memory_id")
+        mark_stale_if_missing = params.get("mark_stale_if_missing", True)
+
+        if not memory_id:
+            return ToolResult(
+                data={"error": "memory_id is required"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        result = await verify_memory_v2(
+            memory_id=memory_id,
+            mark_stale_if_missing=mark_stale_if_missing,
+        )
+        return ToolResult(
+            data=result,
+            input_tokens=count_tokens(memory_id),
+            output_tokens=count_tokens(str(result)),
+        )
+
+    # ============ PHASE 18: DAILY JOURNAL HANDLERS ============
+
+    async def _handle_journal_append(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_journal_append - append an entry to today's journal.
+
+        Args:
+            params: Dict containing:
+                - text: Journal entry text (markdown supported)
+                - tags: Optional tags for categorization
+
+        Returns:
+            ToolResult with entry_id, date, and confirmation
+        """
+        from .services.agent_memory import append_journal
+
+        text = params.get("text", "")
+        tags = params.get("tags")
+
+        if not text:
+            return ToolResult(
+                data={"error": "text is required"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        result = await append_journal(
+            project_id=self.project_id,
+            text=text,
+            tags=tags,
+        )
+
+        return ToolResult(
+            data=result,
+            input_tokens=count_tokens(text),
+            output_tokens=count_tokens(str(result)),
+        )
+
+    async def _handle_journal_get(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_journal_get - get journal entries for a specific date.
+
+        Args:
+            params: Dict containing:
+                - date: Date in YYYY-MM-DD format (default: today)
+                - include_yesterday: Also include yesterday's entries
+
+        Returns:
+            ToolResult with date, entries list, and total count
+        """
+        from .services.agent_memory import get_journal
+
+        date = params.get("date")
+        include_yesterday = params.get("include_yesterday", False)
+
+        result = await get_journal(
+            project_id=self.project_id,
+            date=date,
+            include_yesterday=include_yesterday,
+        )
+
+        return ToolResult(
+            data=result,
+            input_tokens=0,
+            output_tokens=count_tokens(str(result)),
+        )
+
+    async def _handle_journal_summarize(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_journal_summarize - get journal entries for a date, ready for summarization.
+
+        Args:
+            params: Dict containing:
+                - date: Date to summarize (YYYY-MM-DD)
+
+        Returns:
+            ToolResult with combined content and suggested prompt
+        """
+        from .services.agent_memory import summarize_journal
+
+        date = params.get("date")
+
+        if not date:
+            return ToolResult(
+                data={"error": "date is required"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        result = await summarize_journal(
+            project_id=self.project_id,
+            date=date,
+        )
+
+        return ToolResult(
+            data=result,
+            input_tokens=0,
+            output_tokens=count_tokens(str(result)),
+        )
+
+    # ============ PHASE 20: MEMORY TIERS & COMPACTION ============
+
+    async def _handle_session_memories(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_session_memories - get tiered memories for session auto-load.
+
+        Args:
+            params: Dict containing:
+                - max_critical_tokens: Token budget for CRITICAL tier
+                - max_daily_tokens: Token budget for DAILY tier
+                - include_yesterday: Include yesterday's daily memories
+
+        Returns:
+            ToolResult with critical and daily memories organized by tier
+        """
+        from .services.agent_memory import get_session_memories
+
+        result = await get_session_memories(
+            project_id=self.project_id,
+            max_critical_tokens=params.get("max_critical_tokens", 8000),
+            max_daily_tokens=params.get("max_daily_tokens", 4000),
+            include_yesterday=params.get("include_yesterday", True),
+        )
+
+        return ToolResult(
+            data=result,
+            input_tokens=0,
+            output_tokens=count_tokens(str(result)),
+        )
+
+    async def _handle_memory_compact(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_memory_compact - compact and optimize memories.
+
+        Args:
+            params: Dict containing:
+                - scope: Memory scope to compact
+                - deduplicate: Merge similar memories
+                - promote_threshold: Access count to promote to CRITICAL
+                - archive_older_than_days: Archive memories older than N days
+                - dry_run: Preview changes without applying
+
+        Returns:
+            ToolResult with compaction results
+        """
+        from .services.agent_memory import compact_memories
+
+        result = await compact_memories(
+            project_id=self.project_id,
+            scope=params.get("scope", "project"),
+            deduplicate=params.get("deduplicate", True),
+            promote_threshold=params.get("promote_threshold", 3),
+            archive_older_than_days=params.get("archive_older_than_days", 30),
+            dry_run=params.get("dry_run", False),
+        )
+
+        return ToolResult(
+            data=result,
+            input_tokens=0,
+            output_tokens=count_tokens(str(result)),
+        )
+
+    async def _handle_memory_daily_brief(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_memory_daily_brief - generate a daily memory brief.
+
+        Args:
+            params: Dict containing:
+                - date: Date for brief (default: today)
+                - max_items: Maximum items to include
+
+        Returns:
+            ToolResult with prioritized memory brief
+        """
+        from .services.agent_memory import get_daily_brief
+
+        result = await get_daily_brief(
+            project_id=self.project_id,
+            date=params.get("date"),
+            max_items=params.get("max_items", 10),
+        )
+
+        return ToolResult(
+            data=result,
+            input_tokens=0,
+            output_tokens=count_tokens(str(result)),
+        )
+
+    # ============ PHASE 20: TENANT PROFILE ============
+
+    async def _handle_tenant_profile_create(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_tenant_profile_create - create a structured tenant/client profile.
+
+        Args:
+            params: Dict containing tenant profile fields (client_name required)
+
+        Returns:
+            ToolResult with profile ID and confirmation
+        """
+        from .services.agent_memory import create_tenant_profile
+
+        client_name = params.get("client_name")
+        if not client_name:
+            return ToolResult(
+                data={"error": "client_name is required"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        result = await create_tenant_profile(
+            project_id=self.project_id,
+            client_name=client_name,
+            business_model=params.get("business_model"),
+            industry=params.get("industry"),
+            tech_stack=params.get("tech_stack"),
+            legal_constraints=params.get("legal_constraints"),
+            security_requirements=params.get("security_requirements"),
+            ui_ux_prefs=params.get("ui_ux_prefs"),
+            communication_style=params.get("communication_style"),
+            risk_tolerance=params.get("risk_tolerance"),
+            dos=params.get("dos"),
+            donts=params.get("donts"),
+            custom_fields=params.get("custom_fields"),
+        )
+
+        return ToolResult(
+            data=result,
+            input_tokens=count_tokens(str(params)),
+            output_tokens=count_tokens(str(result)),
+        )
+
+    async def _handle_tenant_profile_get(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_tenant_profile_get - get tenant profile(s) for a project.
+
+        Args:
+            params: Dict containing:
+                - tenant_id: Specific profile ID (optional)
+
+        Returns:
+            ToolResult with tenant profile(s)
+        """
+        from .services.agent_memory import get_tenant_profile
+
+        result = await get_tenant_profile(
+            project_id=self.project_id,
+            tenant_id=params.get("tenant_id"),
+        )
+
+        return ToolResult(
+            data=result,
+            input_tokens=0,
+            output_tokens=count_tokens(str(result)),
+        )
+
+    # ============ PHASE 19: AGENT PROFILES (SOUL LAYER) ============
+
+    async def _handle_agent_profile_get(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_agent_profile_get - get an agent's profile.
+
+        Args:
+            params: Dict containing:
+                - swarm_id: Swarm ID
+                - agent_id: Agent identifier
+
+        Returns:
+            ToolResult with agent profile
+        """
+        from .services.swarm import get_agent_profile
+
+        swarm_id = params.get("swarm_id", "")
+        agent_id = params.get("agent_id", "")
+
+        if not swarm_id or not agent_id:
+            return ToolResult(
+                data={"error": "swarm_id and agent_id are required"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        result = await get_agent_profile(
+            swarm_id=swarm_id,
+            agent_id=agent_id,
+        )
+
+        return ToolResult(
+            data=result,
+            input_tokens=0,
+            output_tokens=count_tokens(str(result)),
+        )
+
+    async def _handle_agent_profile_update(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_agent_profile_update - update an agent's profile.
+
+        Args:
+            params: Dict containing:
+                - swarm_id: Swarm ID
+                - agent_id: Agent identifier
+                - profile: Profile data to update
+
+        Returns:
+            ToolResult with updated profile
+        """
+        from .services.swarm import update_agent_profile
+
+        swarm_id = params.get("swarm_id", "")
+        agent_id = params.get("agent_id", "")
+        profile = params.get("profile", {})
+
+        if not swarm_id or not agent_id:
+            return ToolResult(
+                data={"error": "swarm_id and agent_id are required"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        if not profile:
+            return ToolResult(
+                data={"error": "profile is required"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        result = await update_agent_profile(
+            swarm_id=swarm_id,
+            agent_id=agent_id,
+            profile=profile,
+        )
+
+        return ToolResult(
+            data=result,
+            input_tokens=count_tokens(str(profile)),
             output_tokens=count_tokens(str(result)),
         )
 
@@ -4880,6 +6615,7 @@ class RLMEngine:
                     - title: Task title (required)
                     - description: Task description
                     - priority: Priority level
+                    - deadline: Optional deadline (ISO 8601)
                     - depends_on: Task IDs this depends on
                     - metadata: Additional task data
 
@@ -5008,6 +6744,708 @@ class RLMEngine:
             output_tokens=count_tokens(str(result)),
         )
 
+    async def _handle_tasks(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_tasks - list tasks in a swarm's task queue.
+
+        Args:
+            params: Dict containing:
+                - swarm_id: Swarm ID (required)
+                - status: Filter by status (optional)
+                - assigned_to: Filter by assigned agent (optional)
+                - limit: Max tasks to return (default 50)
+
+        Returns:
+            ToolResult with list of tasks
+        """
+        from .services.swarm import list_tasks
+
+        swarm_id = params.get("swarm_id", "")
+        status = params.get("status")
+        assigned_to = params.get("assigned_to")
+        limit = params.get("limit", 50)
+
+        if not swarm_id:
+            return ToolResult(
+                data={"error": "rlm_tasks: missing required parameter 'swarm_id'"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        result = await list_tasks(
+            swarm_id=swarm_id,
+            status=status,
+            assigned_to=assigned_to,
+            limit=limit,
+        )
+
+        return ToolResult(
+            data=result,
+            input_tokens=0,
+            output_tokens=count_tokens(str(result)),
+        )
+
+    async def _handle_task_list(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_task_list - list tasks with cursor-based pagination.
+
+        Args:
+            params: Dict containing:
+                - swarm_id: Swarm ID (required)
+                - status: Filter by status (optional)
+                - limit: Max tasks to return (default 50, max 100)
+                - cursor: Cursor for pagination (task ID to start after)
+
+        Returns:
+            ToolResult with tasks: [{id, status, updated_at, owner}], has_more, next_cursor
+        """
+        from .services.swarm import list_tasks_enhanced
+
+        swarm_id = params.get("swarm_id", "")
+        status = params.get("status")
+        limit = params.get("limit", 50)
+        cursor = params.get("cursor")
+
+        if not swarm_id:
+            return ToolResult(
+                data={"error": "rlm_task_list: missing required parameter 'swarm_id'"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        result = await list_tasks_enhanced(
+            swarm_id=swarm_id,
+            status=status,
+            limit=limit,
+            cursor=cursor,
+        )
+
+        return ToolResult(
+            data=result,
+            input_tokens=0,
+            output_tokens=count_tokens(str(result)),
+        )
+
+    async def _handle_task_stats(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_task_stats - get aggregated task statistics.
+
+        Args:
+            params: Dict containing:
+                - swarm_id: Swarm ID (required)
+
+        Returns:
+            ToolResult with {done, in_progress, blocked, pending, failed, cancelled, total}
+        """
+        from .services.swarm import get_task_stats
+
+        swarm_id = params.get("swarm_id", "")
+
+        if not swarm_id:
+            return ToolResult(
+                data={"error": "rlm_task_stats: missing required parameter 'swarm_id'"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        result = await get_task_stats(swarm_id=swarm_id)
+
+        return ToolResult(
+            data=result,
+            input_tokens=0,
+            output_tokens=count_tokens(str(result)),
+        )
+
+    async def _handle_task_events(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_task_events - get task status change events.
+
+        Args:
+            params: Dict containing:
+                - swarm_id: Swarm ID (required)
+                - since: ISO timestamp - only return events after this time (optional)
+                - limit: Max events to return (default 100)
+
+        Returns:
+            ToolResult with task events: [{event_id, event_type, task_id, timestamp}]
+        """
+        from .services.swarm import get_task_events
+
+        swarm_id = params.get("swarm_id", "")
+        since = params.get("since")
+        limit = params.get("limit", 100)
+
+        if not swarm_id:
+            return ToolResult(
+                data={"error": "rlm_task_events: missing required parameter 'swarm_id'"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        result = await get_task_events(
+            swarm_id=swarm_id,
+            since=since,
+            limit=limit,
+        )
+
+        return ToolResult(
+            data=result,
+            input_tokens=0,
+            output_tokens=count_tokens(str(result)),
+        )
+
+    async def _handle_agent_status(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_agent_status - get swarm agent status with pending tasks.
+
+        This is THE discovery tool for swarm agents. Call it at session start
+        to find out what work is waiting for you.
+
+        Args:
+            params: Dict containing:
+                - swarm_id: Swarm ID to check (required)
+                - agent_id: Your agent identifier (required)
+
+        Returns:
+            ToolResult with:
+                - pending_tasks: Tasks assigned to you waiting to be claimed
+                - current_task: Task you're currently working on (if any)
+                - swarm_info: Basic swarm information
+                - instructions: Clear instructions on what to do next
+        """
+        from .services.swarm import get_swarm_info, list_tasks
+
+        swarm_id = params.get("swarm_id", "")
+        agent_id = params.get("agent_id", "")
+
+        if not swarm_id or not agent_id:
+            missing = []
+            if not swarm_id:
+                missing.append("swarm_id")
+            if not agent_id:
+                missing.append("agent_id")
+            return ToolResult(
+                data={"error": f"rlm_agent_status: missing required parameter(s): {', '.join(missing)}"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        # Get swarm info
+        swarm_info = await get_swarm_info(swarm_id)
+        if not swarm_info:
+            return ToolResult(
+                data={"error": f"Swarm '{swarm_id}' not found"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        # Get tasks assigned to this agent (pending status)
+        pending_tasks = await list_tasks(
+            swarm_id=swarm_id,
+            status="pending",
+            assigned_to=agent_id,
+            limit=20,
+        )
+
+        # Get task this agent is currently working on (claimed status)
+        claimed_tasks = await list_tasks(
+            swarm_id=swarm_id,
+            status="claimed",
+            assigned_to=agent_id,
+            limit=5,
+        )
+
+        # Build clear instructions based on status
+        instructions = []
+        pending_list = pending_tasks.get("tasks", [])
+        claimed_list = claimed_tasks.get("tasks", [])
+
+        if claimed_list:
+            current_task = claimed_list[0]
+            instructions.append(
+                f"⚡ You have a task IN PROGRESS: '{current_task.get('title', 'Unknown')}'"
+            )
+            instructions.append(
+                "   → Complete it with: rlm_task_complete(swarm_id, agent_id, task_id, result)"
+            )
+        elif pending_list:
+            instructions.append(
+                f"📋 You have {len(pending_list)} pending task(s) assigned to you!"
+            )
+            for i, task in enumerate(pending_list[:3], 1):
+                instructions.append(f"   {i}. {task.get('title', 'Untitled')}")
+            instructions.append(
+                "   → Claim one with: rlm_task_claim(swarm_id, agent_id, task_id)"
+            )
+        else:
+            instructions.append("✅ No tasks assigned to you right now.")
+            instructions.append(
+                "   → Check for unassigned tasks with: rlm_tasks(swarm_id)"
+            )
+            instructions.append(
+                "   → Or claim any available task: rlm_task_claim(swarm_id, agent_id)"
+            )
+
+        result = {
+            "swarm": {
+                "id": swarm_info.get("id"),
+                "name": swarm_info.get("name"),
+                "description": swarm_info.get("description"),
+            },
+            "agent_id": agent_id,
+            "pending_tasks": pending_list,
+            "pending_count": len(pending_list),
+            "current_task": claimed_list[0] if claimed_list else None,
+            "has_work": len(pending_list) > 0 or len(claimed_list) > 0,
+            "instructions": "\n".join(instructions),
+        }
+
+        return ToolResult(
+            data=result,
+            input_tokens=0,
+            output_tokens=count_tokens(str(result)),
+        )
+
+    async def _handle_swarm_leave(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_swarm_leave - remove an agent from a swarm.
+
+        Args:
+            params: Dict containing:
+                - swarm_id: Swarm ID (required)
+                - agent_id: Agent ID to remove (required)
+
+        Returns:
+            ToolResult with removal status
+        """
+        from .services.swarm import leave_swarm
+
+        swarm_id = params.get("swarm_id", "")
+        agent_id = params.get("agent_id", "")
+
+        if not swarm_id or not agent_id:
+            missing = []
+            if not swarm_id:
+                missing.append("swarm_id")
+            if not agent_id:
+                missing.append("agent_id")
+            return ToolResult(
+                data={"error": f"rlm_swarm_leave: missing required parameter(s): {', '.join(missing)}"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        result = await leave_swarm(swarm_id=swarm_id, agent_id=agent_id)
+
+        return ToolResult(
+            data=result,
+            input_tokens=0,
+            output_tokens=count_tokens(str(result)),
+        )
+
+    async def _handle_swarm_members(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_swarm_members - list all agents in a swarm.
+
+        Args:
+            params: Dict containing:
+                - swarm_id: Swarm ID (required)
+
+        Returns:
+            ToolResult with list of agents
+        """
+        from .services.swarm import get_swarm_info
+
+        swarm_id = params.get("swarm_id", "")
+
+        if not swarm_id:
+            return ToolResult(
+                data={"error": "rlm_swarm_members: missing required parameter 'swarm_id'"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        swarm_info = await get_swarm_info(swarm_id)
+        if not swarm_info:
+            return ToolResult(
+                data={"error": f"Swarm '{swarm_id}' not found"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        # Get agents list from swarm info
+        agents = swarm_info.get("agents", [])
+
+        result = {
+            "swarm_id": swarm_id,
+            "swarm_name": swarm_info.get("name"),
+            "agent_count": len(agents),
+            "max_agents": swarm_info.get("maxAgents", 10),
+            "agents": agents,
+        }
+
+        return ToolResult(
+            data=result,
+            input_tokens=0,
+            output_tokens=count_tokens(str(result)),
+        )
+
+    async def _handle_swarm_update(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_swarm_update - update swarm configuration.
+
+        Args:
+            params: Dict containing:
+                - swarm_id: Swarm ID (required)
+                - name: New name (optional)
+                - description: New description (optional)
+                - max_agents: New max agents (optional)
+                - task_timeout: New task timeout (optional)
+                - claim_timeout: New claim timeout (optional)
+
+        Returns:
+            ToolResult with updated swarm info
+        """
+        swarm_id = params.get("swarm_id", "")
+
+        if not swarm_id:
+            return ToolResult(
+                data={"error": "rlm_swarm_update: missing required parameter 'swarm_id'"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        # Build update data from params
+        update_data = {}
+        if "name" in params:
+            update_data["name"] = params["name"]
+        if "description" in params:
+            update_data["description"] = params["description"]
+        if "max_agents" in params:
+            update_data["maxAgents"] = params["max_agents"]
+        if "task_timeout" in params:
+            update_data["taskTimeout"] = params["task_timeout"]
+        if "claim_timeout" in params:
+            update_data["claimTimeout"] = params["claim_timeout"]
+
+        if not update_data:
+            return ToolResult(
+                data={"error": "rlm_swarm_update: no fields to update provided"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        db = await get_db()
+
+        # Update swarm
+        try:
+            updated = await db.agentswarm.update(
+                where={"id": swarm_id},
+                data=update_data,
+            )
+
+            result = {
+                "success": True,
+                "swarm_id": swarm_id,
+                "updated_fields": list(update_data.keys()),
+                "swarm": {
+                    "id": updated.id,
+                    "name": updated.name,
+                    "description": updated.description,
+                    "maxAgents": updated.maxAgents,
+                    "taskTimeout": updated.taskTimeout,
+                    "claimTimeout": updated.claimTimeout,
+                },
+            }
+        except Exception as e:
+            result = {"error": f"Failed to update swarm: {str(e)}"}
+
+        return ToolResult(
+            data=result,
+            input_tokens=0,
+            output_tokens=count_tokens(str(result)),
+        )
+
+    async def _handle_task_reassign(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_task_reassign - reassign a task to a different agent.
+
+        Args:
+            params: Dict containing:
+                - swarm_id: Swarm ID (required)
+                - task_id: Task ID to reassign (required)
+                - new_agent_id: Agent to assign to (optional, null to unassign)
+
+        Returns:
+            ToolResult with reassignment status
+        """
+        swarm_id = params.get("swarm_id", "")
+        task_id = params.get("task_id", "")
+        new_agent_id = params.get("new_agent_id")
+        force = params.get("force", False)
+
+        if not swarm_id or not task_id:
+            missing = []
+            if not swarm_id:
+                missing.append("swarm_id")
+            if not task_id:
+                missing.append("task_id")
+            return ToolResult(
+                data={"error": f"rlm_task_reassign: missing required parameter(s): {', '.join(missing)}"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        db = await get_db()
+
+        # Get the task
+        task = await db.swarmtask.find_first(
+            where={"id": task_id, "swarmId": swarm_id}
+        )
+
+        if not task:
+            return ToolResult(
+                data={"error": f"Task '{task_id}' not found in swarm '{swarm_id}'"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        # Check task status - normally can only reassign PENDING or CLAIMED tasks
+        # With force=True (admin), can also reassign IN_PROGRESS tasks
+        allowed_statuses = ["PENDING", "CLAIMED"]
+        if force:
+            allowed_statuses.append("IN_PROGRESS")
+
+        if task.status not in allowed_statuses:
+            if task.status == "IN_PROGRESS":
+                return ToolResult(
+                    data={"error": "Cannot reassign IN_PROGRESS task. Use force=true to override (admin only)."},
+                    input_tokens=0,
+                    output_tokens=0,
+                )
+            return ToolResult(
+                data={"error": f"Cannot reassign task with status '{task.status}'. Only PENDING, CLAIMED, or IN_PROGRESS (with force=true) tasks can be reassigned."},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        # If assigning to a new agent, verify agent exists in swarm
+        assigned_to_id = None
+        if new_agent_id:
+            agent = await db.swarmagent.find_first(
+                where={"swarmId": swarm_id, "agentId": new_agent_id}
+            )
+            if not agent:
+                return ToolResult(
+                    data={"error": f"Agent '{new_agent_id}' not found in swarm '{swarm_id}'"},
+                    input_tokens=0,
+                    output_tokens=0,
+                )
+            assigned_to_id = agent.id
+
+        # Update task assignment - use Prisma relation syntax
+        update_data: dict[str, Any] = {"status": "PENDING"}  # Reset to pending when reassigned
+        if assigned_to_id:
+            update_data["agent"] = {"connect": {"id": assigned_to_id}}
+        else:
+            update_data["agent"] = {"disconnect": True}
+
+        updated = await db.swarmtask.update(
+            where={"id": task_id},
+            data=update_data,
+        )
+
+        result = {
+            "success": True,
+            "task_id": task_id,
+            "previous_status": task.status,
+            "new_status": "PENDING",
+            "assigned_to": new_agent_id or "(unassigned)",
+            "task": {
+                "id": updated.id,
+                "title": updated.title,
+                "status": updated.status,
+            },
+        }
+
+        return ToolResult(
+            data=result,
+            input_tokens=0,
+            output_tokens=count_tokens(str(result)),
+        )
+
+    async def _handle_task_delete(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_task_delete - delete a task from a swarm (admin only).
+
+        Args:
+            params: Dict containing:
+                - swarm_id: Swarm ID (required)
+                - task_id: Task ID to delete (required)
+                - force: Force delete even if COMPLETED/IN_PROGRESS (optional)
+
+        Returns:
+            ToolResult with deletion status
+        """
+        swarm_id = params.get("swarm_id", "")
+        task_id = params.get("task_id", "")
+        force = params.get("force", False)
+
+        if not swarm_id or not task_id:
+            missing = []
+            if not swarm_id:
+                missing.append("swarm_id")
+            if not task_id:
+                missing.append("task_id")
+            err = f"rlm_task_delete: missing required parameter(s): {', '.join(missing)}"
+            return ToolResult(data={"error": err}, input_tokens=0, output_tokens=0)
+
+        db = await get_db()
+
+        # Get the task
+        task = await db.swarmtask.find_first(
+            where={"id": task_id, "swarmId": swarm_id}
+        )
+
+        if not task:
+            return ToolResult(
+                data={"error": f"Task '{task_id}' not found in swarm '{swarm_id}'"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        # Check task status - normally can only delete PENDING, FAILED, CANCELLED
+        allowed_statuses = ["PENDING", "FAILED", "CANCELLED"]
+        if force:
+            allowed_statuses.extend(["COMPLETED", "IN_PROGRESS", "CLAIMED"])
+
+        if task.status not in allowed_statuses:
+            err = f"Cannot delete task with status '{task.status}'. Use force=true."
+            return ToolResult(data={"error": err}, input_tokens=0, output_tokens=0)
+
+        # Delete the task
+        await db.swarmtask.delete(where={"id": task_id})
+
+        result = {
+            "success": True,
+            "task_id": task_id,
+            "title": task.title,
+            "status": task.status,
+            "message": f"Task '{task.title}' deleted successfully",
+        }
+
+        return ToolResult(
+            data=result,
+            input_tokens=0,
+            output_tokens=count_tokens(str(result)),
+        )
+
+    async def _handle_task_update(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_task_update - update task properties (admin only).
+
+        Args:
+            params: Dict containing:
+                - swarm_id: Swarm ID (required)
+                - task_id: Task ID to update (required)
+                - title: New title (optional)
+                - description: New description (optional)
+                - priority: New priority (optional)
+                - status: New status (optional)
+                - metadata: New metadata (optional)
+
+        Returns:
+            ToolResult with update status
+        """
+        swarm_id = params.get("swarm_id", "")
+        task_id = params.get("task_id", "")
+
+        if not swarm_id or not task_id:
+            missing = []
+            if not swarm_id:
+                missing.append("swarm_id")
+            if not task_id:
+                missing.append("task_id")
+            err = f"rlm_task_update: missing required parameter(s): {', '.join(missing)}"
+            return ToolResult(data={"error": err}, input_tokens=0, output_tokens=0)
+
+        db = await get_db()
+
+        # Get the task
+        task = await db.swarmtask.find_first(
+            where={"id": task_id, "swarmId": swarm_id}
+        )
+
+        if not task:
+            return ToolResult(
+                data={"error": f"Task '{task_id}' not found in swarm '{swarm_id}'"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        # Build update data from provided params
+        update_data: dict[str, Any] = {}
+
+        if "title" in params:
+            update_data["title"] = params["title"]
+
+        if "description" in params:
+            update_data["description"] = params["description"]
+
+        if "priority" in params:
+            update_data["priority"] = int(params["priority"])
+
+        if "status" in params:
+            new_status = params["status"].upper()
+            valid = ["PENDING", "IN_PROGRESS", "COMPLETED", "FAILED", "CANCELLED", "CLAIMED"]
+            if new_status not in valid:
+                err = f"Invalid status '{new_status}'. Valid: {', '.join(valid)}"
+                return ToolResult(data={"error": err}, input_tokens=0, output_tokens=0)
+            update_data["status"] = new_status
+            # Set completedAt if marking as completed/failed
+            if new_status in ["COMPLETED", "FAILED"]:
+                update_data["completedAt"] = datetime.now(UTC)
+
+        if not update_data:
+            err = "No fields to update. Provide: title, description, priority, or status"
+            return ToolResult(data={"error": err}, input_tokens=0, output_tokens=0)
+
+        # Update the task
+        updated = await db.swarmtask.update(
+            where={"id": task_id},
+            data=update_data,
+        )
+
+        result = {
+            "success": True,
+            "task_id": task_id,
+            "updated_fields": list(update_data.keys()),
+            "task": {
+                "id": updated.id,
+                "title": updated.title,
+                "status": updated.status,
+                "priority": updated.priority,
+            },
+        }
+
+        return ToolResult(
+            data=result,
+            input_tokens=0,
+            output_tokens=count_tokens(str(result)),
+        )
+
+    async def _handle_task_unclaim(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_task_unclaim - unclaim a stuck task."""
+        from .engine.handlers.swarm import handle_task_unclaim
+
+        return await handle_task_unclaim(params, await self._get_handler_ctx())
+
+    async def _handle_task_recover(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_task_recover - recover stuck tasks in batch."""
+        from .engine.handlers.swarm import handle_task_recover
+
+        return await handle_task_recover(params, await self._get_handler_ctx())
+
     # ============ Phase 10: Document Sync Handlers ============
 
     async def _handle_upload_document(self, params: dict[str, Any]) -> ToolResult:
@@ -5044,12 +7482,37 @@ class RLMEngine:
         content_hash = hashlib.sha256(content.encode()).hexdigest()
         size = len(content.encode())
 
-        # Check if document exists
+        # Check if document exists (including soft-deleted)
         existing = await db.document.find_first(where={"projectId": self.project_id, "path": path})
 
         if existing:
+            # Check if soft-deleted - if so, restore it
+            if existing.deletedAt is not None:
+                # Restore soft-deleted document with new content
+                await db.document.update(
+                    where={"id": existing.id},
+                    data={
+                        "content": content,
+                        "hash": content_hash,
+                        "size": size,
+                        "source": "mcp",
+                        "deletedAt": None,
+                        "deletedBy": None,
+                    },
+                )
+                # Invalidate index and query caches
+                self.index = None
+                self._chunks_available = None
+                await self._invalidate_context_query_cache()
+                result = UploadDocumentResult(
+                    path=path,
+                    action="restored",
+                    size=size,
+                    hash=content_hash,
+                    message=f"Document '{path}' restored from trash ({size} bytes)",
+                )
             # Check if content changed
-            if existing.hash == content_hash:
+            elif existing.hash == content_hash:
                 result = UploadDocumentResult(
                     path=path,
                     action="unchanged",
@@ -5061,10 +7524,12 @@ class RLMEngine:
                 # Update existing document
                 await db.document.update(
                     where={"id": existing.id},
-                    data={"content": content, "hash": content_hash, "size": size},
+                    data={"content": content, "hash": content_hash, "size": size, "source": "mcp"},
                 )
-                # Invalidate index cache
+                # Invalidate index and query caches
                 self.index = None
+                self._chunks_available = None
+                await self._invalidate_context_query_cache()
                 result = UploadDocumentResult(
                     path=path,
                     action="updated",
@@ -5081,10 +7546,13 @@ class RLMEngine:
                     "content": content,
                     "hash": content_hash,
                     "size": size,
+                    "source": "mcp",
                 }
             )
-            # Invalidate index cache
+            # Invalidate index and query caches
             self.index = None
+            self._chunks_available = None
+            await self._invalidate_context_query_cache()
             result = UploadDocumentResult(
                 path=path,
                 action="created",
@@ -5128,8 +7596,8 @@ class RLMEngine:
         deleted = 0
         input_tokens = 0
 
-        # Get all existing documents
-        existing_docs = await db.document.find_many(where={"projectId": self.project_id})
+        # Get all existing documents (exclude soft-deleted)
+        existing_docs = await db.document.find_many(where={"projectId": self.project_id, "deletedAt": None})
         existing_by_path = {doc.path: doc for doc in existing_docs}
         synced_paths = set()
 
@@ -5156,7 +7624,7 @@ class RLMEngine:
                 else:
                     await db.document.update(
                         where={"id": existing.id},
-                        data={"content": content, "hash": content_hash, "size": size},
+                        data={"content": content, "hash": content_hash, "size": size, "source": "mcp"},
                     )
                     updated += 1
             else:
@@ -5167,20 +7635,41 @@ class RLMEngine:
                         "content": content,
                         "hash": content_hash,
                         "size": size,
+                        "source": "mcp",
                     }
                 )
                 created += 1
 
         # Delete missing documents if requested
         if delete_missing:
+            # Get trash retention days for this plan
+            plan_name = self.plan.value if hasattr(self.plan, "value") else str(self.plan)
+            trash_retention_days = settings.trash_retention_days.get(plan_name, 0)
+
             for path, doc in existing_by_path.items():
                 if path not in synced_paths:
-                    await db.document.delete(where={"id": doc.id})
+                    if trash_retention_days > 0:
+                        # Soft delete - move to trash (plan supports retention)
+                        await db.document.update(
+                            where={"id": doc.id},
+                            data={
+                                "deletedAt": datetime.now(UTC),
+                                "deletedBy": self.user_id,
+                            },
+                        )
+                        # Delete chunks to free up space (can be regenerated on restore)
+                        await db.documentchunk.delete_many(where={"documentId": doc.id})
+                    else:
+                        # Hard delete - FREE plan has no trash retention
+                        await db.documentchunk.delete_many(where={"documentId": doc.id})
+                        await db.document.delete(where={"id": doc.id})
                     deleted += 1
 
-        # Invalidate index cache if any changes
+        # Invalidate index and query caches if any changes
         if created > 0 or updated > 0 or deleted > 0:
             self.index = None
+            self._chunks_available = None
+            await self._invalidate_context_query_cache()
 
         total = created + updated + unchanged
         result = SyncDocumentsResult(
@@ -6076,3 +8565,411 @@ print(f"[Snipara] {len(context.get('files', {}))} files loaded. Helpers: peek, g
             input_tokens=0,
             output_tokens=result.token_count,
         )
+
+    # ============ PHASE 15: DECISION LOG HANDLERS ============
+
+    async def _handle_decision_create(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_decision_create - create a structured decision record.
+
+        Creates an ADR-style decision record with context, rationale, alternatives,
+        and revert plans. Auto-generates DEC-XXX IDs.
+        """
+        from src.engine.handlers.decisions import handle_decision_create
+        from src.models.decision import DecisionCreateParams
+
+        try:
+            create_params = DecisionCreateParams(
+                title=params.get("title", ""),
+                owner=params.get("owner", ""),
+                scope=params.get("scope", ""),
+                impact=params.get("impact", "MEDIUM"),
+                context=params.get("context", ""),
+                decision=params.get("decision", ""),
+                rationale=params.get("rationale", ""),
+                alternatives=params.get("alternatives", []),
+                revert_plan=params.get("revert_plan"),
+                tags=params.get("tags", []),
+            )
+
+            db = await get_db()
+            result = await handle_decision_create(db, self.project_id, create_params)
+
+            return ToolResult(
+                data=result.model_dump(),
+                input_tokens=count_tokens(params.get("context", "") + params.get("decision", "")),
+                output_tokens=count_tokens(result.model_dump_json()),
+            )
+        except ValueError as e:
+            return ToolResult(
+                data={"error": str(e)},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+    async def _handle_decision_query(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_decision_query - query project decisions with filters.
+
+        Search by status, impact, scope, tags, or text query.
+        """
+        from src.engine.handlers.decisions import handle_decision_query
+        from src.models.decision import DecisionQueryParams
+
+        query_params = DecisionQueryParams(
+            query=params.get("query"),
+            status=params.get("status"),
+            impact=params.get("impact"),
+            scope=params.get("scope"),
+            tags=params.get("tags"),
+            limit=params.get("limit", 10),
+            include_superseded=params.get("include_superseded", False),
+        )
+
+        db = await get_db()
+        result = await handle_decision_query(db, self.project_id, query_params)
+
+        return ToolResult(
+            data=result.model_dump(),
+            input_tokens=count_tokens(params.get("query", "")),
+            output_tokens=count_tokens(result.model_dump_json()),
+        )
+
+    async def _handle_decision_supersede(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_decision_supersede - supersede an existing decision with a new one.
+
+        Creates a new decision that replaces an old one, maintaining the chain of evolution.
+        """
+        from src.engine.handlers.decisions import handle_decision_supersede
+        from src.models.decision import DecisionCreateParams
+
+        old_decision_id = params.get("old_decision_id", "")
+        if not old_decision_id:
+            return ToolResult(
+                data={"error": "old_decision_id is required"},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        try:
+            new_params = DecisionCreateParams(
+                title=params.get("title", ""),
+                owner=params.get("owner", ""),
+                scope=params.get("scope", ""),
+                impact=params.get("impact", "MEDIUM"),
+                context=params.get("context", ""),
+                decision=params.get("decision", ""),
+                rationale=params.get("rationale", ""),
+                alternatives=params.get("alternatives", []),
+                revert_plan=params.get("revert_plan"),
+                tags=params.get("tags", []),
+            )
+
+            db = await get_db()
+            result = await handle_decision_supersede(
+                db, self.project_id, old_decision_id, new_params
+            )
+
+            return ToolResult(
+                data=result.model_dump(),
+                input_tokens=count_tokens(params.get("context", "") + params.get("decision", "")),
+                output_tokens=count_tokens(result.model_dump_json()),
+            )
+        except ValueError as e:
+            return ToolResult(
+                data={"error": str(e)},
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+    # =========================================================================
+    # Phase 16: Index Health & Search Analytics (Sprint 3)
+    # =========================================================================
+
+    async def _handle_index_health(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_index_health - get comprehensive index health metrics.
+
+        Returns coverage, tier distribution, quality scores, stale documents,
+        and overall health score for the project.
+        """
+        from src.services.index_health import compute_index_health, get_index_recommendations
+
+        db = await get_db()
+        stale_threshold_days = params.get("stale_threshold_days", 30)
+
+        health = await compute_index_health(
+            db,
+            self.project_id,
+            stale_threshold_days=stale_threshold_days,
+        )
+
+        recommendations = await get_index_recommendations(db, self.project_id, health)
+        result = health.to_dict()
+        result["needs_attention"] = health.health_status in {"warning", "critical"}
+        if recommendations:
+            result["recommendations"] = recommendations
+            primary = next((rec for rec in recommendations if rec.get("tool") == "rlm_reindex"), None)
+            if primary:
+                result["client_notice"] = primary["description"]
+                result["recommended_tool"] = primary["tool"]
+                result["recommended_tool_arguments"] = primary["arguments"]
+
+        return ToolResult(
+            data=result,
+            input_tokens=0,
+            output_tokens=count_tokens(str(result)),
+        )
+
+    async def _handle_index_recommendations(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_index_recommendations - get actionable recommendations.
+
+        Returns prioritized list of recommendations to improve index health.
+        """
+        from src.services.index_health import compute_index_health, get_index_recommendations
+
+        db = await get_db()
+        # Compute health first if not cached
+        health = await compute_index_health(db, self.project_id)
+        recommendations = await get_index_recommendations(db, self.project_id, health)
+
+        result = {
+            "recommendations": recommendations,
+            "health_score": health.health_score,
+            "health_status": health.health_status,
+        }
+        primary = next((rec for rec in recommendations if rec.get("tool") == "rlm_reindex"), None)
+        if primary:
+            result["recommended_tool"] = primary["tool"]
+            result["recommended_tool_arguments"] = primary["arguments"]
+            result["client_notice"] = primary["description"]
+
+        return ToolResult(
+            data=result,
+            input_tokens=0,
+            output_tokens=count_tokens(str(result)),
+        )
+
+    async def _handle_reindex(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_reindex - trigger or poll a background reindex job through MCP.
+        """
+        from src.services.background_jobs import create_index_job, get_job_status
+
+        db = await get_db()
+        job_id = params.get("job_id")
+
+        if job_id:
+            status = await get_job_status(db, self.project_id, job_id)
+            if not status:
+                result = {"error": f"Reindex job '{job_id}' not found for project '{self.project_id}'"}
+                return ToolResult(data=result, input_tokens=0, output_tokens=count_tokens(str(result)))
+
+            status["action"] = "status"
+            status["poll_with"] = {"job_id": job_id}
+            return ToolResult(
+                data=status,
+                input_tokens=0,
+                output_tokens=count_tokens(str(status)),
+            )
+
+        mode = str(params.get("mode", "incremental")).lower()
+        kind = str(params.get("kind", "doc")).lower()
+
+        if mode not in {"incremental", "full"}:
+            result = {"error": "Invalid mode. Must be one of: incremental, full"}
+            return ToolResult(data=result, input_tokens=0, output_tokens=count_tokens(str(result)))
+
+        if kind not in {"doc", "code"}:
+            result = {"error": "Invalid kind. Must be one of: doc, code"}
+            return ToolResult(data=result, input_tokens=0, output_tokens=count_tokens(str(result)))
+
+        if kind == "code" and not settings.enable_code_ingestion:
+            result = {"error": "Code ingestion is not enabled"}
+            return ToolResult(data=result, input_tokens=0, output_tokens=count_tokens(str(result)))
+
+        job = await create_index_job(
+            db,
+            self.project_id,
+            triggered_by=self.user_id or "mcp",
+            triggered_via="api",
+            index_mode="FULL" if mode == "full" else "INCREMENTAL",
+            index_kind="CODE" if kind == "code" else "DOC",
+        )
+
+        result = {
+            "action": "trigger",
+            "job_id": job["id"],
+            "project_id": self.project_id,
+            "status": job["status"],
+            "progress": job.get("progress", 0),
+            "index_mode": str(job.get("index_mode", mode)).lower(),
+            "index_kind": str(job.get("index_kind", kind)).lower(),
+            "created_at": job.get("created_at"),
+            "already_exists": job.get("already_exists", False),
+            "status_poll": {"job_id": job["id"]},
+        }
+        return ToolResult(
+            data=result,
+            input_tokens=0,
+            output_tokens=count_tokens(str(result)),
+        )
+
+    async def _handle_search_analytics(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_search_analytics - get comprehensive search performance metrics.
+
+        Returns query counts, success rates, latency percentiles, tool usage,
+        daily trends, and error breakdown.
+        """
+        from src.services.search_analytics import compute_search_analytics
+
+        db = await get_db()
+        days = params.get("days", 30)
+
+        analytics = await compute_search_analytics(
+            db,
+            self.project_id,
+            days=days,
+        )
+
+        return ToolResult(
+            data=analytics.to_dict(),
+            input_tokens=0,
+            output_tokens=count_tokens(str(analytics.to_dict())),
+        )
+
+    async def _handle_query_trends(self, params: dict[str, Any]) -> ToolResult:
+        """
+        Handle rlm_query_trends - get query volume trends over time.
+
+        Returns time-bucketed query statistics for visualization.
+        """
+        from src.services.search_analytics import get_query_trends
+
+        db = await get_db()
+        days = params.get("days", 7)
+        granularity = params.get("granularity", "hour")
+
+        trends = await get_query_trends(
+            db,
+            self.project_id,
+            days=days,
+            granularity=granularity,
+        )
+
+        return ToolResult(
+            data={
+                "trends": trends,
+                "granularity": granularity,
+                "period_days": days,
+            },
+            input_tokens=0,
+            output_tokens=count_tokens(str(trends)),
+        )
+
+    # ============ PHASE 17: HIERARCHICAL TASK HANDLERS ============
+
+    async def _handle_htask_create(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_htask_create - create a hierarchical task at any level."""
+        from .engine.handlers.htask import handle_htask_create
+
+        return await handle_htask_create(params, await self._get_handler_ctx())
+
+    async def _handle_htask_create_feature(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_htask_create_feature - create N1 feature with workstreams."""
+        from .engine.handlers.htask import handle_htask_create_feature
+
+        return await handle_htask_create_feature(params, await self._get_handler_ctx())
+
+    async def _handle_htask_get(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_htask_get - get task with children."""
+        from .engine.handlers.htask import handle_htask_get
+
+        return await handle_htask_get(params, await self._get_handler_ctx())
+
+    async def _handle_htask_tree(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_htask_tree - get full hierarchical tree."""
+        from .engine.handlers.htask import handle_htask_tree
+
+        return await handle_htask_tree(params, await self._get_handler_ctx())
+
+    async def _handle_htask_update(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_htask_update - update task fields."""
+        from .engine.handlers.htask import handle_htask_update
+
+        return await handle_htask_update(params, await self._get_handler_ctx())
+
+    async def _handle_htask_block(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_htask_block - block task with payload."""
+        from .engine.handlers.htask import handle_htask_block
+
+        return await handle_htask_block(params, await self._get_handler_ctx())
+
+    async def _handle_htask_unblock(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_htask_unblock - unblock task."""
+        from .engine.handlers.htask import handle_htask_unblock
+
+        return await handle_htask_unblock(params, await self._get_handler_ctx())
+
+    async def _handle_htask_complete(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_htask_complete - complete N3 task with evidence."""
+        from .engine.handlers.htask import handle_htask_complete
+
+        return await handle_htask_complete(params, await self._get_handler_ctx())
+
+    async def _handle_htask_verify_closure(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_htask_verify_closure - verify if parent can close."""
+        from .engine.handlers.htask import handle_htask_verify_closure
+
+        return await handle_htask_verify_closure(params, await self._get_handler_ctx())
+
+    async def _handle_htask_close(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_htask_close - close parent task."""
+        from .engine.handlers.htask import handle_htask_close
+
+        return await handle_htask_close(params, await self._get_handler_ctx())
+
+    async def _handle_htask_delete(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_htask_delete - delete task."""
+        from .engine.handlers.htask import handle_htask_delete
+
+        return await handle_htask_delete(params, await self._get_handler_ctx())
+
+    async def _handle_htask_recommend_batch(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_htask_recommend_batch - get recommended N3 tasks."""
+        from .engine.handlers.htask import handle_htask_recommend_batch
+
+        return await handle_htask_recommend_batch(params, await self._get_handler_ctx())
+
+    async def _handle_htask_policy_get(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_htask_policy_get - get htask policy."""
+        from .engine.handlers.htask import handle_htask_policy_get
+
+        return await handle_htask_policy_get(params, await self._get_handler_ctx())
+
+    async def _handle_htask_policy_update(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_htask_policy_update - update htask policy."""
+        from .engine.handlers.htask import handle_htask_policy_update
+
+        return await handle_htask_policy_update(params, await self._get_handler_ctx())
+
+    async def _handle_htask_metrics(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_htask_metrics - get comprehensive metrics."""
+        from .engine.handlers.htask import handle_htask_metrics
+
+        return await handle_htask_metrics(params, await self._get_handler_ctx())
+
+    async def _handle_htask_audit_trail(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_htask_audit_trail - get task audit trail."""
+        from .engine.handlers.htask import handle_htask_audit_trail
+
+        return await handle_htask_audit_trail(params, await self._get_handler_ctx())
+
+    async def _handle_htask_checkpoint_delta(self, params: dict[str, Any]) -> ToolResult:
+        """Handle rlm_htask_checkpoint_delta - get delta report."""
+        from .engine.handlers.htask import handle_htask_checkpoint_delta
+
+        return await handle_htask_checkpoint_delta(params, await self._get_handler_ctx())

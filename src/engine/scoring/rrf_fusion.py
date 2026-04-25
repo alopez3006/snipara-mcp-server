@@ -12,6 +12,7 @@ from .constants import (
     HYBRID_KEYWORD_HEAVY,
     HYBRID_SEMANTIC_HEAVY,
     RRF_K,
+    SELECTION_QUERY_PATTERNS,
     SPECIFIC_QUERY_TERMS,
 )
 from .stemmer import stem_keyword
@@ -60,6 +61,12 @@ def classify_query_weights(
 
     # Signal 3: conceptual query pattern
     is_conceptual = any(query_lower.startswith(p) for p in CONCEPTUAL_PREFIXES)
+    is_selection = any(re.search(pattern, query_lower) for pattern in SELECTION_QUERY_PATTERNS)
+
+    # Selection/recommendation intent should favor semantic relevance even when
+    # keyword titles look tempting.
+    if is_selection:
+        return HYBRID_SEMANTIC_HEAVY
 
     # Priority: specific keyword matches first, then conceptual patterns
     if strong_keyword and has_specific:

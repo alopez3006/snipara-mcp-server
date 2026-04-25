@@ -11,6 +11,7 @@ Handles:
 - rlm_task_create: Create a task in the queue
 - rlm_task_claim: Claim a task from the queue
 - rlm_task_complete: Mark a task as complete
+- rlm_tasks: List tasks in a swarm
 """
 
 from typing import Any
@@ -23,10 +24,18 @@ from ...services.swarm import (
     complete_task,
     create_swarm,
     create_task,
+    get_agent_profile,
     get_state,
+    get_task_events,
+    get_task_stats,
     join_swarm,
+    list_tasks,
+    list_tasks_enhanced,
+    recover_stuck_tasks,
     release_claim,
     set_state,
+    unclaim_task,
+    update_agent_profile,
 )
 from .base import HandlerContext, count_tokens
 
@@ -54,7 +63,7 @@ async def handle_swarm_create(
 
     if not name:
         return ToolResult(
-            data={"error": "name is required"},
+            data={"error": "rlm_swarm_create: missing required parameter 'name'"},
             input_tokens=0,
             output_tokens=0,
         )
@@ -97,8 +106,13 @@ async def handle_swarm_join(
     capabilities = params.get("capabilities")
 
     if not swarm_id or not agent_id:
+        missing = []
+        if not swarm_id:
+            missing.append("swarm_id")
+        if not agent_id:
+            missing.append("agent_id")
         return ToolResult(
-            data={"error": "swarm_id and agent_id are required"},
+            data={"error": f"rlm_swarm_join: missing required parameter(s): {', '.join(missing)}"},
             input_tokens=0,
             output_tokens=0,
         )
@@ -141,8 +155,17 @@ async def handle_claim(
     timeout_seconds = params.get("timeout_seconds", 300)
 
     if not all([swarm_id, agent_id, resource_type, resource_id]):
+        missing = []
+        if not swarm_id:
+            missing.append("swarm_id")
+        if not agent_id:
+            missing.append("agent_id")
+        if not resource_type:
+            missing.append("resource_type")
+        if not resource_id:
+            missing.append("resource_id")
         return ToolResult(
-            data={"error": "swarm_id, agent_id, resource_type, and resource_id are required"},
+            data={"error": f"rlm_claim: missing required parameter(s): {', '.join(missing)}"},
             input_tokens=0,
             output_tokens=0,
         )
@@ -186,8 +209,13 @@ async def handle_release(
     resource_id = params.get("resource_id")
 
     if not swarm_id or not agent_id:
+        missing = []
+        if not swarm_id:
+            missing.append("swarm_id")
+        if not agent_id:
+            missing.append("agent_id")
         return ToolResult(
-            data={"error": "swarm_id and agent_id are required"},
+            data={"error": f"rlm_release: missing required parameter(s): {', '.join(missing)}"},
             input_tokens=0,
             output_tokens=0,
         )
@@ -225,8 +253,13 @@ async def handle_state_get(
     key = params.get("key", "")
 
     if not swarm_id or not key:
+        missing = []
+        if not swarm_id:
+            missing.append("swarm_id")
+        if not key:
+            missing.append("key")
         return ToolResult(
-            data={"error": "swarm_id and key are required"},
+            data={"error": f"rlm_state_get: missing required parameter(s): {', '.join(missing)}"},
             input_tokens=0,
             output_tokens=0,
         )
@@ -264,8 +297,15 @@ async def handle_state_set(
     expected_version = params.get("expected_version")
 
     if not swarm_id or not agent_id or not key:
+        missing = []
+        if not swarm_id:
+            missing.append("swarm_id")
+        if not agent_id:
+            missing.append("agent_id")
+        if not key:
+            missing.append("key")
         return ToolResult(
-            data={"error": "swarm_id, agent_id, and key are required"},
+            data={"error": f"rlm_state_set: missing required parameter(s): {', '.join(missing)}"},
             input_tokens=0,
             output_tokens=0,
         )
@@ -307,8 +347,15 @@ async def handle_broadcast(
     payload = params.get("payload")
 
     if not swarm_id or not agent_id or not event_type:
+        missing = []
+        if not swarm_id:
+            missing.append("swarm_id")
+        if not agent_id:
+            missing.append("agent_id")
+        if not event_type:
+            missing.append("event_type")
         return ToolResult(
-            data={"error": "swarm_id, agent_id, and event_type are required"},
+            data={"error": f"rlm_broadcast: missing required parameter(s): {', '.join(missing)}"},
             input_tokens=0,
             output_tokens=0,
         )
@@ -342,6 +389,7 @@ async def handle_task_create(
             - priority: Task priority (higher = more urgent)
             - depends_on: Task IDs this depends on
             - metadata: Additional task data
+            - for_agent_id: Pre-assign task to specific agent (task affinity)
 
     Returns:
         ToolResult with task ID
@@ -351,12 +399,21 @@ async def handle_task_create(
     title = params.get("title", "")
     description = params.get("description")
     priority = params.get("priority", 0)
+    deadline = params.get("deadline")
     depends_on = params.get("depends_on")
     metadata = params.get("metadata")
+    for_agent_id = params.get("for_agent_id")
 
     if not swarm_id or not agent_id or not title:
+        missing = []
+        if not swarm_id:
+            missing.append("swarm_id")
+        if not agent_id:
+            missing.append("agent_id")
+        if not title:
+            missing.append("title")
         return ToolResult(
-            data={"error": "swarm_id, agent_id, and title are required"},
+            data={"error": f"rlm_task_create: missing required parameter(s): {', '.join(missing)}"},
             input_tokens=0,
             output_tokens=0,
         )
@@ -367,8 +424,10 @@ async def handle_task_create(
         title=title,
         description=description,
         priority=priority,
+        deadline=deadline,
         depends_on=depends_on,
         metadata=metadata,
+        for_agent_id=for_agent_id,
     )
 
     return ToolResult(
@@ -400,8 +459,13 @@ async def handle_task_claim(
     timeout_seconds = params.get("timeout_seconds", 600)
 
     if not swarm_id or not agent_id:
+        missing = []
+        if not swarm_id:
+            missing.append("swarm_id")
+        if not agent_id:
+            missing.append("agent_id")
         return ToolResult(
-            data={"error": "swarm_id and agent_id are required"},
+            data={"error": f"rlm_task_claim: missing required parameter(s): {', '.join(missing)}"},
             input_tokens=0,
             output_tokens=0,
         )
@@ -444,8 +508,17 @@ async def handle_task_complete(
     result_data = params.get("result")
 
     if not swarm_id or not agent_id or not task_id:
+        missing = []
+        if not swarm_id:
+            missing.append("swarm_id")
+        if not agent_id:
+            missing.append("agent_id")
+        if not task_id:
+            missing.append("task_id")
         return ToolResult(
-            data={"error": "swarm_id, agent_id, and task_id are required"},
+            data={
+                "error": f"rlm_task_complete: missing required parameter(s): {', '.join(missing)}"
+            },
             input_tokens=0,
             output_tokens=0,
         )
@@ -461,5 +534,350 @@ async def handle_task_complete(
     return ToolResult(
         data=result,
         input_tokens=count_tokens(str(result_data) if result_data else ""),
+        output_tokens=count_tokens(str(result)),
+    )
+
+
+async def handle_tasks(
+    params: dict[str, Any],
+    ctx: HandlerContext,
+) -> ToolResult:
+    """List tasks in a swarm's task queue.
+
+    Args:
+        params: Dict containing:
+            - swarm_id: Swarm ID
+            - status: Optional filter by status (pending, claimed, completed, failed)
+            - assigned_to: Optional filter by assigned agent ID
+            - limit: Max tasks to return (default 50)
+
+    Returns:
+        ToolResult with list of tasks
+    """
+    swarm_id = params.get("swarm_id", "")
+    status = params.get("status")
+    assigned_to = params.get("assigned_to")
+    limit = params.get("limit", 50)
+
+    if not swarm_id:
+        return ToolResult(
+            data={"error": "rlm_tasks: missing required parameter 'swarm_id'"},
+            input_tokens=0,
+            output_tokens=0,
+        )
+
+    result = await list_tasks(
+        swarm_id=swarm_id,
+        status=status,
+        assigned_to=assigned_to,
+        limit=limit,
+    )
+
+    return ToolResult(
+        data=result,
+        input_tokens=0,
+        output_tokens=count_tokens(str(result)),
+    )
+
+
+async def handle_task_list(
+    params: dict[str, Any],
+    ctx: HandlerContext,
+) -> ToolResult:
+    """List tasks with cursor-based pagination.
+
+    Args:
+        params: Dict containing:
+            - swarm_id: Swarm ID (required)
+            - status: Optional filter by status (pending, in_progress, completed, failed, cancelled)
+            - limit: Max tasks to return (default 50, max 100)
+            - cursor: Cursor for pagination (task ID to start after)
+
+    Returns:
+        ToolResult with tasks: [{id, status, updated_at, owner}], has_more, next_cursor
+    """
+    swarm_id = params.get("swarm_id", "")
+    status = params.get("status")
+    limit = params.get("limit", 50)
+    cursor = params.get("cursor")
+
+    if not swarm_id:
+        return ToolResult(
+            data={"error": "rlm_task_list: missing required parameter 'swarm_id'"},
+            input_tokens=0,
+            output_tokens=0,
+        )
+
+    result = await list_tasks_enhanced(
+        swarm_id=swarm_id,
+        status=status,
+        limit=limit,
+        cursor=cursor,
+    )
+
+    return ToolResult(
+        data=result,
+        input_tokens=0,
+        output_tokens=count_tokens(str(result)),
+    )
+
+
+async def handle_task_stats(
+    params: dict[str, Any],
+    ctx: HandlerContext,
+) -> ToolResult:
+    """Get aggregated task statistics for a swarm.
+
+    Args:
+        params: Dict containing:
+            - swarm_id: Swarm ID (required)
+
+    Returns:
+        ToolResult with {done, in_progress, blocked, pending, failed, cancelled, total}
+    """
+    swarm_id = params.get("swarm_id", "")
+
+    if not swarm_id:
+        return ToolResult(
+            data={"error": "rlm_task_stats: missing required parameter 'swarm_id'"},
+            input_tokens=0,
+            output_tokens=0,
+        )
+
+    result = await get_task_stats(swarm_id=swarm_id)
+
+    return ToolResult(
+        data=result,
+        input_tokens=0,
+        output_tokens=count_tokens(str(result)),
+    )
+
+
+async def handle_task_events(
+    params: dict[str, Any],
+    ctx: HandlerContext,
+) -> ToolResult:
+    """Get task status change events for a swarm.
+
+    Args:
+        params: Dict containing:
+            - swarm_id: Swarm ID (required)
+            - since: ISO timestamp - only return events after this time
+            - limit: Max events to return (default 100)
+
+    Returns:
+        ToolResult with task events: [{event_id, event_type, task_id, timestamp}]
+    """
+    swarm_id = params.get("swarm_id", "")
+    since = params.get("since")
+    limit = params.get("limit", 100)
+
+    if not swarm_id:
+        return ToolResult(
+            data={"error": "rlm_task_events: missing required parameter 'swarm_id'"},
+            input_tokens=0,
+            output_tokens=0,
+        )
+
+    result = await get_task_events(
+        swarm_id=swarm_id,
+        since=since,
+        limit=limit,
+    )
+
+    return ToolResult(
+        data=result,
+        input_tokens=0,
+        output_tokens=count_tokens(str(result)),
+    )
+
+
+# ============ AGENT PROFILE HANDLERS ============
+
+
+async def handle_agent_profile_get(
+    params: dict[str, Any],
+    ctx: HandlerContext,
+) -> ToolResult:
+    """Get an agent's profile (identity, personality, boundaries).
+
+    Args:
+        params: Dict containing:
+            - swarm_id: Swarm ID (required)
+            - agent_id: Agent identifier (required)
+
+    Returns:
+        ToolResult with agent profile
+    """
+    swarm_id = params.get("swarm_id", "")
+    agent_id = params.get("agent_id", "")
+
+    if not swarm_id:
+        return ToolResult(
+            data={"error": "rlm_agent_profile_get: missing required parameter 'swarm_id'"},
+            input_tokens=0,
+            output_tokens=0,
+        )
+
+    if not agent_id:
+        return ToolResult(
+            data={"error": "rlm_agent_profile_get: missing required parameter 'agent_id'"},
+            input_tokens=0,
+            output_tokens=0,
+        )
+
+    result = await get_agent_profile(
+        swarm_id=swarm_id,
+        agent_id=agent_id,
+    )
+
+    return ToolResult(
+        data=result,
+        input_tokens=0,
+        output_tokens=count_tokens(str(result)),
+    )
+
+
+async def handle_agent_profile_update(
+    params: dict[str, Any],
+    ctx: HandlerContext,
+) -> ToolResult:
+    """Update an agent's profile.
+
+    Args:
+        params: Dict containing:
+            - swarm_id: Swarm ID (required)
+            - agent_id: Agent identifier (required)
+            - profile: Profile data to update (merged with existing)
+                - display_name: str
+                - personality: str
+                - role_description: str
+                - boundaries: list[str]
+                - communication_style: str
+                - decision_making: str
+                - soul_document_path: str
+                - memory_scope: "agent" | "project" | "team"
+                - custom: dict
+
+    Returns:
+        ToolResult with updated profile
+    """
+    swarm_id = params.get("swarm_id", "")
+    agent_id = params.get("agent_id", "")
+    profile = params.get("profile", {})
+
+    if not swarm_id:
+        return ToolResult(
+            data={"error": "rlm_agent_profile_update: missing required parameter 'swarm_id'"},
+            input_tokens=0,
+            output_tokens=0,
+        )
+
+    if not agent_id:
+        return ToolResult(
+            data={"error": "rlm_agent_profile_update: missing required parameter 'agent_id'"},
+            input_tokens=0,
+            output_tokens=0,
+        )
+
+    if not profile:
+        return ToolResult(
+            data={"error": "rlm_agent_profile_update: missing required parameter 'profile'"},
+            input_tokens=0,
+            output_tokens=0,
+        )
+
+    result = await update_agent_profile(
+        swarm_id=swarm_id,
+        agent_id=agent_id,
+        profile=profile,
+    )
+
+    return ToolResult(
+        data=result,
+        input_tokens=count_tokens(str(profile)),
+        output_tokens=count_tokens(str(result)),
+    )
+
+
+# ============ Task Recovery Handlers (P2) ============
+
+
+async def handle_task_unclaim(
+    params: dict[str, Any],
+    ctx: HandlerContext,
+) -> ToolResult:
+    """Unclaim a task, returning it to PENDING status.
+
+    Args:
+        params: Dict containing:
+            - swarm_id: Swarm ID (required)
+            - task_id: Task ID to unclaim (required)
+            - reason: Reason for unclaiming (optional)
+
+    Returns:
+        ToolResult with unclaim confirmation
+    """
+    swarm_id = params.get("swarm_id", "")
+    task_id = params.get("task_id", "")
+
+    if not swarm_id or not task_id:
+        missing = []
+        if not swarm_id:
+            missing.append("swarm_id")
+        if not task_id:
+            missing.append("task_id")
+        return ToolResult(
+            data={"error": f"rlm_task_unclaim: missing required parameter(s): {', '.join(missing)}"},
+            input_tokens=0,
+            output_tokens=0,
+        )
+
+    result = await unclaim_task(
+        swarm_id=swarm_id,
+        task_id=task_id,
+        reason=params.get("reason"),
+    )
+
+    return ToolResult(
+        data=result,
+        input_tokens=0,
+        output_tokens=count_tokens(str(result)),
+    )
+
+
+async def handle_task_recover(
+    params: dict[str, Any],
+    ctx: HandlerContext,
+) -> ToolResult:
+    """Find and recover stuck tasks in a swarm.
+
+    Args:
+        params: Dict containing:
+            - swarm_id: Swarm ID (required)
+            - stuck_threshold_minutes: Minutes threshold (default 30)
+            - dry_run: If true, only report without recovering (default true)
+
+    Returns:
+        ToolResult with stuck tasks and recovery results
+    """
+    swarm_id = params.get("swarm_id", "")
+
+    if not swarm_id:
+        return ToolResult(
+            data={"error": "rlm_task_recover: missing required parameter 'swarm_id'"},
+            input_tokens=0,
+            output_tokens=0,
+        )
+
+    result = await recover_stuck_tasks(
+        swarm_id=swarm_id,
+        stuck_threshold_minutes=params.get("stuck_threshold_minutes", 30),
+        dry_run=params.get("dry_run", True),
+    )
+
+    return ToolResult(
+        data=result,
+        input_tokens=0,
         output_tokens=count_tokens(str(result)),
     )

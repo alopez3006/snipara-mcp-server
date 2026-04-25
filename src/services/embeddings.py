@@ -102,8 +102,12 @@ class EmbeddingsService:
             # Import here to avoid loading torch at startup
             from sentence_transformers import SentenceTransformer
 
-            # Explicitly load on CPU to avoid meta tensor issues on memory-constrained environments
-            self._model = SentenceTransformer(self._model_name, device="cpu")
+            # Runtime loads are cache-only. Public models are warmed onto disk during deploy.
+            self._model = SentenceTransformer(
+                self._model_name,
+                device="cpu",
+                local_files_only=True,
+            )
             logger.info(f"Embedding model loaded: {self._model_name} (device: cpu)")
         return self._model
 

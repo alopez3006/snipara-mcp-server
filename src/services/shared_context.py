@@ -9,6 +9,7 @@ their documents with the project's own documentation, respecting:
 
 import hashlib
 import logging
+import re
 from dataclasses import dataclass, field
 from enum import StrEnum
 
@@ -52,12 +53,14 @@ class SharedDocument:
     slug: str
     content: str
     category: DocumentCategory
+    is_mandatory: bool  # Non-negotiable rule flag
     tags: list[str]
     priority: int  # Within-category priority
     token_count: int
     content_hash: str
     collection_id: str
     collection_name: str
+    source_type: str
     collection_priority: int  # Collection priority in project
 
 
@@ -117,12 +120,14 @@ async def load_team_context_for_project(project_id: str) -> list[SharedDocument]
             slug=ctx.key,
             content=ctx.value,
             category=DocumentCategory.BEST_PRACTICES,
+            is_mandatory=False,
             tags=[],
             priority=ctx.priority,
             token_count=token_count,
             content_hash=content_hash,
             collection_id=f"team_{project.teamId}",
             collection_name="Team Context",
+            source_type="TEAM_CONTEXT",
             collection_priority=-1,  # Higher priority than project collections
         )
         documents.append(doc)
@@ -198,12 +203,14 @@ async def load_project_shared_context(project_id: str) -> SharedContext:
                 slug=doc.slug,
                 content=doc.content,
                 category=category,
+                is_mandatory=getattr(doc, "isMandatory", False),
                 tags=doc.tags or [],
                 priority=doc.priority,
                 token_count=doc.tokenCount,
                 content_hash=doc.contentHash,
                 collection_id=collection.id,
                 collection_name=collection.name,
+                source_type="LINKED_COLLECTION",
                 collection_priority=ctx.priority,
             )
             documents.append(shared_doc)
@@ -264,12 +271,14 @@ def _truncate_document(doc: SharedDocument, max_tokens: int) -> SharedDocument:
         slug=doc.slug,
         content=truncated,
         category=doc.category,
+        is_mandatory=doc.is_mandatory,
         tags=doc.tags,
         priority=doc.priority,
         token_count=len(truncated) // 4,
         content_hash=doc.content_hash,
         collection_id=doc.collection_id,
         collection_name=doc.collection_name,
+        source_type=doc.source_type,
         collection_priority=doc.collection_priority,
     )
 
@@ -604,6 +613,18 @@ async def get_shared_prompt_templates(
     return templates
 
 
+async def _get_user_team_ids(user_id: str | None) -> list[str]:
+    """Get all team IDs where the user is a member."""
+    # Early return for None or empty string
+    if not user_id:
+        return []
+    db = await get_db()
+    memberships = await db.teammember.find_many(
+        where={"userId": user_id},
+    )
+    return [m.teamId for m in memberships]
+
+
 async def list_shared_collections(
     user_id: str,
     include_public: bool = True,
@@ -625,20 +646,37 @@ async def list_shared_collections(
     """
     db = await get_db()
 
+    # Early validation - user_id must be valid for non-public queries
+    has_valid_user = bool(user_id)
+
+    # First, get all team IDs where user is a member
+    user_team_ids = await _get_user_team_ids(user_id) if has_valid_user else []
+
     # Build the OR conditions for access
-    or_conditions = [
-        {"ownerId": user_id},
-        {"team": {"members": {"some": {"userId": user_id}}}},
-    ]
+    or_conditions: list[dict] = []
+
+    # Only add user-based conditions if we have a valid user_id
+    if has_valid_user:
+        or_conditions.append({"ownerId": user_id})
+        # Add team access condition if user is in any teams
+        if user_team_ids:
+            or_conditions.append({"teamId": {"in": user_team_ids}})
 
     if include_public:
         or_conditions.append({"isPublic": True})
 
+    # If no conditions, return empty list (no access)
+    if not or_conditions:
+        return []
+
+    # Query collections without _count (not supported in prisma-client-py)
+    # Note: prisma-client-py doesn't support nested select in include
     collections = await db.sharedcontextcollection.find_many(
         where={"OR": or_conditions},
         include={
-            "team": {"select": {"name": True}},
-            "_count": {"select": {"documents": True, "projectLinks": True}},
+            "team": True,
+            "documents": True,
+            "projectLinks": True,
         },
         order={"updatedAt": "desc"},
     )
@@ -648,10 +686,14 @@ async def list_shared_collections(
         # Determine access type for clarity
         if col.ownerId == user_id:
             access_type = "owner"
-        elif col.teamId:
+        elif col.teamId and col.teamId in user_team_ids:
             access_type = "team_member"
         else:
             access_type = "public"
+
+        # Count documents and project links manually
+        doc_count = len(col.documents) if col.documents else 0
+        project_count = len(col.projectLinks) if col.projectLinks else 0
 
         result.append(
             {
@@ -662,8 +704,8 @@ async def list_shared_collections(
                 "scope": col.scope,
                 "is_public": col.isPublic,
                 "team_name": col.team.name if col.team else None,
-                "document_count": col._count["documents"] if col._count else 0,
-                "project_count": col._count["projectLinks"] if col._count else 0,
+                "document_count": doc_count,
+                "project_count": project_count,
                 "access_type": access_type,
                 "version": col.version,
             }
@@ -703,14 +745,25 @@ async def create_shared_document(
 
     db = await get_db()
 
+    # Validate user_id
+    if not user_id:
+        raise ValueError("user_id is required to upload shared documents")
+
+    # First, get all team IDs where user is a member
+    user_team_ids = await _get_user_team_ids(user_id)
+
+    # Build access conditions
+    or_conditions: list[dict] = [
+        {"ownerId": user_id},
+    ]
+    if user_team_ids:
+        or_conditions.append({"teamId": {"in": user_team_ids}})
+
     # Check collection exists and user has access
     collection = await db.sharedcontextcollection.find_first(
         where={
             "id": collection_id,
-            "OR": [
-                {"ownerId": user_id},
-                {"team": {"members": {"some": {"userId": user_id}}}},
-            ],
+            "OR": or_conditions,
         },
     )
 
@@ -807,4 +860,296 @@ async def create_shared_document(
         "action": "created",
         "token_count": token_count,
         "message": f"Document '{title}' created ({token_count} tokens)",
+    }
+
+
+def _slugify(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    return slug or "collection"
+
+
+async def _get_admin_team_membership(user_id: str, team_id: str):
+    db = await get_db()
+    return await db.teammember.find_first(
+        where={
+            "userId": user_id,
+            "teamId": team_id,
+            "role": {"in": ["OWNER", "ADMIN"]},
+        }
+    )
+
+
+async def _resolve_accessible_project(project_id_or_slug: str, user_id: str):
+    db = await get_db()
+    project = await db.project.find_first(
+        where={
+            "OR": [
+                {"id": project_id_or_slug},
+                {"slug": project_id_or_slug},
+                {"githubRepo": project_id_or_slug},
+            ],
+            "team": {
+                "members": {
+                    "some": {
+                        "userId": user_id,
+                    }
+                }
+            },
+        }
+    )
+
+    if not project:
+        raise ValueError("Project not found or you don't have access to it")
+
+    return project
+
+
+async def _resolve_accessible_collection(collection_id: str, user_id: str, include_public: bool = True):
+    db = await get_db()
+    user_team_ids = await _get_user_team_ids(user_id)
+    or_conditions: list[dict] = [{"ownerId": user_id}]
+    if user_team_ids:
+        or_conditions.append({"teamId": {"in": user_team_ids}})
+    if include_public:
+        or_conditions.append({"isPublic": True})
+
+    collection = await db.sharedcontextcollection.find_first(
+        where={
+            "id": collection_id,
+            "OR": or_conditions,
+        },
+        include={
+            "team": True,
+            "documents": True,
+            "projectLinks": True,
+        },
+    )
+
+    if not collection:
+        raise ValueError("Collection not found or you don't have access to it")
+
+    return collection
+
+
+async def create_shared_collection(
+    *,
+    user_id: str,
+    team_id: str,
+    name: str,
+    slug: str | None = None,
+    description: str | None = None,
+    is_public: bool = False,
+) -> dict:
+    """Create a TEAM shared context collection for the current team."""
+    db = await get_db()
+
+    if not user_id:
+        raise ValueError("user_id is required to create shared collections")
+    if not name.strip():
+        raise ValueError("name is required")
+
+    membership = await _get_admin_team_membership(user_id, team_id)
+    if not membership:
+        raise ValueError("Only team admins can create shared collections")
+
+    resolved_slug = _slugify(slug or name)
+    existing = await db.sharedcontextcollection.find_first(
+        where={
+            "slug": resolved_slug,
+            "scope": "TEAM",
+            "teamId": team_id,
+        }
+    )
+    if existing:
+        raise ValueError(f"A collection with slug '{resolved_slug}' already exists")
+
+    collection = await db.sharedcontextcollection.create(
+        data={
+            "name": name.strip(),
+            "slug": resolved_slug,
+            "description": description,
+            "scope": "TEAM",
+            "teamId": team_id,
+            "isPublic": is_public,
+        },
+        include={
+            "team": True,
+            "documents": True,
+            "projectLinks": True,
+        },
+    )
+
+    return {
+        "collection_id": collection.id,
+        "name": collection.name,
+        "slug": collection.slug,
+        "scope": collection.scope,
+        "team_name": collection.team.name if collection.team else None,
+        "document_count": len(collection.documents or []),
+        "project_count": len(collection.projectLinks or []),
+        "message": f"Collection '{collection.name}' created",
+    }
+
+
+async def get_collection_documents(
+    *,
+    collection_id: str,
+    user_id: str,
+    include_content: bool = True,
+) -> dict:
+    """Return collection metadata and documents for an accessible shared collection."""
+    collection = await _resolve_accessible_collection(collection_id, user_id)
+
+    category_order = {
+        "MANDATORY": 0,
+        "BEST_PRACTICES": 1,
+        "GUIDELINES": 2,
+        "REFERENCE": 3,
+    }
+    documents = sorted(
+        list(collection.documents or []),
+        key=lambda doc: (category_order.get(doc.category, 99), -doc.priority, doc.title.lower()),
+    )
+
+    return {
+        "collection": {
+            "id": collection.id,
+            "name": collection.name,
+            "slug": collection.slug,
+            "description": collection.description,
+            "scope": collection.scope,
+            "team_name": collection.team.name if collection.team else None,
+            "document_count": len(documents),
+            "project_count": len(collection.projectLinks or []),
+            "version": collection.version,
+        },
+        "documents": [
+            {
+                "id": doc.id,
+                "title": doc.title,
+                "slug": doc.slug,
+                "category": doc.category,
+                "tags": doc.tags or [],
+                "priority": doc.priority,
+                "token_count": doc.tokenCount,
+                "content": doc.content if include_content else None,
+            }
+            for doc in documents
+        ],
+    }
+
+
+async def link_shared_collection_to_project(
+    *,
+    collection_id: str,
+    project_id_or_slug: str,
+    user_id: str,
+    priority: int | None = None,
+    token_budget_percent: int | None = None,
+    enabled_categories: list[str] | None = None,
+) -> dict:
+    """Link an accessible collection to an accessible project."""
+    db = await get_db()
+
+    if not user_id:
+        raise ValueError("user_id is required to link shared collections")
+
+    project = await _resolve_accessible_project(project_id_or_slug, user_id)
+    collection = await _resolve_accessible_collection(collection_id, user_id)
+
+    existing_link = await db.projectsharedcontext.find_unique(
+        where={"projectId_collectionId": {"projectId": project.id, "collectionId": collection.id}}
+    )
+    if existing_link:
+        return {
+            "link_id": existing_link.id,
+            "project_id": project.id,
+            "project_slug": project.slug,
+            "collection_id": collection.id,
+            "action": "unchanged",
+            "message": f"Collection '{collection.name}' is already linked to project '{project.slug}'",
+        }
+
+    next_priority = priority
+    if next_priority is None:
+        highest_priority_link = await db.projectsharedcontext.find_first(
+            where={"projectId": project.id},
+            order={"priority": "desc"},
+        )
+        next_priority = (
+            highest_priority_link.priority + 1
+            if highest_priority_link and highest_priority_link.priority is not None
+            else 0
+        )
+
+    await db.sharedcontextcollection.update(
+        where={"id": collection.id},
+        data={"usageCount": {"increment": 1}},
+    )
+
+    link = await db.projectsharedcontext.create(
+        data={
+            "projectId": project.id,
+            "collectionId": collection.id,
+            "priority": next_priority,
+            "tokenBudgetPercent": token_budget_percent,
+            "enabledCategories": enabled_categories or [],
+        }
+    )
+
+    return {
+        "link_id": link.id,
+        "project_id": project.id,
+        "project_slug": project.slug,
+        "collection_id": collection.id,
+        "collection_name": collection.name,
+        "priority": link.priority,
+        "action": "linked",
+        "message": f"Linked '{collection.name}' to project '{project.slug}'",
+    }
+
+
+async def unlink_shared_collection_from_project(
+    *,
+    collection_id: str,
+    project_id_or_slug: str,
+    user_id: str,
+) -> dict:
+    """Unlink a shared collection from an accessible project."""
+    db = await get_db()
+
+    if not user_id:
+        raise ValueError("user_id is required to unlink shared collections")
+
+    project = await _resolve_accessible_project(project_id_or_slug, user_id)
+    collection = await _resolve_accessible_collection(collection_id, user_id, include_public=True)
+
+    link = await db.projectsharedcontext.find_first(
+        where={
+            "projectId": project.id,
+            "collectionId": collection.id,
+        }
+    )
+    if not link:
+        return {
+            "project_id": project.id,
+            "project_slug": project.slug,
+            "collection_id": collection.id,
+            "action": "unchanged",
+            "message": f"Collection '{collection.name}' is not linked to project '{project.slug}'",
+        }
+
+    await db.projectsharedcontext.delete(where={"id": link.id})
+    await db.sharedcontextcollection.update(
+        where={"id": collection.id},
+        data={"usageCount": {"decrement": 1}},
+    )
+
+    return {
+        "project_id": project.id,
+        "project_slug": project.slug,
+        "collection_id": collection.id,
+        "collection_name": collection.name,
+        "action": "unlinked",
+        "message": f"Unlinked '{collection.name}' from project '{project.slug}'",
     }

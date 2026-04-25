@@ -2,7 +2,7 @@
 
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, root_validator
 
 from .enums import DecomposeStrategy, PlanStrategy, SearchMode
 
@@ -11,6 +11,31 @@ from .enums import DecomposeStrategy, PlanStrategy, SearchMode
 
 class ContextSection(BaseModel):
     """A section of relevant context returned by rlm_context_query."""
+
+    @root_validator(pre=True)
+    def _coerce_legacy_fields(self, values: dict[str, Any]) -> dict[str, Any]:
+        if "lines" not in values:
+            start_line = values.pop("start_line", None)
+            end_line = values.pop("end_line", None)
+            values["lines"] = (
+                int(start_line) if start_line is not None else 0,
+                int(end_line) if end_line is not None else 0,
+            )
+
+        if "token_count" not in values and "tokens" in values:
+            values["token_count"] = values.pop("tokens")
+
+        relevance_score = values.get("relevance_score")
+        if relevance_score is not None:
+            relevance = float(relevance_score)
+            if 10.0 <= relevance <= 100.0:
+                relevance = relevance / 100.0 if relevance <= 100.0 else 1.0
+            elif relevance > 100.0:
+                relevance = 1.0
+            values["relevance_score"] = relevance
+
+        values["file"] = values.get("file") or "(unknown)"
+        return values
 
     title: str = Field(..., description="Section title/heading")
     content: str = Field(..., description="Section content (may be truncated)")
@@ -22,6 +47,21 @@ class ContextSection(BaseModel):
         default=False, description="Whether content was truncated to fit budget"
     )
 
+    @property
+    def start_line(self) -> int:
+        """Backward-compatible alias for legacy section consumers."""
+        return self.lines[0]
+
+    @property
+    def end_line(self) -> int:
+        """Backward-compatible alias for legacy section consumers."""
+        return self.lines[1]
+
+    @property
+    def tokens(self) -> int:
+        """Backward-compatible alias for legacy section consumers."""
+        return self.token_count
+
 
 class ContextSectionRef(BaseModel):
     """A chunk reference returned when return_references=True.
@@ -30,6 +70,31 @@ class ContextSectionRef(BaseModel):
     Use rlm_get_chunk(chunk_id) to retrieve full content when needed.
     This reduces hallucination by maintaining clear source attribution.
     """
+
+    @root_validator(pre=True)
+    def _coerce_legacy_fields(self, values: dict[str, Any]) -> dict[str, Any]:
+        if "lines" not in values:
+            start_line = values.pop("start_line", None)
+            end_line = values.pop("end_line", None)
+            values["lines"] = (
+                int(start_line) if start_line is not None else 0,
+                int(end_line) if end_line is not None else 0,
+            )
+
+        if "token_count" not in values and "tokens" in values:
+            values["token_count"] = values.pop("tokens")
+
+        relevance_score = values.get("relevance_score")
+        if relevance_score is not None:
+            relevance = float(relevance_score)
+            if 10.0 <= relevance <= 100.0:
+                relevance = relevance / 100.0 if relevance <= 100.0 else 1.0
+            elif relevance > 100.0:
+                relevance = 1.0
+            values["relevance_score"] = relevance
+
+        values["file"] = values.get("file") or "(unknown)"
+        return values
 
     chunk_id: str = Field(
         ..., description="Unique chunk identifier for retrieval via rlm_get_chunk"
@@ -46,6 +111,21 @@ class ContextSectionRef(BaseModel):
     semantic_score: float = Field(
         default=0.0, description="Semantic similarity score (for debugging)"
     )
+
+    @property
+    def start_line(self) -> int:
+        """Backward-compatible alias for legacy section consumers."""
+        return self.lines[0]
+
+    @property
+    def end_line(self) -> int:
+        """Backward-compatible alias for legacy section consumers."""
+        return self.lines[1]
+
+    @property
+    def tokens(self) -> int:
+        """Backward-compatible alias for legacy section consumers."""
+        return self.token_count
 
 
 class GetChunkResult(BaseModel):
@@ -138,6 +218,26 @@ class ContextQueryResult(BaseModel):
         default=None,
         description="Assessed query complexity: 'simple', 'moderate', or 'complex'",
     )
+    recommended_tool: str | None = Field(
+        default=None,
+        description="Concrete MCP tool recommendation for structural queries, when available",
+    )
+    recommended_tool_arguments: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Suggested arguments for the recommended MCP tool",
+    )
+    graph_hybrid_used: bool = Field(
+        default=False,
+        description="Whether a structural code-graph summary was inlined into the response",
+    )
+    graph_context_tool: str | None = Field(
+        default=None,
+        description="Code graph MCP tool used to build the inline structural summary",
+    )
+    graph_context_summary: str | None = Field(
+        default=None,
+        description="Inline structural summary generated from the persisted code graph",
+    )
     # Auto-decompose metadata (Pro+ feature)
     decomposed: bool = Field(
         default=False,
@@ -146,6 +246,17 @@ class ContextQueryResult(BaseModel):
     sub_queries: list[str] = Field(
         default_factory=list,
         description="Sub-queries used when decomposed=True",
+    )
+    # Decision log metadata (Phase 15)
+    decisions_included: int = Field(
+        default=0,
+        ge=0,
+        description="Number of active CRITICAL/HIGH impact decisions auto-included in context",
+    )
+    decision_tokens: int = Field(
+        default=0,
+        ge=0,
+        description="Number of tokens from auto-included decisions",
     )
 
 

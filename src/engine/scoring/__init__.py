@@ -31,7 +31,9 @@ from .constants import (
     STOP_WORDS,
 )
 from .keyword_scorer import (
+    adjust_score_for_query_intent,
     calculate_keyword_score,
+    compute_keyword_weights,
     expand_keywords,
     extract_keywords,
     filter_ubiquitous_keywords,
@@ -66,7 +68,9 @@ __all__ = [
     # Stemmer
     "stem_keyword",
     # Keyword scorer
+    "adjust_score_for_query_intent",
     "calculate_keyword_score",
+    "compute_keyword_weights",
     "expand_keywords",
     "extract_keywords",
     "filter_ubiquitous_keywords",

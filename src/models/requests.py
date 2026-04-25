@@ -2,13 +2,15 @@
 
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, conlist
 
 from .enums import (
     AgentMemoryScope,
     AgentMemoryType,
     DecomposeStrategy,
     DocumentCategoryEnum,
+    EvidenceType,
+    MemoryStatus,
     PlanStrategy,
     SearchMode,
     SummaryType,
@@ -28,7 +30,7 @@ class MCPRequest(BaseModel):
 class AskParams(BaseModel):
     """Parameters for rlm_ask tool."""
 
-    question: str = Field(..., description="The question to ask about the documentation")
+    query: str = Field(..., description="The question to ask about the documentation")
 
 
 class SearchParams(BaseModel):
@@ -150,8 +152,8 @@ class MultiQueryItem(BaseModel):
 class MultiQueryParams(BaseModel):
     """Parameters for rlm_multi_query tool."""
 
-    queries: list[MultiQueryItem] = Field(
-        ..., min_length=1, max_length=10, description="List of queries to execute"
+    queries: conlist(MultiQueryItem, min_length=1, max_length=10) = Field(
+        ..., description="List of queries to execute"
     )
     max_tokens: int = Field(default=8000, ge=500, le=50000, description="Total token budget")
     search_mode: SearchMode = Field(
@@ -281,6 +283,15 @@ class RecallParams(BaseModel):
         default=0.5, ge=0.0, le=1.0, description="Minimum relevance score (0-1)"
     )
     include_expired: bool = Field(default=False, description="Include expired memories in recall")
+    include_inactive: bool = Field(
+        default=False, description="Include inactive memories in the main results"
+    )
+    warning_threshold: float = Field(
+        default=0.72,
+        ge=0.0,
+        le=1.0,
+        description="Minimum relevance score for inactive-memory warnings",
+    )
 
 
 class MemoriesParams(BaseModel):
@@ -289,10 +300,14 @@ class MemoriesParams(BaseModel):
     type: AgentMemoryType | None = Field(default=None, description="Filter by type")
     scope: AgentMemoryScope | None = Field(default=None, description="Filter by scope")
     category: str | None = Field(default=None, description="Filter by category")
+    status: MemoryStatus | None = Field(default=None, description="Filter by memory lifecycle")
     search: str | None = Field(default=None, description="Text search in content")
     limit: int = Field(default=20, ge=1, le=100, description="Maximum memories to return")
     offset: int = Field(default=0, ge=0, description="Offset for pagination")
     include_expired: bool = Field(default=False, description="Include expired memories")
+    include_inactive: bool = Field(
+        default=False, description="Include inactive memories in the result set"
+    )
 
 
 class ForgetParams(BaseModel):
@@ -305,6 +320,49 @@ class ForgetParams(BaseModel):
     category: str | None = Field(default=None, description="Delete all memories in this category")
     older_than_days: int | None = Field(
         default=None, ge=1, description="Delete memories older than N days"
+    )
+
+
+class MemoryInvalidateParams(BaseModel):
+    """Parameters for rlm_memory_invalidate."""
+
+    memory_id: str = Field(..., description="Legacy or V2 memory ID")
+    invalidated_at: str | None = Field(
+        default=None,
+        description="Optional ISO timestamp. Defaults to now.",
+    )
+    reason: str | None = Field(default=None, description="Optional invalidation reason")
+
+
+class MemoryAttachSourceParams(BaseModel):
+    """Parameters for rlm_memory_attach_source."""
+
+    memory_id: str = Field(..., description="Legacy or V2 memory ID")
+    evidence_type: EvidenceType = Field(..., description="Evidence type")
+    document_id: str | None = Field(default=None, description="Optional document ID")
+    chunk_id: str | None = Field(default=None, description="Optional chunk ID")
+    external_ref: str | None = Field(default=None, description="External path or URL")
+    snippet: str | None = Field(default=None, description="Optional supporting excerpt")
+    line_start: int | None = Field(default=None, ge=1, description="Optional start line")
+    line_end: int | None = Field(default=None, ge=1, description="Optional end line")
+    weight: float = Field(default=1.0, ge=0.0, le=1.0, description="Evidence weight")
+
+
+class MemorySupersedeParams(BaseModel):
+    """Parameters for rlm_memory_supersede."""
+
+    old_memory_id: str = Field(..., description="Legacy or V2 memory ID being superseded")
+    new_memory_id: str = Field(..., description="Legacy or V2 replacement memory ID")
+    reason: str | None = Field(default=None, description="Optional supersession reason")
+
+
+class MemoryVerifyParams(BaseModel):
+    """Parameters for rlm_memory_verify."""
+
+    memory_id: str = Field(..., description="Legacy or V2 memory ID")
+    mark_stale_if_missing: bool = Field(
+        default=True,
+        description="Mark memory stale when all evidence is invalid",
     )
 
 
@@ -340,8 +398,11 @@ class ClaimParams(BaseModel):
         ..., description="Resource type: 'file', 'function', 'module', 'custom'"
     )
     resource_id: str = Field(..., description="Resource identifier (e.g., 'src/auth.ts')")
-    ttl_seconds: int | None = Field(
-        default=None, ge=60, le=7200, description="Custom TTL (uses swarm default if null)"
+    timeout_seconds: int | None = Field(
+        default=None,
+        ge=60,
+        le=7200,
+        description="Claim timeout in seconds (uses swarm default if null)",
     )
 
 
@@ -392,6 +453,11 @@ class TaskCreateParams(BaseModel):
     depends_on: list[str] = Field(
         default_factory=list, description="Task IDs that must complete first"
     )
+    for_agent_id: str | None = Field(
+        default=None,
+        description="Pre-assign task to specific agent (task affinity). "
+        "If set, only this agent can claim the task.",
+    )
 
 
 class TaskClaimParams(BaseModel):
@@ -414,6 +480,23 @@ class TaskCompleteParams(BaseModel):
     error: str | None = Field(default=None, description="Error message if task failed")
 
 
+class TasksParams(BaseModel):
+    """Parameters for rlm_tasks tool - list tasks in a swarm."""
+
+    swarm_id: str = Field(..., description="Swarm ID")
+    status: str | None = Field(
+        default=None,
+        description="Filter by status: pending, claimed, completed, failed",
+    )
+    assigned_to: str | None = Field(
+        default=None,
+        description="Filter by assigned agent ID (for task affinity)",
+    )
+    limit: int = Field(
+        default=50, ge=1, le=100, description="Maximum tasks to return"
+    )
+
+
 # ============ DOCUMENT SYNC PARAMS (Phase 10) ============
 
 
@@ -427,8 +510,8 @@ class SyncDocumentItem(BaseModel):
 class SyncDocumentsParams(BaseModel):
     """Parameters for rlm_sync_documents tool."""
 
-    documents: list[SyncDocumentItem] = Field(
-        ..., description="Documents to sync", min_length=1, max_length=100
+    documents: conlist(SyncDocumentItem, min_length=1, max_length=100) = Field(
+        ..., description="Documents to sync"
     )
     delete_missing: bool = Field(default=False, description="Delete documents not in list")
 

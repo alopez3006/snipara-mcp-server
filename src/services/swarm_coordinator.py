@@ -253,9 +253,12 @@ async def get_swarm_info(swarm_id: str) -> dict[str, Any]:
     agents = [
         {
             "agent_id": a.agentId,
-            "role": a.role.lower(),
-            "capabilities": a.capabilities,
-            "last_seen": a.lastSeenAt.isoformat() if a.lastSeenAt else None,
+            "name": a.name,
+            "is_active": a.isActive,
+            "last_heartbeat": a.lastHeartbeat.isoformat() if a.lastHeartbeat else None,
+            "tasks_completed": a.tasksCompleted,
+            "tasks_failed": a.tasksFailed,
+            "joined_at": a.joinedAt.isoformat() if a.joinedAt else None,
         }
         for a in swarm.agents
     ]
@@ -269,6 +272,128 @@ async def get_swarm_info(swarm_id: str) -> dict[str, Any]:
         "is_active": swarm.isActive,
         "agent_count": len(agents),
         "agents": agents,
+    }
+
+
+async def get_agent_profile(
+    swarm_id: str,
+    agent_id: str,
+) -> dict[str, Any]:
+    """Get an agent's profile (identity, personality, boundaries).
+
+    Args:
+        swarm_id: The swarm ID
+        agent_id: The agent's unique identifier
+
+    Returns:
+        Dict with agent profile or error
+    """
+    db = await get_db()
+
+    # Find agent in swarm
+    agent = await db.swarmagent.find_first(
+        where={
+            "swarmId": swarm_id,
+            "agentId": agent_id,
+        }
+    )
+
+    if not agent:
+        return {
+            "success": False,
+            "error": f"Agent '{agent_id}' not found in swarm",
+            "profile": None,
+        }
+
+    # Parse profile JSON if exists
+    profile = agent.profile if agent.profile else {}
+    if isinstance(profile, str):
+        try:
+            profile = json.loads(profile)
+        except json.JSONDecodeError:
+            profile = {}
+
+    return {
+        "success": True,
+        "swarm_id": swarm_id,
+        "agent_id": agent_id,
+        "db_id": agent.id,
+        "name": agent.name,
+        "profile": profile,
+        "is_active": agent.isActive,
+        "joined_at": agent.joinedAt.isoformat() if agent.joinedAt else None,
+    }
+
+
+async def update_agent_profile(
+    swarm_id: str,
+    agent_id: str,
+    profile: dict[str, Any],
+) -> dict[str, Any]:
+    """Update an agent's profile.
+
+    Profile structure:
+    {
+        "display_name": str,       # "Jarvis ⚡"
+        "personality": str,        # "INTJ - Strategic, decisive"
+        "role_description": str,   # "Chief Coordinator"
+        "boundaries": list[str],   # ["Never send without approval", ...]
+        "communication_style": str, # "Direct, no fluff"
+        "decision_making": str,    # "Analyze then decide"
+        "soul_document_path": str, # "agents/jarvis/SOUL.md"
+        "memory_scope": str,       # "agent" | "project" | "team"
+        "custom": dict             # Any additional fields
+    }
+
+    Args:
+        swarm_id: The swarm ID
+        agent_id: The agent's unique identifier
+        profile: The profile data to update (merged with existing)
+
+    Returns:
+        Dict with updated profile or error
+    """
+    db = await get_db()
+
+    # Find agent in swarm
+    agent = await db.swarmagent.find_first(
+        where={
+            "swarmId": swarm_id,
+            "agentId": agent_id,
+        }
+    )
+
+    if not agent:
+        return {
+            "success": False,
+            "error": f"Agent '{agent_id}' not found in swarm",
+            "profile": None,
+        }
+
+    # Merge with existing profile
+    existing_profile = agent.profile if agent.profile else {}
+    if isinstance(existing_profile, str):
+        try:
+            existing_profile = json.loads(existing_profile)
+        except json.JSONDecodeError:
+            existing_profile = {}
+
+    merged_profile = {**existing_profile, **profile}
+
+    # Update agent with new profile
+    await db.swarmagent.update(
+        where={"id": agent.id},
+        data={"profile": Json(merged_profile)},
+    )
+
+    logger.info(f"Updated profile for agent {agent_id} in swarm {swarm_id}")
+
+    return {
+        "success": True,
+        "swarm_id": swarm_id,
+        "agent_id": agent_id,
+        "profile": merged_profile,
+        "message": "Profile updated successfully",
     }
 
 
@@ -786,6 +911,7 @@ async def create_task(
     deadline: datetime | str | None = None,
     depends_on: list[str] | None = None,
     metadata: dict[str, Any] | None = None,
+    for_agent_id: str | None = None,
 ) -> dict[str, Any]:
     """Create a task in the swarm's queue.
 
@@ -798,11 +924,23 @@ async def create_task(
         deadline: Optional deadline (datetime or ISO string)
         depends_on: List of task IDs this task depends on
         metadata: Additional task metadata
+        for_agent_id: Pre-assign task to specific agent (task affinity).
+                      If set, only this agent can claim the task.
 
     Returns:
         Dict with task info
     """
     db = await get_db()
+
+    # Verify swarm exists before attempting to create task
+    swarm = await db.agentswarm.find_unique(where={"id": swarm_id})
+    if not swarm:
+        logger.warning(f"rlm_task_create: swarm '{swarm_id}' not found")
+        return {"error": f"Swarm '{swarm_id}' not found"}
+
+    if not swarm.isActive:
+        logger.warning(f"rlm_task_create: swarm '{swarm_id}' is not active")
+        return {"error": f"Swarm '{swarm_id}' is not active"}
 
     # Parse deadline if string
     due_at = None
@@ -812,19 +950,37 @@ async def create_task(
         else:
             due_at = deadline
 
-    task = await db.swarmtask.create(
-        data={
-            "swarm": {"connect": {"id": swarm_id}},
-            "title": title,
-            "description": description,
-            "status": "PENDING",
-            "priority": priority,
-            "dueAt": due_at,
-            "dependsOn": depends_on or [],
-        }
-    )
+    # Build task data
+    task_data: dict[str, Any] = {
+        "swarm": {"connect": {"id": swarm_id}},
+        "title": title,
+        "description": description,
+        "status": "PENDING",
+        "priority": priority,
+        "dueAt": due_at,
+        "dependsOn": depends_on or [],
+    }
 
-    logger.info(f"Created task {task.id} in swarm {swarm_id}")
+    # Pre-assign to specific agent if for_agent_id is provided
+    assigned_agent_db_id = None
+    if for_agent_id:
+        # Find the agent's DB record (SwarmAgent.id, not the agentId string)
+        target_agent = await db.swarmagent.find_first(
+            where={
+                "swarmId": swarm_id,
+                "agentId": for_agent_id,
+                "isActive": True,
+            }
+        )
+        if target_agent:
+            task_data["agent"] = {"connect": {"id": target_agent.id}}
+            assigned_agent_db_id = target_agent.id
+        else:
+            logger.warning(f"for_agent_id '{for_agent_id}' not found in swarm {swarm_id}, task will be unassigned")
+
+    task = await db.swarmtask.create(data=task_data)
+
+    logger.info(f"Created task {task.id} in swarm {swarm_id}" + (f" for agent {for_agent_id}" if for_agent_id else ""))
 
     return {
         "success": True,
@@ -833,7 +989,9 @@ async def create_task(
         "priority": priority,
         "deadline": due_at.isoformat() if due_at else None,
         "depends_on": depends_on or [],
-        "message": "Task created",
+        "for_agent_id": for_agent_id,
+        "assigned": assigned_agent_db_id is not None,
+        "message": "Task created" + (f" for agent {for_agent_id}" if for_agent_id else ""),
     }
 
 
@@ -847,15 +1005,39 @@ async def create_tasks_bulk(
     Args:
         swarm_id: The swarm ID
         agent_id: Agent creating the tasks
-        tasks: List of task objects with title, description, priority, deadline, depends_on, metadata
+        tasks: List of task objects with title, description, priority, deadline,
+               depends_on, metadata, for_agent_id
 
     Returns:
         Dict with created task IDs and stats
     """
     db = await get_db()
 
+    # Verify swarm exists before attempting to create tasks
+    swarm = await db.agentswarm.find_unique(where={"id": swarm_id})
+    if not swarm:
+        logger.warning(f"rlm_task_bulk_create: swarm '{swarm_id}' not found")
+        return {"error": f"Swarm '{swarm_id}' not found", "created": 0, "failed": len(tasks)}
+
+    if not swarm.isActive:
+        logger.warning(f"rlm_task_bulk_create: swarm '{swarm_id}' is not active")
+        return {"error": f"Swarm '{swarm_id}' is not active", "created": 0, "failed": len(tasks)}
+
     created_ids: list[str] = []
     failed: list[dict[str, Any]] = []
+
+    # Pre-fetch all target agents for task affinity (batch lookup)
+    target_agent_ids = {t.get("for_agent_id") for t in tasks if t.get("for_agent_id")}
+    agent_id_to_db_id: dict[str, str] = {}
+    if target_agent_ids:
+        target_agents = await db.swarmagent.find_many(
+            where={
+                "swarmId": swarm_id,
+                "agentId": {"in": list(target_agent_ids)},
+                "isActive": True,
+            }
+        )
+        agent_id_to_db_id = {a.agentId: a.id for a in target_agents}
 
     for i, task_data in enumerate(tasks):
         title = task_data.get("title", "")
@@ -873,17 +1055,27 @@ async def create_tasks_bulk(
                 else:
                     due_at = deadline
 
-            task = await db.swarmtask.create(
-                data={
-                    "swarm": {"connect": {"id": swarm_id}},
-                    "title": title,
-                    "description": task_data.get("description"),
-                    "status": "PENDING",
-                    "priority": task_data.get("priority", 0),
-                    "dueAt": due_at,
-                    "dependsOn": task_data.get("depends_on") or [],
-                }
-            )
+            # Build task data
+            create_data: dict[str, Any] = {
+                "swarm": {"connect": {"id": swarm_id}},
+                "title": title,
+                "description": task_data.get("description"),
+                "status": "PENDING",
+                "priority": task_data.get("priority", 0),
+                "dueAt": due_at,
+                "dependsOn": task_data.get("depends_on") or [],
+            }
+
+            # Handle task affinity (for_agent_id)
+            for_agent_id = task_data.get("for_agent_id")
+            if for_agent_id:
+                db_id = agent_id_to_db_id.get(for_agent_id)
+                if db_id:
+                    create_data["agent"] = {"connect": {"id": db_id}}
+                else:
+                    logger.warning(f"for_agent_id '{for_agent_id}' not found for task {i}")
+
+            task = await db.swarmtask.create(data=create_data)
             created_ids.append(task.id)
         except Exception as e:
             failed.append({"index": i, "title": title, "error": str(e)})
@@ -909,6 +1101,10 @@ async def claim_task(
 
     If task_id is not provided, claims the highest priority available task
     (one whose dependencies are all completed).
+
+    Task affinity rules:
+    - If task has assignedTo set (pre-assigned), only that agent can claim it
+    - If task has no assignedTo (null), any agent can claim it
 
     Args:
         swarm_id: The swarm ID
@@ -953,14 +1149,23 @@ async def claim_task(
                 "error": "Task not found or not available",
                 "task_id": None,
             }
+
+        # Check task affinity - agent can only claim if assigned to them or unassigned
+        if task.assignedTo is not None and task.assignedTo != agent.id:
+            return {
+                "success": False,
+                "error": "Task is assigned to another agent",
+                "task_id": task.id,
+                "assigned_to": task.assignedTo,
+            }
     else:
-        # Find available task (dependencies completed)
-        task = await _get_available_task(swarm_id)
+        # Find available task (dependencies completed + agent affinity filter)
+        task = await _get_available_task(swarm_id, agent_db_id=agent.id)
 
         if not task:
             return {
                 "success": False,
-                "error": "No available tasks",
+                "error": "No available tasks for this agent",
                 "task_id": None,
             }
 
@@ -997,6 +1202,7 @@ async def claim_task(
         "description": task.description,
         "priority": task.priority,
         "deadline": deadline.isoformat(),
+        "was_preassigned": task.assignedTo is not None,
         "message": "Task claimed",
     }
 
@@ -1120,6 +1326,7 @@ async def list_tasks(
         where=where,
         order=[{"priority": "desc"}, {"createdAt": "asc"}],
         take=limit,
+        include={"agent": True},  # Include agent relation to get agentId
     )
 
     return {
@@ -1131,8 +1338,9 @@ async def list_tasks(
                 "status": t.status.lower(),
                 "priority": t.priority,
                 "depends_on": t.dependsOn,
+                "assigned_to": t.agent.agentId if t.agent else None,  # External agent ID
                 "created_at": t.createdAt.isoformat() if t.createdAt else None,
-                "deadline": t.deadline.isoformat() if t.deadline else None,
+                "deadline": t.dueAt.isoformat() if t.dueAt else None,
             }
             for t in tasks
         ],
@@ -1140,16 +1348,162 @@ async def list_tasks(
     }
 
 
-async def _get_available_task(swarm_id: str):
-    """Get highest priority task with all dependencies completed."""
+async def list_tasks_enhanced(
+    swarm_id: str,
+    status: str | None = None,
+    limit: int = 50,
+    cursor: str | None = None,
+) -> dict[str, Any]:
+    """List tasks in a swarm with cursor-based pagination.
+
+    Args:
+        swarm_id: The swarm ID
+        status: Filter by status (pending, in_progress, completed, failed, cancelled)
+        limit: Maximum tasks to return (default 50, max 100)
+        cursor: Cursor for pagination (task ID to start after)
+
+    Returns:
+        Dict with tasks list, pagination info
+    """
     db = await get_db()
+
+    # Clamp limit
+    limit = min(max(1, limit), 100)
+
+    where: dict[str, Any] = {"swarmId": swarm_id}
+
+    if status:
+        where["status"] = status.upper()
+
+    # Cursor-based pagination
+    if cursor:
+        where["id"] = {"gt": cursor}
+
+    tasks = await db.swarmtask.find_many(
+        where=where,
+        order=[{"createdAt": "asc"}, {"id": "asc"}],
+        take=limit + 1,  # Fetch one extra to check if there's more
+        include={"agent": True},
+    )
+
+    # Check if there are more results
+    has_more = len(tasks) > limit
+    if has_more:
+        tasks = tasks[:limit]
+
+    # Get next cursor
+    next_cursor = tasks[-1].id if tasks and has_more else None
+
+    return {
+        "tasks": [
+            {
+                "id": t.id,
+                "title": t.title,
+                "status": t.status.lower() if hasattr(t.status, "lower") else str(t.status).lower(),
+                "updated_at": (t.completedAt or t.startedAt or t.createdAt).isoformat()
+                if (t.completedAt or t.startedAt or t.createdAt)
+                else None,
+                "owner": t.agent.agentId if t.agent else None,
+            }
+            for t in tasks
+        ],
+        "total": len(tasks),
+        "has_more": has_more,
+        "next_cursor": next_cursor,
+    }
+
+
+async def get_task_stats(swarm_id: str) -> dict[str, Any]:
+    """Get aggregated task statistics for a swarm.
+
+    Args:
+        swarm_id: The swarm ID
+
+    Returns:
+        Dict with counts by status: done, in_progress, blocked, pending
+    """
+    db = await get_db()
+
+    # Get all tasks for this swarm
+    # Note: Python Prisma doesn't support 'select', fetch all fields
+    tasks = await db.swarmtask.find_many(
+        where={"swarmId": swarm_id},
+    )
+
+    # Count by status
+    counts = {
+        "done": 0,  # COMPLETED
+        "in_progress": 0,  # IN_PROGRESS or CLAIMED
+        "blocked": 0,  # PENDING with unmet dependencies
+        "pending": 0,  # PENDING with no dependencies or all deps complete
+        "failed": 0,  # FAILED
+        "cancelled": 0,  # CANCELLED
+    }
+
+    # Get completed task IDs for dependency checking
+    completed_ids = {t.id for t in tasks if str(t.status).upper() == "COMPLETED"}
+
+    for task in tasks:
+        status = str(task.status).upper()
+
+        if status == "COMPLETED":
+            counts["done"] += 1
+        elif status == "FAILED":
+            counts["failed"] += 1
+        elif status == "CANCELLED":
+            counts["cancelled"] += 1
+        elif status in ("IN_PROGRESS", "CLAIMED"):
+            counts["in_progress"] += 1
+        elif status == "PENDING":
+            # Check if blocked by dependencies
+            deps = task.dependsOn or []
+            if deps and not all(dep_id in completed_ids for dep_id in deps):
+                counts["blocked"] += 1
+            else:
+                counts["pending"] += 1
+
+    return {
+        "swarm_id": swarm_id,
+        "done": counts["done"],
+        "in_progress": counts["in_progress"],
+        "blocked": counts["blocked"],
+        "pending": counts["pending"],
+        "failed": counts["failed"],
+        "cancelled": counts["cancelled"],
+        "total": len(tasks),
+    }
+
+
+async def _get_available_task(swarm_id: str, agent_db_id: str | None = None):
+    """Get highest priority task with all dependencies completed.
+
+    Task affinity rules:
+    - If task has assignedTo set, only that agent can claim it
+    - If task has no assignedTo (null), any agent can claim it
+
+    Args:
+        swarm_id: The swarm ID
+        agent_db_id: The claiming agent's DB ID (SwarmAgent.id).
+                     If provided, filters to tasks assigned to this agent OR unassigned tasks.
+    """
+    db = await get_db()
+
+    # Build where clause with agent affinity filter
+    where_clause: dict[str, Any] = {
+        "swarmId": swarm_id,
+        "status": "PENDING",
+    }
+
+    # Apply agent affinity filter: agent can only claim tasks assigned to them OR unassigned
+    if agent_db_id:
+        where_clause["OR"] = [
+            {"assignedTo": agent_db_id},  # Tasks assigned to this agent
+            {"assignedTo": None},          # Unassigned tasks (any agent can claim)
+        ]
 
     # Get all pending tasks ordered by priority
     pending_tasks = await db.swarmtask.find_many(
-        where={
-            "swarmId": swarm_id,
-            "status": "PENDING",
-        },
+        where=where_clause,
         order=[{"priority": "desc"}, {"createdAt": "asc"}],
     )
 
@@ -1178,3 +1532,131 @@ async def _check_dependencies_complete(swarm_id: str, dep_ids: list[str]) -> boo
     )
 
     return completed_count == len(dep_ids)
+
+
+# ============================================
+# Task Recovery Functions (P2)
+# ============================================
+
+
+async def unclaim_task(
+    swarm_id: str,
+    task_id: str,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    """Unclaim a task, returning it to PENDING status.
+
+    Use this to recover tasks that are stuck (claimed but not progressing).
+
+    Args:
+        swarm_id: The swarm ID
+        task_id: The task ID to unclaim
+        reason: Optional reason for unclaiming
+
+    Returns:
+        Dict with unclaim confirmation
+    """
+    db = await get_db()
+
+    # Get the task
+    task = await db.swarmtask.find_first(
+        where={"id": task_id, "swarmId": swarm_id}
+    )
+
+    if not task:
+        return {"success": False, "error": "Task not found"}
+
+    if task.status not in ["CLAIMED", "IN_PROGRESS"]:
+        return {
+            "success": False,
+            "error": f"Task is {task.status}, cannot unclaim",
+        }
+
+    # Reset task to PENDING
+    await db.swarmtask.update(
+        where={"id": task_id},
+        data={
+            "status": "PENDING",
+            "assignedTo": None,
+            "claimedAt": None,
+            "startedAt": None,
+        },
+    )
+
+    return {
+        "success": True,
+        "task_id": task_id,
+        "previous_status": task.status,
+        "previous_agent": task.assignedTo,
+        "reason": reason,
+        "message": "Task unclaimed and returned to PENDING",
+    }
+
+
+async def recover_stuck_tasks(
+    swarm_id: str,
+    stuck_threshold_minutes: int = 30,
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    """Find and optionally recover tasks that are stuck.
+
+    A task is considered stuck if:
+    - Status is CLAIMED or IN_PROGRESS
+    - claimedAt or startedAt is older than threshold
+
+    Args:
+        swarm_id: The swarm ID
+        stuck_threshold_minutes: Minutes after which a task is considered stuck
+        dry_run: If True, only report stuck tasks without recovering them
+
+    Returns:
+        Dict with stuck tasks and recovery results
+    """
+    db = await get_db()
+
+    threshold = datetime.now(UTC) - timedelta(minutes=stuck_threshold_minutes)
+
+    # Find stuck tasks
+    stuck_tasks = await db.swarmtask.find_many(
+        where={
+            "swarmId": swarm_id,
+            "status": {"in": ["CLAIMED", "IN_PROGRESS"]},
+            "OR": [
+                {"claimedAt": {"lt": threshold}},
+                {"startedAt": {"lt": threshold}},
+            ],
+        },
+        order=[{"claimedAt": "asc"}],
+    )
+
+    result = {
+        "swarm_id": swarm_id,
+        "threshold_minutes": stuck_threshold_minutes,
+        "stuck_count": len(stuck_tasks),
+        "dry_run": dry_run,
+        "stuck_tasks": [],
+        "recovered": [],
+    }
+
+    for task in stuck_tasks:
+        stuck_info = {
+            "task_id": task.id,
+            "title": task.title,
+            "status": task.status,
+            "assigned_to": task.assignedTo,
+            "claimed_at": task.claimedAt.isoformat() if task.claimedAt else None,
+            "stuck_for_minutes": int(
+                (datetime.now(UTC) - (task.claimedAt or task.startedAt or datetime.now(UTC))).total_seconds() / 60
+            ),
+        }
+        result["stuck_tasks"].append(stuck_info)
+
+        if not dry_run:
+            # Recover the task
+            recovery = await unclaim_task(swarm_id, task.id, reason="Auto-recovered: stuck threshold exceeded")
+            if recovery.get("success"):
+                result["recovered"].append(task.id)
+
+    result["recovered_count"] = len(result["recovered"])
+
+    return result

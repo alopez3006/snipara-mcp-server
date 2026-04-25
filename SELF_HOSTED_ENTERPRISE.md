@@ -18,27 +18,27 @@ Organizations choose self-hosted Snipara for:
 
 ### Software & Support
 
-| Feature | Description |
-|---------|-------------|
-| **Full Source Code** | Complete FastAPI MCP server with all features |
-| **Security Features** | Audit logging, anti-scan protection, multi-project ACL |
-| **Advanced Embeddings** | bge-large-en-v1.5 (1024 dimensions) |
-| **Agent Infrastructure** | Memory system, swarms, multi-agent coordination |
-| **Team Features** | Shared context collections, multi-project queries |
-| **Quarterly Updates** | Security patches, feature updates, performance improvements |
-| **Deployment Support** | Docker images, Kubernetes manifests, Railway/Render configs |
-| **Documentation** | Architecture docs, API reference, runbooks |
+| Feature                  | Description                                                 |
+| ------------------------ | ----------------------------------------------------------- |
+| **Full Source Code**     | Complete FastAPI MCP server with all features               |
+| **Security Features**    | Audit logging, anti-scan protection, multi-project ACL      |
+| **Advanced Embeddings**  | bge-large-en-v1.5 (1024 dimensions)                         |
+| **Agent Infrastructure** | Memory system, swarms, multi-agent coordination             |
+| **Team Features**        | Shared context collections, multi-project queries           |
+| **Quarterly Updates**    | Security patches, feature updates, performance improvements |
+| **Deployment Support**   | Docker images, Kubernetes manifests, Render/Fly.io configs  |
+| **Documentation**        | Architecture docs, API reference, runbooks                  |
 
 ### Professional Services
 
-| Service | Included |
-|---------|----------|
-| **Initial Setup** | ✅ 8 hours - Infrastructure assessment, deployment planning |
-| **White-Glove Deployment** | ✅ Full deployment to your infrastructure |
-| **Custom Integration** | ✅ SSO, existing databases, monitoring tools |
-| **Training** | ✅ 4 hours - Admin training, best practices workshop |
-| **Ongoing Support** | ✅ Email + Slack support (24-hour SLA) |
-| **Quarterly Reviews** | ✅ Performance review, optimization recommendations |
+| Service                    | Included                                                    |
+| -------------------------- | ----------------------------------------------------------- |
+| **Initial Setup**          | ✅ 8 hours - Infrastructure assessment, deployment planning |
+| **White-Glove Deployment** | ✅ Full deployment to your infrastructure                   |
+| **Custom Integration**     | ✅ SSO, existing databases, monitoring tools                |
+| **Training**               | ✅ 4 hours - Admin training, best practices workshop        |
+| **Ongoing Support**        | ✅ Email + Slack support (24-hour SLA)                      |
+| **Quarterly Reviews**      | ✅ Performance review, optimization recommendations         |
 
 ## Pricing
 
@@ -47,6 +47,7 @@ Organizations choose self-hosted Snipara for:
 **$2,000/month minimum** (billed annually: $24,000/year)
 
 Includes:
+
 - Up to 50,000 queries/month
 - Unlimited projects and users
 - All features (security, agents, team context)
@@ -55,21 +56,21 @@ Includes:
 ### Volume Pricing
 
 | Monthly Queries | Price/Month |
-|----------------|-------------|
-| 50K | $2,000 |
-| 100K | $3,500 |
-| 250K | $7,500 |
-| 500K | $12,000 |
-| 1M+ | Custom |
+| --------------- | ----------- |
+| 50K             | $2,000      |
+| 100K            | $3,500      |
+| 250K            | $7,500      |
+| 500K            | $12,000     |
+| 1M+             | Custom      |
 
 ### Premium Support Add-Ons
 
-| Add-On | Price |
-|--------|-------|
-| **Priority Support** (4-hour SLA) | +$500/month |
-| **24/7 On-Call** (1-hour SLA) | +$2,000/month |
-| **Dedicated CSM** | +$3,000/month |
-| **Custom Feature Development** | Starting at $10,000/project |
+| Add-On                            | Price                       |
+| --------------------------------- | --------------------------- |
+| **Priority Support** (4-hour SLA) | +$500/month                 |
+| **24/7 On-Call** (1-hour SLA)     | +$2,000/month               |
+| **Dedicated CSM**                 | +$3,000/month               |
+| **Custom Feature Development**    | Starting at $10,000/project |
 
 ## Infrastructure Requirements
 
@@ -80,7 +81,7 @@ PostgreSQL:
   Version: "14+"
   Storage: "100GB SSD"
   Memory: "4GB RAM"
-  Note: "Neon, Supabase, or self-hosted"
+  Note: "Vaultbrix, Neon, or self-hosted"
 
 Redis:
   Version: "7+"
@@ -148,7 +149,7 @@ Estimated Cost: $1,000-$3,000/month (infrastructure only)
 - ✅ Multi-region support
 - ⚠️ Complex setup (requires K8s expertise)
 
-### 3. PaaS (Railway, Render, Fly.io)
+### 3. PaaS (Render, Fly.io)
 
 - ✅ Managed infrastructure
 - ✅ Easy scaling
@@ -185,16 +186,16 @@ We provide documentation and architecture guidance for:
 
 ## Comparison: Hosted vs Self-Hosted
 
-| Feature | Hosted Cloud | Self-Hosted Enterprise |
-|---------|--------------|------------------------|
-| **Setup Time** | 5 minutes | 2-4 weeks |
-| **Infrastructure Management** | ✅ Managed by Snipara | ❌ Your responsibility |
-| **Data Location** | US/EU regions | ✅ Your infrastructure |
-| **Scaling** | ✅ Automatic | Manual or auto-configured |
-| **Updates** | ✅ Automatic | Quarterly releases |
-| **Cost (50K queries/mo)** | $49/month (Team) | $2,000/month |
-| **Support** | Email | Email + Slack + Quarterly reviews |
-| **Compliance** | SOC 2 | ✅ Your compliance framework |
+| Feature                       | Hosted Cloud          | Self-Hosted Enterprise            |
+| ----------------------------- | --------------------- | --------------------------------- |
+| **Setup Time**                | 5 minutes             | 2-4 weeks                         |
+| **Infrastructure Management** | ✅ Managed by Snipara | ❌ Your responsibility            |
+| **Data Location**             | US/EU regions         | ✅ Your infrastructure            |
+| **Scaling**                   | ✅ Automatic          | Manual or auto-configured         |
+| **Updates**                   | ✅ Automatic          | Quarterly releases                |
+| **Cost (50K queries/mo)**     | $49/month (Team)      | $2,000/month                      |
+| **Support**                   | Email                 | Email + Slack + Quarterly reviews |
+| **Compliance**                | SOC 2                 | ✅ Your compliance framework      |
 
 ## Getting Started
 
@@ -203,6 +204,7 @@ We provide documentation and architecture guidance for:
 Email: **sales@snipara.com**
 
 Include:
+
 - Company name and size
 - Expected query volume
 - Infrastructure preferences (AWS, GCP, Azure, on-prem)
@@ -212,6 +214,7 @@ Include:
 ### Step 2: Scoping Call (30-60 minutes)
 
 We'll discuss:
+
 - ✅ Technical requirements
 - ✅ Integration points (SSO, databases, monitoring)
 - ✅ Deployment timeline
@@ -268,6 +271,7 @@ We'll discuss:
 ### Q: What's the difference between this and open source?
 
 **A:** Self-Hosted Enterprise includes:
+
 - Latest security features (audit logging, anti-scan)
 - Agent infrastructure (memory, swarms)
 - Team features (shared context collections)
@@ -284,4 +288,4 @@ The open source version (previously available on PyPI) is now deprecated and has
 
 ---
 
-*Pricing effective January 2026. Subject to change. All prices in USD.*
+_Pricing effective January 2026. Subject to change. All prices in USD._

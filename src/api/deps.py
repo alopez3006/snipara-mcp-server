@@ -31,6 +31,7 @@ from ..config import settings
 from ..models import MultiProjectQueryParams, Plan, ToolName
 from ..rlm_engine import RLMEngine, count_tokens
 from ..usage import (
+    check_auth_failure_rate_limit,
     check_client_usage_limits,
     check_rate_limit,
     check_usage_limits,
@@ -41,6 +42,28 @@ from ..usage import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+async def _reject_failed_auth(
+    *,
+    client_ip: str | None,
+    key_prefix: str,
+    detail: str,
+) -> None:
+    allowed = await check_auth_failure_rate_limit(client_ip, key_prefix)
+    log_security_event(
+        "auth.failed",
+        "api_key",
+        key_prefix,
+        key_prefix,
+        details={"rate_limited": not allowed},
+        ip_address=client_ip,
+    )
+
+    if not allowed:
+        raise HTTPException(status_code=429, detail="Too many failed authentication attempts.")
+
+    raise HTTPException(status_code=401, detail=detail)
 
 
 # ============ ERROR SANITIZATION ============
@@ -61,6 +84,8 @@ def sanitize_error_message(error: Exception) -> str:
         "Project not found",
         "Rate limit exceeded",
         "Monthly usage limit exceeded",
+        "requires context scope",
+        "requires memory scope",
         "Invalid tool name",
         "Invalid regex pattern",
         "No documentation loaded",
@@ -85,10 +110,15 @@ def sanitize_error_message(error: Exception) -> str:
 
 
 async def get_api_key(
-    x_api_key: Annotated[str, Header(alias="X-API-Key")],
+    x_api_key: Annotated[str | None, Header(alias="X-API-Key")] = None,
+    authorization: Annotated[str | None, Header()] = None,
 ) -> str:
-    """Extract API key from header."""
-    return x_api_key
+    """Extract auth credentials from X-API-Key or Authorization."""
+    if x_api_key:
+        return x_api_key
+    if authorization:
+        return authorization[7:] if authorization.startswith("Bearer ") else authorization
+    raise HTTPException(status_code=401, detail="Authentication required")
 
 
 def get_client_ip(request: FastAPIRequest) -> str | None:
@@ -136,24 +166,27 @@ async def validate_and_rate_limit(
     if api_key.startswith("snipara_at_"):
         auth_info = await validate_oauth_token(api_key, project_id)
         if not auth_info:
-            raise HTTPException(
-                status_code=401,
+            await _reject_failed_auth(
+                client_ip=client_ip,
+                key_prefix=key_prefix,
                 detail="Invalid or expired OAuth token. Re-authenticate at https://snipara.com/dashboard or run /snipara:quickstart",
             )
     # Check if it's an integrator client key
     elif api_key.startswith("snipara_ic_"):
         auth_info = await validate_client_api_key(api_key, project_id)
         if not auth_info:
-            raise HTTPException(
-                status_code=401,
+            await _reject_failed_auth(
+                client_ip=client_ip,
+                key_prefix=key_prefix,
                 detail="Invalid client API key. Contact your integrator for access.",
             )
     else:
         # Fall back to API key validation
         auth_info = await validate_api_key(api_key, project_id)
         if not auth_info:
-            raise HTTPException(
-                status_code=401,
+            await _reject_failed_auth(
+                client_ip=client_ip,
+                key_prefix=key_prefix,
                 detail="Invalid API key. Get a free key at https://snipara.com/dashboard (100 queries/month, no credit card)",
             )
 
@@ -180,10 +213,15 @@ async def validate_and_rate_limit(
     # 4. Determine plan BEFORE rate limit check (plan-based limits)
     plan = get_effective_plan(project.team.subscription if project.team else None)
 
+    # 4.5 Use PARTNER rate limits for integrator clients (higher limits for heavy polling)
+    rate_limit_plan = plan.value
+    if auth_info.get("auth_type") == "integrator_client":
+        rate_limit_plan = "PARTNER"
+
     # 5. Check rate limit with plan-based limits
-    rate_ok = await check_rate_limit(auth_info["id"], client_ip=client_ip, plan=plan.value)
+    rate_ok = await check_rate_limit(auth_info["id"], client_ip=client_ip, plan=rate_limit_plan)
     if not rate_ok:
-        max_requests = settings.plan_rate_limits.get(plan.value, settings.rate_limit_requests)
+        max_requests = settings.plan_rate_limits.get(rate_limit_plan, settings.rate_limit_requests)
         log_security_event(
             "rate_limit.exceeded",
             "api_key",
@@ -243,7 +281,11 @@ async def validate_team_and_rate_limit(
 
     api_key_info = await validate_team_api_key(api_key, team.id)
     if not api_key_info:
-        raise HTTPException(status_code=401, detail="Invalid API key")
+        await _reject_failed_auth(
+            client_ip=client_ip,
+            key_prefix=key_prefix,
+            detail="Invalid API key",
+        )
 
     # Determine plan BEFORE rate limit check (plan-based limits)
     plan = get_effective_plan(team.subscription)

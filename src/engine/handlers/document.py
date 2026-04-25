@@ -9,8 +9,10 @@ Handles:
 
 import hashlib
 from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import Any
 
+from ...config import settings
 from ...db import get_db
 from ...models import (
     RequestAccessResult,
@@ -41,8 +43,15 @@ async def handle_upload_document(
     content = params.get("content", "")
 
     if not path or not content:
+        missing = []
+        if not path:
+            missing.append("path")
+        if not content:
+            missing.append("content")
         return ToolResult(
-            data={"error": "path and content are required"},
+            data={
+                "error": f"rlm_upload_document: missing required parameter(s): {', '.join(missing)}"
+            },
             input_tokens=0,
             output_tokens=0,
         )
@@ -59,12 +68,34 @@ async def handle_upload_document(
     content_hash = hashlib.sha256(content.encode()).hexdigest()
     size = len(content.encode())
 
-    # Check if document exists
+    # Check if document exists (including soft-deleted)
     existing = await db.document.find_first(where={"projectId": ctx.project_id, "path": path})
 
     if existing:
+        # Check if soft-deleted - if so, restore it
+        if existing.deletedAt is not None:
+            # Restore soft-deleted document with new content
+            await db.document.update(
+                where={"id": existing.id},
+                data={
+                    "content": content,
+                    "hash": content_hash,
+                    "size": size,
+                    "deletedAt": None,
+                    "deletedBy": None,
+                },
+            )
+            # Invalidate index cache
+            invalidate_index()
+            result = UploadDocumentResult(
+                path=path,
+                action="restored",
+                size=size,
+                hash=content_hash,
+                message=f"Document '{path}' restored from trash ({size} bytes)",
+            )
         # Check if content changed
-        if existing.hash == content_hash:
+        elif existing.hash == content_hash:
             result = UploadDocumentResult(
                 path=path,
                 action="unchanged",
@@ -135,7 +166,9 @@ async def handle_sync_documents(
 
     if not documents:
         return ToolResult(
-            data={"error": "documents list is required"},
+            data={
+                "error": "rlm_sync_documents: missing required parameter 'documents' (list of {path, content})"
+            },
             input_tokens=0,
             output_tokens=0,
         )
@@ -147,8 +180,8 @@ async def handle_sync_documents(
     deleted = 0
     input_tokens = 0
 
-    # Get all existing documents
-    existing_docs = await db.document.find_many(where={"projectId": ctx.project_id})
+    # Get all existing documents (exclude soft-deleted)
+    existing_docs = await db.document.find_many(where={"projectId": ctx.project_id, "deletedAt": None})
     existing_by_path = {doc.path: doc for doc in existing_docs}
     synced_paths = set()
 
@@ -192,9 +225,27 @@ async def handle_sync_documents(
 
     # Delete missing documents if requested
     if delete_missing:
+        # Get trash retention days for this plan
+        plan_name = ctx.plan.value if hasattr(ctx.plan, "value") else str(ctx.plan)
+        trash_retention_days = settings.trash_retention_days.get(plan_name, 0)
+
         for path, doc in existing_by_path.items():
             if path not in synced_paths:
-                await db.document.delete(where={"id": doc.id})
+                if trash_retention_days > 0:
+                    # Soft delete - move to trash (plan supports retention)
+                    await db.document.update(
+                        where={"id": doc.id},
+                        data={
+                            "deletedAt": datetime.now(UTC),
+                            "deletedBy": ctx.user_id,
+                        },
+                    )
+                    # Delete chunks to free up space (can be regenerated on restore)
+                    await db.documentchunk.delete_many(where={"documentId": doc.id})
+                else:
+                    # Hard delete - FREE plan has no trash retention
+                    await db.documentchunk.delete_many(where={"documentId": doc.id})
+                    await db.document.delete(where={"id": doc.id})
                 deleted += 1
 
     # Invalidate index cache if any changes

@@ -1,5 +1,6 @@
 """FastAPI MCP Server for RLM SaaS."""
 
+import asyncio
 import json
 import logging
 import time
@@ -21,14 +22,16 @@ from .api.deps import (
     validate_and_rate_limit,
     validate_team_and_rate_limit,
 )
+from .api.graphify import router as graphify_router
+from .api.integrator import router as integrator_router
 from .auth import (
+    enforce_tool_scope,
     get_effective_plan,
     get_team_by_slug_or_id,
     validate_team_api_key,
 )
 from .config import settings
 from .db import close_db, get_db
-from .api.integrator import router as integrator_router
 from .mcp import jsonrpc_error, jsonrpc_response
 from .mcp_transport import router as mcp_router
 from .middleware import IPRateLimitMiddleware, SecurityHeadersMiddleware
@@ -44,10 +47,12 @@ from .models import (
 )
 from .rlm_engine import RLMEngine
 from .services.agent_memory import semantic_recall, store_memory
+from .services.swarm_events import subscribe_to_swarm, unsubscribe_from_swarm
 from .usage import (
     _is_demo_key,
     check_rate_limit,
     check_usage_limits,
+    clear_rate_limit,
     close_redis,
     get_demo_analytics,
     get_usage_stats,
@@ -72,14 +77,15 @@ def _filter_sentry_event(event: dict) -> dict:
 
 
 # Initialize Sentry if DSN is configured
-if settings.sentry_dsn:
+sentry_dsn = settings.sentry_dsn.strip()
+if sentry_dsn:
     try:
         import sentry_sdk
         from sentry_sdk.integrations.fastapi import FastApiIntegration
         from sentry_sdk.integrations.starlette import StarletteIntegration
 
         sentry_sdk.init(
-            dsn=settings.sentry_dsn,
+            dsn=sentry_dsn,
             environment=settings.environment,
             traces_sample_rate=0.1 if settings.environment == "production" else 1.0,
             integrations=[
@@ -91,6 +97,8 @@ if settings.sentry_dsn:
         logger.info("Sentry error tracking initialized")
     except ImportError:
         logger.warning("Sentry DSN configured but sentry-sdk not installed")
+    except Exception as exc:
+        logger.warning(f"Sentry DSN configured but initialization failed: {exc}")
 else:
     logger.debug("Sentry DSN not configured - error tracking disabled")
 
@@ -114,16 +122,18 @@ async def lifespan(app: FastAPI):
     # Primary (bge-large) for pgvector + Light (bge-small) for on-the-fly fallback
     from .services.embeddings import EmbeddingsService
 
-    try:
-        EmbeddingsService.preload_all()
-    except Exception as e:
-        logger.warning(f"Embedding model preload failed (will retry on first use): {e}")
+    if settings.preload_embeddings:
+        try:
+            EmbeddingsService.preload_all()
+        except Exception as e:
+            logger.warning(f"Embedding model preload failed (will retry on first use): {e}")
+    else:
+        logger.info("Embedding preload disabled; models will load lazily on demand")
 
     # Start background job processor for async indexing
     from .services.background_jobs import start_job_processor, stop_job_processor
 
-    db = await get_db()
-    await start_job_processor(db)
+    await start_job_processor()
 
     yield
     # Shutdown
@@ -159,6 +169,9 @@ app.include_router(mcp_router)
 
 # Mount Integrator Admin API
 app.include_router(integrator_router)
+
+# Mount Graphify-compatible export surface
+app.include_router(graphify_router)
 
 
 # ============ EXCEPTION HANDLERS ============
@@ -207,7 +220,7 @@ async def health_check() -> HealthResponse:
 @app.get("/ready", tags=["Health"])
 async def readiness_check():
     """Readiness check - verifies DB and embedding model are operational."""
-    from .services.embeddings import EmbeddingsService
+    from .services.embeddings import LIGHT_MODEL_NAME, EmbeddingsService
 
     checks: dict[str, bool] = {}
     all_ok = True
@@ -221,9 +234,14 @@ async def readiness_check():
         checks["database"] = False
         all_ok = False
 
-    # Check embedding model is loaded
-    checks["embedding_model"] = EmbeddingsService.get_instance().is_loaded()
-    if not checks["embedding_model"]:
+    # Readiness depends on DB plus primary embeddings only when eager preload is enabled.
+    primary_loaded = EmbeddingsService.get_instance().is_loaded()
+    light_loaded = EmbeddingsService.get_instance(LIGHT_MODEL_NAME).is_loaded()
+    checks["embedding_preload_enabled"] = settings.preload_embeddings
+    checks["embedding_primary_loaded"] = primary_loaded
+    checks["embedding_light_loaded"] = light_loaded
+    checks["embeddings_ready"] = primary_loaded if settings.preload_embeddings else True
+    if not checks["embeddings_ready"]:
         all_ok = False
 
     response = ReadyResponse(
@@ -295,6 +313,7 @@ async def mcp_endpoint(
 
     # Execute the tool with project settings from dashboard
     try:
+        enforce_tool_scope(request.tool.value, api_key_info)
         engine = RLMEngine(
             project.id,
             plan=plan,
@@ -698,13 +717,68 @@ async def demo_analytics(
     return {"success": True, "data": analytics}
 
 
+@app.post("/v1/admin/clear-rate-limit", tags=["Admin"])
+async def admin_clear_rate_limit(
+    project_slug: str = Query(description="Project slug to clear rate limits for"),
+    x_internal_secret: Annotated[str | None, Header(alias="X-Internal-Secret")] = None,
+):
+    """
+    Clear rate limits for all API keys associated with a project.
+
+    This admin endpoint removes rate limit counters from Redis, allowing
+    immediate recovery from rate limit exceeded states.
+
+    Requires X-Internal-Secret header for authentication.
+
+    Args:
+        project_slug: The project slug (e.g., "vutler")
+
+    Returns:
+        List of cleared API key IDs and count
+    """
+    if not settings.internal_api_secret:
+        raise HTTPException(status_code=500, detail="Internal API secret not configured")
+    if not x_internal_secret or x_internal_secret != settings.internal_api_secret:
+        raise HTTPException(status_code=401, detail="Invalid or missing internal secret")
+
+    db = await get_db()
+
+    # Find project by slug
+    project = await db.project.find_first(where={"slug": project_slug})
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project '{project_slug}' not found")
+
+    # Get all API keys for this project
+    api_keys = await db.apikey.find_many(where={"projectId": project.id})
+
+    cleared = []
+    for key in api_keys:
+        success = await clear_rate_limit(key.id)
+        if success:
+            cleared.append(key.id[:12] + "...")
+
+    logger.info(f"Admin cleared rate limits for project {project_slug}: {len(cleared)} keys")
+
+    return {
+        "success": True,
+        "project": project_slug,
+        "cleared_count": len(cleared),
+        "cleared_keys": cleared,
+    }
+
+
 @app.post("/v1/{project_id}/reindex", tags=["MCP"])
 async def reindex_project(
     project_id: str,
     mode: str = Query(
         default="incremental",
         description="Index mode: 'incremental' (only unindexed docs) or 'full' (all docs)",
-        regex="^(incremental|full)$",
+        pattern="^(incremental|full)$",
+    ),
+    kind: str = Query(
+        default="doc",
+        description="Index kind: 'doc' for document chunks, 'code' for code graph indexing",
+        pattern="^(doc|code)$",
     ),
     x_api_key: Annotated[str | None, Header(alias="X-API-Key")] = None,
     x_internal_secret: Annotated[str | None, Header(alias="X-Internal-Secret")] = None,
@@ -727,6 +801,7 @@ async def reindex_project(
     Args:
         project_id: The project ID or slug
         mode: Index mode - "incremental" or "full"
+        kind: Index kind - "doc" or "code"
         x_api_key: API key from X-API-Key header (optional)
         x_internal_secret: Internal secret for server-to-server calls (optional)
 
@@ -765,6 +840,10 @@ async def reindex_project(
 
     # Map mode to IndexJobMode enum value
     index_mode = "FULL" if mode == "full" else "INCREMENTAL"
+    index_kind = "CODE" if kind == "code" else "DOC"
+
+    if index_kind == "CODE" and not settings.enable_code_ingestion:
+        raise HTTPException(status_code=409, detail="Code ingestion is not enabled")
 
     # Create index job (returns immediately)
     job = await create_index_job(
@@ -773,9 +852,16 @@ async def reindex_project(
         triggered_by=None,  # Could add user ID if available
         triggered_via=triggered_via,
         index_mode=index_mode,
+        index_kind=index_kind,
     )
 
-    logger.info(f"Created index job {job['id']} for project {project.id} (mode={index_mode})")
+    logger.info(
+        "Created %s index job %s for project %s (mode=%s)",
+        index_kind.lower(),
+        job["id"],
+        project.id,
+        index_mode,
+    )
 
     return {
         "job_id": job["id"],
@@ -783,6 +869,7 @@ async def reindex_project(
         "status": job["status"],
         "progress": job.get("progress", 0),
         "index_mode": job.get("index_mode", "INCREMENTAL").lower(),
+        "index_kind": job.get("index_kind", "DOC").lower(),
         "created_at": job.get("created_at"),
         "status_url": f"/v1/{project.id}/reindex/{job['id']}",
         "already_exists": job.get("already_exists", False),
@@ -854,6 +941,10 @@ async def recall_memories(
     category: str | None = Query(default=None, description="Filter by category"),
     limit: int = Query(default=10, ge=1, le=50, description="Max memories to return"),
     min_relevance: float = Query(default=0.3, ge=0, le=1, description="Minimum relevance"),
+    include_inactive: bool = Query(default=False, description="Include inactive memories"),
+    warning_threshold: float = Query(
+        default=0.72, ge=0, le=1, description="Minimum relevance for inactive-memory warnings"
+    ),
 ):
     """
     Recall memories semantically based on a query.
@@ -872,7 +963,12 @@ async def recall_memories(
         List of relevant memories with content and metadata
     """
     # Validate API key, project, and rate limit
-    _, project, _, _ = await validate_and_rate_limit(project_id, api_key)
+    auth_info, project, _, _ = await validate_and_rate_limit(project_id, api_key)
+
+    try:
+        enforce_tool_scope("rlm_recall", auth_info)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
 
     # Use resolved project ID, not the slug from URL
     resolved_project_id = project.id
@@ -884,12 +980,15 @@ async def recall_memories(
         category=category,
         limit=limit,
         min_relevance=min_relevance,
+        include_inactive=include_inactive,
+        warning_threshold=warning_threshold,
     )
 
     return {
         "project_id": resolved_project_id,
         "query": query,
         "memories": result.get("memories", []),
+        "warnings": result.get("warnings", []),
         "total_searched": result.get("total_searched", 0),
         "timing_ms": result.get("timing_ms", 0),
     }
@@ -917,7 +1016,12 @@ async def create_memory(
         Created memory with ID and metadata
     """
     # Validate API key, project, and rate limit
-    _, project, _, _ = await validate_and_rate_limit(project_id, api_key)
+    auth_info, project, _, _ = await validate_and_rate_limit(project_id, api_key)
+
+    try:
+        enforce_tool_scope("rlm_remember", auth_info)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
 
     body = await request.json()
 
@@ -938,6 +1042,7 @@ async def create_memory(
         "project_id": resolved_project_id,
         "memory_id": result.get("memory_id"),
         "type": result.get("type"),
+        "status": result.get("status"),
         "created": result.get("created", False),
         "message": result.get("message"),
     }
@@ -953,6 +1058,7 @@ async def sse_event_generator(
     plan: Plan,
     user_id: str | None = None,
     access_level: str = "EDITOR",
+    auth_info: dict | None = None,
 ) -> AsyncGenerator[str, None]:
     """
     Generate Server-Sent Events for MCP tool execution.
@@ -969,6 +1075,7 @@ async def sse_event_generator(
 
     try:
         # Execute the tool
+        enforce_tool_scope(tool.value, auth_info)
         engine = RLMEngine(project_id, plan=plan, user_id=user_id, access_level=access_level)
         result = await engine.execute(tool, params)
 
@@ -1075,6 +1182,7 @@ async def mcp_sse_endpoint(
             plan,
             user_id=api_key_info.get("user_id"),
             access_level=api_key_info.get("access_level", "EDITOR"),
+            auth_info=api_key_info,
         ),
         media_type="text/event-stream",
         headers={
@@ -1124,7 +1232,128 @@ async def mcp_sse_endpoint_post(
             plan,
             user_id=api_key_info.get("user_id"),
             access_level=api_key_info.get("access_level", "EDITOR"),
+            auth_info=api_key_info,
         ),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # Disable nginx buffering
+        },
+    )
+
+
+# ============ SWARM SSE ENDPOINTS ============
+
+
+async def swarm_sse_event_generator(
+    swarm_id: str,
+    project_id: str,
+) -> AsyncGenerator[str, None]:
+    """
+    Generate Server-Sent Events for swarm real-time updates.
+
+    Subscribes to Redis pub/sub channel and streams events to client.
+
+    Yields SSE-formatted events:
+    - connected: Connection established
+    - event: Swarm event (task_created, task_completed, agent_joined, etc.)
+    - heartbeat: Keep-alive ping every 30 seconds
+    - error: Error occurred
+    """
+    pubsub = None
+    try:
+        # Send connection established event
+        yield f"data: {json.dumps({'type': 'connected', 'swarm_id': swarm_id})}\n\n"
+
+        # Subscribe to swarm events
+        pubsub = await subscribe_to_swarm(swarm_id)
+        if not pubsub:
+            yield f"data: {json.dumps({'type': 'error', 'message': 'Redis unavailable, use polling instead'})}\n\n"
+            return
+
+        # Listen for events with heartbeat
+        heartbeat_interval = 30  # seconds
+        last_heartbeat = time.time()
+
+        while True:
+            try:
+                # Non-blocking get with timeout
+                message = await asyncio.wait_for(
+                    pubsub.get_message(ignore_subscribe_messages=True),
+                    timeout=1.0,
+                )
+
+                if message and message.get("type") == "message":
+                    data = message.get("data")
+                    if isinstance(data, bytes):
+                        data = data.decode("utf-8")
+                    event_data = json.loads(data) if isinstance(data, str) else data
+                    yield f"data: {json.dumps({'type': 'event', 'event': event_data})}\n\n"
+
+                # Send heartbeat every 30 seconds
+                if time.time() - last_heartbeat >= heartbeat_interval:
+                    yield f"data: {json.dumps({'type': 'heartbeat', 'timestamp': datetime.utcnow().isoformat()})}\n\n"
+                    last_heartbeat = time.time()
+
+            except TimeoutError:
+                # Timeout is normal, check for heartbeat
+                if time.time() - last_heartbeat >= heartbeat_interval:
+                    yield f"data: {json.dumps({'type': 'heartbeat', 'timestamp': datetime.utcnow().isoformat()})}\n\n"
+                    last_heartbeat = time.time()
+                continue
+
+    except asyncio.CancelledError:
+        # Client disconnected
+        logger.debug(f"SSE client disconnected from swarm {swarm_id}")
+    except Exception as e:
+        logger.error(f"Swarm SSE error: {e}")
+        yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+    finally:
+        if pubsub:
+            await unsubscribe_from_swarm(pubsub, swarm_id)
+
+
+@app.get("/v1/{project_id}/swarm/{swarm_id}/sse", tags=["Swarm", "SSE"])
+async def swarm_sse_endpoint(
+    project_id: str,
+    swarm_id: str,
+    api_key: Annotated[str, Depends(get_api_key)],
+):
+    """
+    Subscribe to real-time swarm events via Server-Sent Events (SSE).
+
+    This endpoint streams swarm events in real-time using Redis pub/sub.
+    Useful for dashboards, monitoring, and real-time coordination.
+
+    Events include:
+    - task_created, task_claimed, task_completed, task_failed
+    - agent_joined, agent_left
+    - state_changed
+    - claim_acquired, claim_released
+
+    Args:
+        project_id: The project ID
+        swarm_id: The swarm ID to subscribe to
+        api_key: API key from X-API-Key header
+
+    Returns:
+        SSE stream with swarm events
+    """
+    # Validate API key and project
+    api_key_info, project, plan, _ = await validate_and_rate_limit(project_id, api_key)
+
+    # Verify swarm exists and belongs to project
+    db = await get_db()
+    swarm = await db.swarm.find_first(
+        where={"id": swarm_id, "projectId": project.id}
+    )
+    if not swarm:
+        raise HTTPException(status_code=404, detail=f"Swarm {swarm_id} not found")
+
+    # Return SSE stream
+    return StreamingResponse(
+        swarm_sse_event_generator(swarm_id, project.id),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

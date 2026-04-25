@@ -1,4 +1,4 @@
-# Core - cache bust 2026-01-27
+# Core
 fastapi>=0.109.0
 uvicorn[standard]>=0.27.0
 gunicorn>=21.0.0
@@ -11,7 +11,8 @@ redis>=5.0.0
 # Validation & Config
 pydantic>=2.5.0
 pydantic-settings>=2.1.0
-python-dotenv>=1.0.0
+python-dotenv>=1.2.2
+email-validator>=2.0.0
 
 # Security
 bcrypt>=4.1.0

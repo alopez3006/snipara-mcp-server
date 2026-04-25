@@ -1,15 +1,20 @@
 """Tests for rlm_context_query tool - Token budgeting and context optimization."""
 
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
 import pytest
 
+from src.engine.core import DocumentationIndex
 from src.models import (
     ContextQueryParams,
     ContextQueryResult,
     ContextSection,
+    Plan,
     SearchMode,
     ToolName,
 )
-from src.rlm_engine import RLMEngine, Section, count_tokens, get_encoder
+from src.rlm_engine import RLMEngine, Section, _is_simple_comparison_query, _should_auto_decompose, count_tokens, get_encoder
 
 
 class TestTokenCounting:
@@ -117,6 +122,42 @@ class TestContextSection:
         )
         assert section.truncated is True
 
+    def test_legacy_aliases_are_exposed(self):
+        """Test that validated sections still expose legacy accessors."""
+        section = ContextSection(
+            title="Legacy-compatible section",
+            content="Legacy consumers still read tokens and line attrs.",
+            file="docs/legacy.md",
+            lines=(12, 34),
+            relevance_score=0.75,
+            token_count=120,
+            truncated=False,
+        )
+
+        assert section.start_line == 12
+        assert section.end_line == 34
+        assert section.tokens == 120
+
+    def test_legacy_payload_is_normalized(self):
+        """Test coercion from legacy payload fields."""
+        section = ContextSection(
+            title="Legacy payload",
+            content="Normalizes fields from older callers.",
+            file=None,
+            start_line=7,
+            end_line=9,
+            relevance_score=100.0,
+            tokens=24,
+        )
+
+        assert section.file == "(unknown)"
+        assert section.lines == (7, 9)
+        assert section.start_line == 7
+        assert section.end_line == 9
+        assert section.token_count == 24
+        assert section.tokens == 24
+        assert section.relevance_score == 1.0
+
     def test_relevance_score_bounds(self):
         """Test relevance score validation."""
         # Valid scores
@@ -198,6 +239,397 @@ class TestContextQueryResult:
         assert result.total_tokens == 50
         assert result.session_context_included is True
         assert len(result.suggestions) == 1
+
+
+class TestAutoDecomposeHeuristics:
+    """Tests for auto-decomposition gating."""
+
+    def test_short_binary_comparison_stays_direct(self):
+        """Short comparison queries should not auto-decompose."""
+        query = "CE community edition vs EE enterprise edition licensing"
+        assert _is_simple_comparison_query(query) is True
+        assert _should_auto_decompose(query) is False
+
+    def test_long_comparison_query_still_decomposes(self):
+        """Longer comparison queries with multiple facets should still decompose."""
+        query = (
+            "Compare community edition and enterprise edition licensing, support obligations, "
+            "deployment constraints, and redistribution rights"
+        )
+        assert _is_simple_comparison_query(query) is False
+        assert _should_auto_decompose(query) is True
+
+    def test_multi_question_query_still_decomposes(self):
+        """Multiple questions should still trigger decomposition."""
+        query = "How does auth work? What security measures are in place?"
+        assert _should_auto_decompose(query) is True
+
+
+class TestContextQueryCaching:
+    """Tests for hosted exact-query caching on rlm_context_query."""
+
+    @staticmethod
+    def _build_engine() -> RLMEngine:
+        engine = RLMEngine("test-project", plan=Plan.TEAM)
+        section = Section(
+            id="[LICENSING]",
+            title="Community Edition License",
+            content=(
+                "Community edition licensing terms and redistribution notes. "
+                "This section documents what users can ship, modify, and host. "
+                "It also explains support boundaries, redistribution limits, "
+                "and validation behavior for community deployments."
+            ),
+            start_line=1,
+            end_line=12,
+            level=1,
+        )
+        engine.index = DocumentationIndex(
+            files=["docs/licensing.md"],
+            lines=section.content.splitlines(),
+            sections=[section],
+            total_chars=len(section.content),
+            file_boundaries={"docs/licensing.md": (0, max(len(section.content.splitlines()), 1))},
+        )
+        return engine
+
+    @pytest.mark.asyncio
+    async def test_repeat_query_hits_cache(self, monkeypatch):
+        """Second identical query should reuse the cached result."""
+        engine_first = self._build_engine()
+        engine_second = self._build_engine()
+        cached_result: dict | None = None
+
+        async def cache_get(_query: str, _max_tokens: int, variant: str | None = None):
+            assert variant is not None
+            return cached_result
+
+        async def cache_set(
+            _query: str,
+            _max_tokens: int,
+            result: dict,
+            ttl: int | None = None,
+            variant: str | None = None,
+        ) -> bool:
+            nonlocal cached_result
+            assert ttl is None
+            assert variant is not None
+            cached_result = result
+            return True
+
+        fake_cache = SimpleNamespace(
+            get=AsyncMock(side_effect=cache_get),
+            set=AsyncMock(side_effect=cache_set),
+            invalidate=AsyncMock(return_value=1),
+        )
+        monkeypatch.setattr("src.rlm_engine.get_cache", lambda *args, **kwargs: fake_cache)
+        monkeypatch.setattr(
+            "src.rlm_engine.get_db",
+            AsyncMock(side_effect=RuntimeError("database not available in cache test")),
+        )
+
+        first_score = AsyncMock(return_value=[(engine_first.index.sections[0], 87.0)])
+        second_score = AsyncMock(side_effect=AssertionError("cache miss recomputed scoring"))
+        monkeypatch.setattr(engine_first, "_score_sections", first_score)
+        monkeypatch.setattr(engine_second, "_score_sections", second_score)
+
+        params = {
+            "query": "community edition licensing",
+            "max_tokens": 4000,
+            "search_mode": "hybrid",
+            "include_shared_context": False,
+            "prefer_summaries": False,
+        }
+
+        first = await engine_first._handle_context_query(params)
+        assert first_score.await_count == 1
+        assert fake_cache.set.await_count == 1
+        assert first.data["sections"][0]["title"] == "Community Edition License"
+
+        second = await engine_second._handle_context_query(params)
+        assert fake_cache.get.await_count == 2
+        assert fake_cache.set.await_count == 1
+        assert second.data["sections"][0]["title"] == "Community Edition License"
+        assert second.data["timing"]["cache_lookup_ms"] >= 0
+
+    @pytest.mark.asyncio
+    async def test_reference_mode_skips_result_cache(self, monkeypatch):
+        """Pass-by-reference mode should bypass result caching."""
+        engine = self._build_engine()
+        fake_cache = SimpleNamespace(
+            get=AsyncMock(return_value=None),
+            set=AsyncMock(return_value=True),
+            invalidate=AsyncMock(return_value=1),
+        )
+        monkeypatch.setattr("src.rlm_engine.get_cache", lambda *args, **kwargs: fake_cache)
+        monkeypatch.setattr(
+            "src.rlm_engine.get_db",
+            AsyncMock(side_effect=RuntimeError("database not available in reference cache test")),
+        )
+        monkeypatch.setattr(
+            engine,
+            "_score_sections",
+            AsyncMock(return_value=[(engine.index.sections[0], 87.0)]),
+        )
+
+        result = await engine._handle_context_query(
+            {
+                "query": "community edition licensing",
+                "max_tokens": 4000,
+                "search_mode": "hybrid",
+                "include_shared_context": False,
+                "prefer_summaries": False,
+                "return_references": True,
+            }
+        )
+
+        assert result.data["references_mode"] is True
+        fake_cache.get.assert_not_called()
+        fake_cache.set.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_upload_document_invalidates_query_cache(self, monkeypatch):
+        """Document mutations should clear the hosted context-query cache."""
+        engine = RLMEngine("test-project", plan=Plan.TEAM)
+        engine.index = DocumentationIndex()
+        engine._chunks_available = True
+
+        fake_cache = SimpleNamespace(
+            get=AsyncMock(return_value=None),
+            set=AsyncMock(return_value=True),
+            invalidate=AsyncMock(return_value=3),
+        )
+        fake_db = SimpleNamespace(
+            document=SimpleNamespace(
+                find_first=AsyncMock(return_value=None),
+                create=AsyncMock(return_value=None),
+            ),
+            documentchunk=SimpleNamespace(delete_many=AsyncMock(return_value=None)),
+        )
+
+        monkeypatch.setattr("src.rlm_engine.get_cache", lambda *args, **kwargs: fake_cache)
+        monkeypatch.setattr("src.rlm_engine.get_db", AsyncMock(return_value=fake_db))
+
+        result = await engine._handle_upload_document(
+            {
+                "path": "docs/new-license.md",
+                "content": "# New License\nTerms and conditions.",
+            }
+        )
+
+        assert result.data["action"] == "created"
+        assert engine.index is None
+        assert engine._chunks_available is None
+        fake_cache.invalidate.assert_awaited_once()
+
+
+class TestCodeGraphHybridContext:
+    """Tests for v2 structural graph summaries inside rlm_context_query."""
+
+    @pytest.mark.asyncio
+    async def test_structural_query_inlines_code_graph_summary(self, monkeypatch):
+        """Structural queries should inline a concise graph summary plus the tool hint."""
+        engine = RLMEngine("test-project", plan=Plan.FREE)
+        doc_section = Section(
+            id="[CODE-GRAPH]",
+            title="Code Graph Workflow",
+            content=(
+                "Use rlm_code_callers for reverse call lookups and rlm_code_neighbors "
+                "for local structural traversal. This reference explains how the "
+                "persisted graph complements document retrieval, when callers and "
+                "neighbors are the right tool, and why direct symbol traversal is "
+                "more precise than embeddings alone for repository structure questions."
+            ),
+            start_line=1,
+            end_line=8,
+            level=1,
+        )
+        engine.index = DocumentationIndex(
+            files=["docs/reference/CODE_GRAPH.md"],
+            lines=doc_section.content.splitlines(),
+            sections=[doc_section],
+            total_chars=len(doc_section.content),
+            file_boundaries={"docs/reference/CODE_GRAPH.md": (0, 1)},
+        )
+
+        class FakeGraphService:
+            async def get_callers(self, **kwargs):
+                assert kwargs["qualified_name"] == "src.rlm_engine.RLMEngine._handle_context_query"
+                return {
+                    "matched_targets": [
+                        {
+                            "qualified_name": "src.rlm_engine.RLMEngine._handle_context_query",
+                            "kind": "METHOD",
+                            "file_path": "src/rlm_engine.py",
+                            "start_line": 120,
+                        }
+                    ],
+                    "callers": [
+                        {
+                            "qualified_name": "src.rlm_engine.RLMEngine.run",
+                            "kind": "METHOD",
+                            "file_path": "src/rlm_engine.py",
+                            "start_line": 88,
+                        }
+                    ],
+                    "depth": 1,
+                    "total_callers": 1,
+                }
+
+        monkeypatch.setattr(
+            engine,
+            "_score_sections",
+            AsyncMock(return_value=[(doc_section, 91.0)]),
+        )
+        monkeypatch.setattr(engine, "_get_code_graph_query_service", AsyncMock(return_value=FakeGraphService()))
+        monkeypatch.setattr(
+            "src.rlm_engine.get_db",
+            AsyncMock(side_effect=RuntimeError("database not available in hybrid test")),
+        )
+
+        result = await engine._handle_context_query(
+            {
+                "query": "who calls src.rlm_engine.RLMEngine._handle_context_query?",
+                "max_tokens": 4000,
+                "search_mode": "hybrid",
+                "include_shared_context": False,
+                "prefer_summaries": False,
+            }
+        )
+
+        assert result.data["graph_hybrid_used"] is True
+        assert result.data["graph_context_tool"] == "rlm_code_callers"
+        assert result.data["recommended_tool"] == "rlm_code_callers"
+        assert result.data["sections"][0]["title"].startswith("Code Graph: Callers of")
+        assert "Reverse callers found: 1" in result.data["sections"][0]["content"]
+        assert "src.rlm_engine.RLMEngine.run" in result.data["sections"][0]["content"]
+        assert result.data["sections"][1]["title"] == "Code Graph Workflow"
+
+    @pytest.mark.asyncio
+    async def test_narrative_query_keeps_graph_hybrid_disabled(self, monkeypatch):
+        """Non-structural queries should remain document-only."""
+        engine = RLMEngine("test-project", plan=Plan.FREE)
+        section = Section(
+            id="[LICENSING]",
+            title="Community Edition License",
+            content=(
+                "Community edition licensing terms and redistribution notes. "
+                "This section explains what users can ship, what support is "
+                "included, and which redistribution scenarios are allowed "
+                "for self-hosted and managed deployments."
+            ),
+            start_line=1,
+            end_line=6,
+            level=1,
+        )
+        engine.index = DocumentationIndex(
+            files=["docs/licensing.md"],
+            lines=section.content.splitlines(),
+            sections=[section],
+            total_chars=len(section.content),
+            file_boundaries={"docs/licensing.md": (0, 1)},
+        )
+
+        monkeypatch.setattr(engine, "_score_sections", AsyncMock(return_value=[(section, 87.0)]))
+        monkeypatch.setattr(
+            "src.rlm_engine.get_db",
+            AsyncMock(side_effect=RuntimeError("database not available in narrative test")),
+        )
+
+        result = await engine._handle_context_query(
+            {
+                "query": "community edition licensing",
+                "max_tokens": 4000,
+                "search_mode": "hybrid",
+                "include_shared_context": False,
+                "prefer_summaries": False,
+            }
+        )
+
+        assert result.data["graph_hybrid_used"] is False
+        assert result.data["graph_context_tool"] is None
+        assert result.data["graph_context_summary"] is None
+        assert result.data["sections"][0]["title"] == "Community Edition License"
+
+    @pytest.mark.asyncio
+    async def test_mixed_code_query_keeps_docs_first_and_appends_graph_context(self, monkeypatch):
+        """Mixed implementation questions should stay doc-first while appending graph context."""
+        engine = RLMEngine("test-project", plan=Plan.FREE)
+        section = Section(
+            id="[HANDLER]",
+            title="Request Handler Flow",
+            content=(
+                "The handler prepares retrieval settings, loads shared context when allowed, "
+                "and only then builds the final answer payload. This section explains the "
+                "high-level flow around request handling and answer assembly."
+            ),
+            start_line=1,
+            end_line=6,
+            level=1,
+        )
+        engine.index = DocumentationIndex(
+            files=["docs/reference/HANDLERS.md"],
+            lines=section.content.splitlines(),
+            sections=[section],
+            total_chars=len(section.content),
+            file_boundaries={"docs/reference/HANDLERS.md": (0, 1)},
+        )
+
+        class FakeGraphService:
+            async def get_neighbors(self, **kwargs):
+                assert kwargs["qualified_name"] == "src.rlm_engine.RLMEngine._handle_context_query"
+                return {
+                    "matched_targets": [
+                        {
+                            "qualified_name": "src.rlm_engine.RLMEngine._handle_context_query",
+                            "kind": "METHOD",
+                            "file_path": "src/rlm_engine.py",
+                            "start_line": 120,
+                        }
+                    ],
+                    "nodes": [
+                        {
+                            "qualified_name": "src.rlm_engine.RLMEngine.run",
+                            "kind": "METHOD",
+                            "file_path": "src/rlm_engine.py",
+                            "start_line": 88,
+                        }
+                    ],
+                    "edges": [
+                        {
+                            "from_qualified_name": "src.rlm_engine.RLMEngine.run",
+                            "to_qualified_name": "src.rlm_engine.RLMEngine._handle_context_query",
+                            "kind": "CALLS",
+                        }
+                    ],
+                    "depth": 2,
+                }
+
+        monkeypatch.setattr(engine, "_score_sections", AsyncMock(return_value=[(section, 88.0)]))
+        monkeypatch.setattr(engine, "_get_code_graph_query_service", AsyncMock(return_value=FakeGraphService()))
+        monkeypatch.setattr(
+            "src.rlm_engine.get_db",
+            AsyncMock(side_effect=RuntimeError("database not available in mixed hybrid test")),
+        )
+
+        result = await engine._handle_context_query(
+            {
+                "query": (
+                    "Explain how src.rlm_engine.RLMEngine._handle_context_query works during "
+                    "request handling"
+                ),
+                "max_tokens": 4000,
+                "search_mode": "hybrid",
+                "include_shared_context": False,
+                "prefer_summaries": False,
+            }
+        )
+
+        assert result.data["graph_hybrid_used"] is True
+        assert result.data["graph_context_tool"] == "rlm_code_neighbors"
+        assert result.data["recommended_tool"] == "rlm_code_neighbors"
+        assert result.data["sections"][0]["title"] == "Request Handler Flow"
+        assert result.data["sections"][1]["title"].startswith("Code Graph: Neighborhood of")
 
 
 class TestKeywordScoring:
@@ -308,7 +740,7 @@ class TestSmartTruncation:
         content = "Important information here. More details follow. Even more content."
         result = engine._smart_truncate(content, 8)
 
-        # Should contain the beginning of the content and be truncated
+        # Should contain the beginning of the content
         assert result.startswith("Important")
         assert result.endswith("...")
 

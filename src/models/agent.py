@@ -5,7 +5,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from .enums import AgentMemoryScope, AgentMemoryType
+from .enums import AgentMemoryScope, AgentMemoryType, MemoryStatus
 
 # ============ AGENT MEMORY MODELS (Phase 8.2) ============
 
@@ -18,6 +18,7 @@ class RememberResult(BaseModel):
     type: AgentMemoryType = Field(..., description="Memory type")
     scope: AgentMemoryScope = Field(..., description="Memory scope")
     category: str | None = Field(default=None, description="Category if provided")
+    status: MemoryStatus = Field(default=MemoryStatus.ACTIVE, description="Memory lifecycle")
     expires_at: datetime | None = Field(default=None, description="When memory expires")
     created: bool = Field(default=True, description="True if new, False if updated")
     message: str = Field(..., description="Human-readable status message")
@@ -31,11 +32,31 @@ class RecalledMemory(BaseModel):
     type: AgentMemoryType = Field(..., description="Memory type")
     scope: AgentMemoryScope = Field(..., description="Memory scope")
     category: str | None = Field(default=None, description="Category")
+    status: MemoryStatus = Field(default=MemoryStatus.ACTIVE, description="Memory lifecycle")
     relevance: float = Field(..., ge=0.0, le=1.0, description="Relevance score")
     confidence: float = Field(..., ge=0.0, le=1.0, description="Confidence after decay")
     created_at: datetime = Field(..., description="When memory was created")
     last_accessed_at: datetime | None = Field(default=None, description="Last access time")
     access_count: int = Field(default=0, ge=0, description="Times accessed")
+    invalidated_reason: str | None = Field(default=None, description="Why the memory is inactive")
+    superseded_by_memory_id: str | None = Field(
+        default=None, description="Replacement memory ID when superseded"
+    )
+
+
+class RecallWarning(BaseModel):
+    """Inactive memory surfaced as a warning during recall."""
+
+    memory_id: str = Field(..., description="Memory ID")
+    status: MemoryStatus = Field(..., description="Inactive lifecycle status")
+    content: str = Field(..., description="Memory content")
+    category: str | None = Field(default=None, description="Category")
+    reason: str | None = Field(default=None, description="Invalidation or supersession reason")
+    superseded_by_memory_id: str | None = Field(
+        default=None, description="Replacement memory ID when superseded"
+    )
+    relevance: float = Field(..., ge=0.0, le=1.0, description="Warning relevance score")
+    created_at: datetime = Field(..., description="When memory was created")
 
 
 class RecallResult(BaseModel):
@@ -43,6 +64,9 @@ class RecallResult(BaseModel):
 
     memories: list[RecalledMemory] = Field(
         default_factory=list, description="Recalled memories ranked by relevance"
+    )
+    warnings: list[RecallWarning] = Field(
+        default_factory=list, description="Relevant inactive memories returned as warnings"
     )
     total_searched: int = Field(default=0, ge=0, description="Total memories searched")
     query: str = Field(..., description="Original query")
@@ -57,10 +81,16 @@ class MemoryInfo(BaseModel):
     type: AgentMemoryType = Field(..., description="Memory type")
     scope: AgentMemoryScope = Field(..., description="Memory scope")
     category: str | None = Field(default=None, description="Category")
+    status: MemoryStatus = Field(default=MemoryStatus.ACTIVE, description="Memory lifecycle")
     confidence: float = Field(..., ge=0.0, le=1.0, description="Current confidence")
     source: str | None = Field(default=None, description="Memory source")
     created_at: datetime = Field(..., description="Creation time")
     expires_at: datetime | None = Field(default=None, description="Expiration time")
+    invalidated_at: datetime | None = Field(default=None, description="Invalidation timestamp")
+    invalidated_reason: str | None = Field(default=None, description="Why the memory is inactive")
+    superseded_by_memory_id: str | None = Field(
+        default=None, description="Replacement memory ID when superseded"
+    )
     access_count: int = Field(default=0, ge=0, description="Access count")
 
 
@@ -76,6 +106,47 @@ class ForgetResult(BaseModel):
     """Result of rlm_forget tool."""
 
     deleted_count: int = Field(default=0, ge=0, description="Number of memories deleted")
+    message: str = Field(..., description="Human-readable status message")
+
+
+class MemoryInvalidateResult(BaseModel):
+    """Result of rlm_memory_invalidate tool."""
+
+    memory_id: str = Field(..., description="Memory ID")
+    status: MemoryStatus = Field(..., description="Updated memory status")
+    invalidated_at: datetime = Field(..., description="Invalidation timestamp")
+    message: str = Field(..., description="Human-readable status message")
+
+
+class MemoryAttachSourceResult(BaseModel):
+    """Result of rlm_memory_attach_source tool."""
+
+    memory_id: str = Field(..., description="Resolved V2 memory ID")
+    evidence_type: str = Field(..., description="Evidence type")
+    created: bool = Field(..., description="Whether evidence row was created")
+    message: str = Field(..., description="Human-readable status message")
+
+
+class MemorySupersedeResult(BaseModel):
+    """Result of rlm_memory_supersede tool."""
+
+    old_memory_id: str = Field(..., description="Original memory ID")
+    new_memory_id: str = Field(..., description="Replacement memory ID")
+    old_status: MemoryStatus = Field(..., description="Previous memory status after update")
+    new_status: MemoryStatus = Field(..., description="Replacement memory lifecycle")
+    message: str = Field(..., description="Human-readable status message")
+
+
+class MemoryVerifyResult(BaseModel):
+    """Result of rlm_memory_verify tool."""
+
+    memory_id: str = Field(..., description="Resolved V2 memory ID")
+    verified: bool = Field(..., description="Whether verification completed")
+    total_evidence: int = Field(..., ge=0, description="Total evidence rows")
+    valid_evidence: int = Field(..., ge=0, description="Valid evidence rows")
+    invalid_evidence: int = Field(..., ge=0, description="Invalid evidence rows")
+    evidence_score: float = Field(..., ge=0.0, le=1.0, description="Evidence score")
+    status: str = Field(..., description="Current memory status after verification")
     message: str = Field(..., description="Human-readable status message")
 
 
@@ -99,7 +170,7 @@ class SwarmJoinResult(BaseModel):
 
     swarm_id: str = Field(..., description="Swarm ID")
     agent_id: str = Field(..., description="Agent ID")
-    swarm_name: str = Field(..., description="Swarm name")
+    name: str = Field(..., description="Swarm name")
     current_agents: int = Field(..., ge=0, description="Current number of agents")
     max_agents: int = Field(..., description="Maximum agents allowed")
     message: str = Field(..., description="Human-readable status message")

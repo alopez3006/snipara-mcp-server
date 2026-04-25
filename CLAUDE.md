@@ -9,6 +9,7 @@ This document helps Claude Code understand the snipara-fastapi project.
 Snipara MCP Server is a **Context Optimization as a Service** backend. It indexes documentation and returns optimized context to LLM clients via the Model Context Protocol (MCP).
 
 **Core Value:**
+
 - **90% context reduction** - From 500K tokens to ~5K tokens of highly relevant content
 - **Client uses their own LLM** - No vendor lock-in, no LLM costs for us
 - **High margins** - Pure compute, no LLM costs passed through
@@ -33,7 +34,7 @@ Snipara MCP Server is a **Context Optimization as a Service** backend. It indexe
 └─────────────────────┬───────────────────────────────────────────┘
                       │
 ┌─────────────────────▼───────────────────────────────────────────┐
-│  PostgreSQL (Neon) + Redis                                      │
+│  PostgreSQL (Vaultbrix) + Redis                                 │
 │  - Documents, Embeddings, Sessions, Usage Tracking              │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -56,54 +57,54 @@ snipara-fastapi/
 │       └── shared_context.py
 ├── prisma/                 # Database schema
 ├── tests/                  # Test suite
-└── Dockerfile              # Railway deployment
+└── Dockerfile              # Container image for the VPS deployment
 ```
 
 ## MCP Tools
 
 ### Primary Tools
 
-| Tool | Description |
-|------|-------------|
+| Tool                | Description                                       |
+| ------------------- | ------------------------------------------------- |
 | `rlm_context_query` | Main tool - Returns optimized context for a query |
-| `rlm_decompose` | Break complex queries into sub-queries |
-| `rlm_multi_query` | Execute multiple queries in one call |
+| `rlm_decompose`     | Break complex queries into sub-queries            |
+| `rlm_multi_query`   | Execute multiple queries in one call              |
 
 ### Document Management
 
-| Tool | Description |
-|------|-------------|
-| `rlm_upload_document` | Upload or update a single document |
-| `rlm_sync_documents` | Bulk sync multiple documents (CI/CD) |
-| `rlm_settings` | Get project settings |
+| Tool                  | Description                          |
+| --------------------- | ------------------------------------ |
+| `rlm_upload_document` | Upload or update a single document   |
+| `rlm_sync_documents`  | Bulk sync multiple documents (CI/CD) |
+| `rlm_settings`        | Get project settings                 |
 
 ### Supporting Tools
 
-| Tool | Description |
-|------|-------------|
-| `rlm_search` | Regex pattern search |
-| `rlm_inject` | Inject session context |
-| `rlm_context` | Show current session context |
-| `rlm_clear_context` | Clear session context |
-| `rlm_stats` | Documentation statistics |
-| `rlm_sections` | List all sections |
-| `rlm_read` | Read specific line ranges |
+| Tool                | Description                  |
+| ------------------- | ---------------------------- |
+| `rlm_search`        | Regex pattern search         |
+| `rlm_inject`        | Inject session context       |
+| `rlm_context`       | Show current session context |
+| `rlm_clear_context` | Clear session context        |
+| `rlm_stats`         | Documentation statistics     |
+| `rlm_sections`      | List all sections            |
+| `rlm_read`          | Read specific line ranges    |
 
 ### Summary Storage
 
-| Tool | Description |
-|------|-------------|
-| `rlm_store_summary` | Store LLM-generated summary |
-| `rlm_get_summaries` | Retrieve stored summaries |
-| `rlm_delete_summary` | Delete summaries |
+| Tool                 | Description                 |
+| -------------------- | --------------------------- |
+| `rlm_store_summary`  | Store LLM-generated summary |
+| `rlm_get_summaries`  | Retrieve stored summaries   |
+| `rlm_delete_summary` | Delete summaries            |
 
 ### Shared Context
 
-| Tool | Description |
-|------|-------------|
+| Tool                 | Description                         |
+| -------------------- | ----------------------------------- |
 | `rlm_shared_context` | Get merged context from collections |
-| `rlm_list_templates` | List prompt templates |
-| `rlm_get_template` | Get specific template |
+| `rlm_list_templates` | List prompt templates               |
+| `rlm_get_template`   | Get specific template               |
 
 ## Integration with rlm-runtime
 
@@ -135,17 +136,17 @@ Claude workflow:
 
 ### When to Use Each MCP
 
-| Task Type | Use snipara-mcp | Use rlm-runtime |
-|-----------|-----------------|-----------------|
-| Understanding codebase | Y | |
-| Finding patterns | Y | |
-| Team best practices | Y | |
-| Domain knowledge | Y | |
-| Math/calculations | | Y |
-| Data processing | | Y |
-| Algorithm verification | | Y |
-| Code structure analysis | | Y |
-| **Complex tasks** | Y + Y | Y + Y |
+| Task Type               | Use snipara-mcp | Use rlm-runtime |
+| ----------------------- | --------------- | --------------- |
+| Understanding codebase  | Y               |                 |
+| Finding patterns        | Y               |                 |
+| Team best practices     | Y               |                 |
+| Domain knowledge        | Y               |                 |
+| Math/calculations       |                 | Y               |
+| Data processing         |                 | Y               |
+| Algorithm verification  |                 | Y               |
+| Code structure analysis |                 | Y               |
+| **Complex tasks**       | Y + Y           | Y + Y           |
 
 ### rlm-runtime Installation
 
@@ -187,35 +188,32 @@ mypy src/
 
 ## Deployment
 
-Deployed on Railway with auto-deploy from main branch.
+Production rollout is performed from the monorepo with the Infomaniak VPS scripts.
 
 ```bash
-# Auto-deploy (default)
-git push origin main
-
-# Manual deploy (if auto-deploy fails)
-railway link    # Link to project (first time only)
-railway up      # Deploy current code
+cd /Users/alopez/Devs/Snipara
+./deploy/infomaniak/deploy-zero-downtime.sh backend
+python deploy/infomaniak/check_hosted_mcp.py
 ```
 
 ## Environment Variables
 
-| Variable | Description | Required |
-|----------|-------------|----------|
-| `DATABASE_URL` | PostgreSQL (Neon) connection | Yes |
-| `REDIS_URL` | Redis for caching | Optional |
-| `OPENAI_API_KEY` | For embeddings | Pro+ plans |
-| `LOG_LEVEL` | Logging level | No |
+| Variable         | Description                       | Required   |
+| ---------------- | --------------------------------- | ---------- |
+| `DATABASE_URL`   | PostgreSQL (Vaultbrix) connection | Yes        |
+| `REDIS_URL`      | Redis for caching                 | Optional   |
+| `OPENAI_API_KEY` | For embeddings                    | Pro+ plans |
+| `LOG_LEVEL`      | Logging level                     | No         |
 
 ## Key Files for Common Tasks
 
-| Task | Files |
-|------|-------|
-| Add MCP tool | `src/rlm_engine.py` |
-| Modify search | `src/services/indexer.py` |
+| Task            | Files                     |
+| --------------- | ------------------------- |
+| Add MCP tool    | `src/rlm_engine.py`       |
+| Modify search   | `src/services/indexer.py` |
 | Change chunking | `src/services/chunker.py` |
-| Update auth | `src/auth.py` |
-| Add caching | `src/services/cache.py` |
+| Update auth     | `src/auth.py`             |
+| Add caching     | `src/services/cache.py`   |
 
 ## Recent Changes
 
@@ -227,7 +225,7 @@ railway up      # Deploy current code
 
 ---
 
-*Last updated: January 2025*
+_Last updated: January 2025_
 
 ---
 
@@ -236,37 +234,42 @@ railway up      # Deploy current code
 BMad Method is available globally across all Claude Code sessions. Use these slash commands for structured workflows.
 
 ### Quick Start
+
 ```
 /bmad/core/agents/bmad-master    # Main BMad agent - start here
 /bmad-help                        # Get guidance on what to do next
 ```
 
 ### Core Workflows
-| Command | Purpose |
-|---------|---------|
-| `/bmad/bmm/workflows/prd` | Create Product Requirements Document |
-| `/bmad/bmm/workflows/create-architecture` | Design system architecture |
-| `/bmad/bmm/workflows/create-story` | Create user stories |
-| `/bmad/bmm/workflows/create-epics-and-stories` | Full epic breakdown |
-| `/bmad/bmm/workflows/dev-story` | Develop/implement a story |
-| `/bmad/bmm/workflows/quick-dev` | Quick development flow |
-| `/bmad/bmm/workflows/sprint-planning` | Sprint planning session |
+
+| Command                                        | Purpose                              |
+| ---------------------------------------------- | ------------------------------------ |
+| `/bmad/bmm/workflows/prd`                      | Create Product Requirements Document |
+| `/bmad/bmm/workflows/create-architecture`      | Design system architecture           |
+| `/bmad/bmm/workflows/create-story`             | Create user stories                  |
+| `/bmad/bmm/workflows/create-epics-and-stories` | Full epic breakdown                  |
+| `/bmad/bmm/workflows/dev-story`                | Develop/implement a story            |
+| `/bmad/bmm/workflows/quick-dev`                | Quick development flow               |
+| `/bmad/bmm/workflows/sprint-planning`          | Sprint planning session              |
 
 ### Planning & Design
-| Command | Purpose |
-|---------|---------|
-| `/bmad/bmm/workflows/create-product-brief` | Initial product brief |
-| `/bmad/bmm/workflows/check-implementation-readiness` | Verify before coding |
-| `/bmad/core/workflows/brainstorming` | Brainstorming session |
+
+| Command                                              | Purpose               |
+| ---------------------------------------------------- | --------------------- |
+| `/bmad/bmm/workflows/create-product-brief`           | Initial product brief |
+| `/bmad/bmm/workflows/check-implementation-readiness` | Verify before coding  |
+| `/bmad/core/workflows/brainstorming`                 | Brainstorming session |
 
 ### Documentation & Diagrams
-| Command | Purpose |
-|---------|---------|
-| `/bmad/bmm/workflows/document-project` | Generate project docs |
-| `/bmad/bmm/workflows/create-excalidraw-diagram` | Create diagrams |
-| `/bmad/bmm/workflows/create-excalidraw-flowchart` | Create flowcharts |
-| `/bmad/bmm/workflows/create-excalidraw-wireframe` | Create wireframes |
-| `/bmad/bmm/workflows/create-excalidraw-dataflow` | Create data flow diagrams |
+
+| Command                                           | Purpose                   |
+| ------------------------------------------------- | ------------------------- |
+| `/bmad/bmm/workflows/document-project`            | Generate project docs     |
+| `/bmad/bmm/workflows/create-excalidraw-diagram`   | Create diagrams           |
+| `/bmad/bmm/workflows/create-excalidraw-flowchart` | Create flowcharts         |
+| `/bmad/bmm/workflows/create-excalidraw-wireframe` | Create wireframes         |
+| `/bmad/bmm/workflows/create-excalidraw-dataflow`  | Create data flow diagrams |
 
 ### Installation
+
 BMad is installed globally at `~/bmad-global/` and symlinked to `~/.claude/commands/bmad/`.

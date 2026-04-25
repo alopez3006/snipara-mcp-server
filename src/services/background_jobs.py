@@ -17,6 +17,8 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
+from ..config import settings
+
 if TYPE_CHECKING:
     from prisma.models import IndexJob
 
@@ -30,20 +32,169 @@ JOB_STALE_TIMEOUT = 300  # 5 min - reclaim if worker crashed
 MAX_CONCURRENT_JOBS = 2  # per worker
 AUTO_DISCOVERY_INTERVAL = 300  # 5 min - scan for unindexed documents
 STATE_CLEANUP_INTERVAL = 300  # 5 min - clean up expired shared states
+TIER_DEMOTION_INTERVAL = 3600  # 1 hour - demote chunks based on age
+TIER_DEMOTION_BATCH_SIZE = 100  # chunks per tier per cycle
+DOC_INDEX_KIND = "DOC"
+CODE_INDEX_KIND = "CODE"
 
 # Global state
 _running = False
 _processor_task: asyncio.Task | None = None
 _discovery_task: asyncio.Task | None = None
 _state_cleanup_task: asyncio.Task | None = None
+_tier_demotion_task: asyncio.Task | None = None
 _active_jobs: set[str] = set()
 _worker_id: str = f"worker-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 _last_discovery: datetime | None = None
 
 
+def _normalize_index_kind(index_kind: str | None) -> str:
+    """Normalize job kind inputs to the supported enum values."""
+    if (index_kind or DOC_INDEX_KIND).upper() == CODE_INDEX_KIND:
+        return CODE_INDEX_KIND
+    return DOC_INDEX_KIND
+
+
+async def _enqueue_discovered_index_jobs(
+    db: Prisma,
+    projects_needing_index: list[dict],
+    *,
+    index_kind: str,
+) -> None:
+    """Create discovery jobs through the shared job creation path."""
+    for proj in projects_needing_index:
+        try:
+            job = await create_index_job(
+                db,
+                proj["projectId"],
+                triggered_by="system",
+                triggered_via="auto_discovery",
+                index_mode="INCREMENTAL",
+                index_kind=index_kind,
+            )
+            if job.get("already_exists"):
+                continue
+
+            logger.info(
+                "Created auto-discovery %s index job %s for project %s (%s unindexed docs)",
+                index_kind.lower(),
+                job["id"],
+                proj["project_slug"],
+                proj["unindexed_count"],
+            )
+        except Exception as e:
+            if "unique constraint" not in str(e).lower():
+                logger.error(
+                    "Failed to create %s index job for %s: %s",
+                    index_kind.lower(),
+                    proj["project_slug"],
+                    e,
+                )
+
+
+async def _discover_projects_needing_doc_index(db: Prisma) -> list[dict]:
+    """Find projects that need DOC indexing."""
+    return await db.query_raw(
+        """
+        WITH doc_stats AS (
+            SELECT
+                d."projectId",
+                COUNT(*) FILTER (
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM document_chunks dc WHERE dc."documentId" = d.id
+                    )
+                ) as unindexed_count
+            FROM documents d
+            WHERE d.kind = 'DOC'
+              AND d."deletedAt" IS NULL
+            GROUP BY d."projectId"
+            HAVING COUNT(*) FILTER (
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM document_chunks dc WHERE dc."documentId" = d.id
+                )
+            ) > 0
+        ),
+        pending_jobs AS (
+            SELECT DISTINCT "projectId"
+            FROM index_jobs
+            WHERE status IN ('PENDING', 'RUNNING')
+              AND kind = 'DOC'
+        )
+        SELECT
+            ds."projectId",
+            ds.unindexed_count,
+            p.name as project_name,
+            p.slug as project_slug
+        FROM doc_stats ds
+        JOIN projects p ON ds."projectId" = p.id
+        LEFT JOIN pending_jobs pj ON ds."projectId" = pj."projectId"
+        WHERE pj."projectId" IS NULL
+        ORDER BY ds.unindexed_count DESC
+        LIMIT 10
+        """
+    )
+
+
+async def _discover_projects_needing_code_index(db: Prisma) -> list[dict]:
+    """Find projects that need CODE indexing."""
+    if not settings.enable_code_ingestion:
+        return []
+
+    from .code_graph import CODE_GRAPH_EXTRACTOR_VERSION
+
+    return await db.query_raw(
+        """
+        WITH code_stats AS (
+            SELECT
+                d."projectId",
+                COUNT(*) FILTER (
+                    WHERE NOT EXISTS (
+                        SELECT 1
+                        FROM code_index_state cis
+                        WHERE cis."documentId" = d.id
+                          AND cis."documentHash" = d.hash
+                          AND cis."extractorVersion" = $1
+                    )
+                ) as unindexed_count
+            FROM documents d
+            WHERE d.kind = 'CODE'
+              AND d."deletedAt" IS NULL
+            GROUP BY d."projectId"
+            HAVING COUNT(*) FILTER (
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM code_index_state cis
+                    WHERE cis."documentId" = d.id
+                      AND cis."documentHash" = d.hash
+                      AND cis."extractorVersion" = $1
+                )
+            ) > 0
+        ),
+        pending_jobs AS (
+            SELECT DISTINCT "projectId"
+            FROM index_jobs
+            WHERE status IN ('PENDING', 'RUNNING')
+              AND kind = 'CODE'
+        )
+        SELECT
+            cs."projectId",
+            cs.unindexed_count,
+            p.name as project_name,
+            p.slug as project_slug
+        FROM code_stats cs
+        JOIN projects p ON cs."projectId" = p.id
+        LEFT JOIN pending_jobs pj ON cs."projectId" = pj."projectId"
+        WHERE pj."projectId" IS NULL
+        ORDER BY cs.unindexed_count DESC
+        LIMIT 10
+        """,
+        CODE_GRAPH_EXTRACTOR_VERSION,
+    )
+
+
 async def start_job_processor() -> None:
     """Start the background job processor loop."""
-    global _running, _processor_task, _discovery_task, _state_cleanup_task
+    global _running, _processor_task, _discovery_task, _state_cleanup_task, _tier_demotion_task
 
     if _running:
         logger.warning("Job processor already running")
@@ -53,15 +204,16 @@ async def start_job_processor() -> None:
     _processor_task = asyncio.create_task(_job_processor_loop())
     _discovery_task = asyncio.create_task(_auto_discovery_loop())
     _state_cleanup_task = asyncio.create_task(_state_cleanup_loop())
+    _tier_demotion_task = asyncio.create_task(_tier_demotion_loop())
     logger.info(f"Job processor started (worker_id={_worker_id})")
 
 
 async def stop_job_processor() -> None:
     """Stop the background job processor."""
-    global _running, _processor_task, _discovery_task, _state_cleanup_task
+    global _running, _processor_task, _discovery_task, _state_cleanup_task, _tier_demotion_task
 
     _running = False
-    for task in [_processor_task, _discovery_task, _state_cleanup_task]:
+    for task in [_processor_task, _discovery_task, _state_cleanup_task, _tier_demotion_task]:
         if task:
             task.cancel()
             try:
@@ -71,6 +223,7 @@ async def stop_job_processor() -> None:
     _processor_task = None
     _discovery_task = None
     _state_cleanup_task = None
+    _tier_demotion_task = None
     logger.info("Job processor stopped")
 
 
@@ -115,78 +268,27 @@ async def _auto_discovery_loop() -> None:
             db = await get_db()
             now = datetime.now(UTC)
 
-            # Find projects with documents that have no chunks
-            # Use a single efficient query that:
-            # 1. Groups by project
-            # 2. Counts docs with 0 chunks
-            # 3. Only returns projects with unindexed docs
-            # 4. Excludes projects that already have pending/running jobs
-            projects_needing_index = await db.query_raw(
-                """
-                WITH doc_stats AS (
-                    SELECT
-                        d."projectId",
-                        COUNT(*) FILTER (
-                            WHERE NOT EXISTS (
-                                SELECT 1 FROM document_chunks dc WHERE dc."documentId" = d.id
-                            )
-                        ) as unindexed_count
-                    FROM documents d
-                    GROUP BY d."projectId"
-                    HAVING COUNT(*) FILTER (
-                        WHERE NOT EXISTS (
-                            SELECT 1 FROM document_chunks dc WHERE dc."documentId" = d.id
-                        )
-                    ) > 0
-                ),
-                pending_jobs AS (
-                    SELECT DISTINCT "projectId"
-                    FROM index_jobs
-                    WHERE status IN ('PENDING', 'RUNNING')
+            discovery_batches = [(DOC_INDEX_KIND, await _discover_projects_needing_doc_index(db))]
+            if settings.enable_code_ingestion:
+                discovery_batches.append(
+                    (CODE_INDEX_KIND, await _discover_projects_needing_code_index(db))
                 )
-                SELECT
-                    ds."projectId",
-                    ds.unindexed_count,
-                    p.name as project_name,
-                    p.slug as project_slug
-                FROM doc_stats ds
-                JOIN projects p ON ds."projectId" = p.id
-                LEFT JOIN pending_jobs pj ON ds."projectId" = pj."projectId"
-                WHERE pj."projectId" IS NULL
-                ORDER BY ds.unindexed_count DESC
-                LIMIT 10
-                """
-            )
 
-            if projects_needing_index:
+            for index_kind, projects_needing_index in discovery_batches:
+                if not projects_needing_index:
+                    continue
+
                 logger.info(
-                    f"Auto-discovery found {len(projects_needing_index)} projects "
-                    f"with unindexed documents"
+                    "Auto-discovery found %s projects with unindexed %s documents",
+                    len(projects_needing_index),
+                    index_kind.lower(),
                 )
 
-                for proj in projects_needing_index:
-                    try:
-                        # Create an incremental index job
-                        result = await db.query_raw(
-                            """
-                            INSERT INTO index_jobs
-                            (id, "projectId", status, progress, "indexMode", "createdAt", "updatedAt", "triggeredBy", "triggeredVia")
-                            VALUES (gen_random_uuid()::text, $1, 'PENDING', 0, 'INCREMENTAL'::"IndexJobMode", NOW(), NOW(), 'system', 'auto_discovery')
-                            RETURNING id
-                            """,
-                            proj["projectId"],
-                        )
-                        job_id = result[0]["id"] if result else None
-                        logger.info(
-                            f"Created auto-discovery index job {job_id} for "
-                            f"project {proj['project_slug']} ({proj['unindexed_count']} unindexed docs)"
-                        )
-                    except Exception as e:
-                        # Job might already exist due to race condition - that's OK
-                        if "unique constraint" not in str(e).lower():
-                            logger.error(
-                                f"Failed to create index job for {proj['project_slug']}: {e}"
-                            )
+                await _enqueue_discovered_index_jobs(
+                    db,
+                    projects_needing_index,
+                    index_kind=index_kind,
+                )
 
             _last_discovery = now
 
@@ -232,6 +334,88 @@ async def _state_cleanup_loop() -> None:
         await asyncio.sleep(STATE_CLEANUP_INTERVAL)
 
 
+async def _tier_demotion_loop() -> None:
+    """
+    Periodically demote chunks to lower tiers based on age.
+
+    Tier demotion rules:
+    - HOT (accessed < 24h) -> WARM if lastAccessed > 24h
+    - WARM (accessed < 7d) -> COLD if lastAccessed > 7d
+    - COLD (accessed < 30d) -> ARCHIVE if lastAccessed > 30d
+
+    This runs every TIER_DEMOTION_INTERVAL seconds (1 hour by default).
+    """
+    from ..db import get_db
+
+    # Wait 2 minutes before first demotion to let server stabilize
+    await asyncio.sleep(120)
+
+    while _running:
+        try:
+            db = await get_db()
+            now = datetime.now(UTC)
+            total_demoted = 0
+
+            # HOT -> WARM: lastAccessed > 24 hours
+            hot_cutoff = now - timedelta(hours=24)
+            hot_to_warm = await db.query_raw(
+                """
+                UPDATE document_chunks
+                SET tier = 'WARM'
+                WHERE tier = 'HOT'
+                  AND "lastAccessed" IS NOT NULL
+                  AND "lastAccessed" < $1::timestamptz
+                RETURNING id
+                """,
+                hot_cutoff.isoformat(),
+            )
+            if hot_to_warm:
+                logger.info(f"Tier demotion: {len(hot_to_warm)} chunks HOT -> WARM")
+                total_demoted += len(hot_to_warm)
+
+            # WARM -> COLD: lastAccessed > 7 days
+            warm_cutoff = now - timedelta(days=7)
+            warm_to_cold = await db.query_raw(
+                """
+                UPDATE document_chunks
+                SET tier = 'COLD'
+                WHERE tier = 'WARM'
+                  AND "lastAccessed" IS NOT NULL
+                  AND "lastAccessed" < $1::timestamptz
+                RETURNING id
+                """,
+                warm_cutoff.isoformat(),
+            )
+            if warm_to_cold:
+                logger.info(f"Tier demotion: {len(warm_to_cold)} chunks WARM -> COLD")
+                total_demoted += len(warm_to_cold)
+
+            # COLD -> ARCHIVE: lastAccessed > 30 days
+            cold_cutoff = now - timedelta(days=30)
+            cold_to_archive = await db.query_raw(
+                """
+                UPDATE document_chunks
+                SET tier = 'ARCHIVE'
+                WHERE tier = 'COLD'
+                  AND "lastAccessed" IS NOT NULL
+                  AND "lastAccessed" < $1::timestamptz
+                RETURNING id
+                """,
+                cold_cutoff.isoformat(),
+            )
+            if cold_to_archive:
+                logger.info(f"Tier demotion: {len(cold_to_archive)} chunks COLD -> ARCHIVE")
+                total_demoted += len(cold_to_archive)
+
+            if total_demoted > 0:
+                logger.info(f"Tier demotion complete: {total_demoted} chunks demoted")
+
+        except Exception as e:
+            logger.error(f"Error in tier demotion loop: {e}")
+
+        await asyncio.sleep(TIER_DEMOTION_INTERVAL)
+
+
 async def _claim_next_job(db: Prisma) -> IndexJob | None:
     """
     Atomically claim the next available job.
@@ -263,7 +447,7 @@ async def _claim_next_job(db: Prisma) -> IndexJob | None:
             LIMIT 1
             FOR UPDATE SKIP LOCKED
         )
-        RETURNING id, "projectId", status, progress, "indexMode", "documentsTotal", "documentsProcessed",
+        RETURNING id, "projectId", status, progress, "indexMode", kind, "documentsTotal", "documentsProcessed",
                   "chunksCreated", "retryCount", "maxRetries", "errorMessage",
                   "createdAt", "startedAt", "completedAt", "updatedAt",
                   "triggeredBy", "triggeredVia", "workerId", results
@@ -277,7 +461,12 @@ async def _claim_next_job(db: Prisma) -> IndexJob | None:
         return None
 
     row = result[0]
-    logger.info(f"Claimed job {row['id']} for project {row['projectId']}")
+    logger.info(
+        "Claimed %s job %s for project %s",
+        row.get("kind", DOC_INDEX_KIND).lower(),
+        row["id"],
+        row["projectId"],
+    )
 
     # If this was a stale job, increment retry count
     if row.get("retryCount", 0) > 0 or row.get("errorMessage"):
@@ -315,37 +504,52 @@ async def _process_index_job(db: Prisma, job: dict) -> None:
     - FULL: Re-index all documents (deletes existing chunks)
     - INCREMENTAL: Only index documents without existing chunks
     """
+    from .code_graph import CodeGraphIndexer
     from .indexer import DocumentIndexer
 
     job_id = job["id"]
     project_id = job["projectId"]
     index_mode = job.get("indexMode", "INCREMENTAL")  # Default to incremental
+    index_kind = _normalize_index_kind(job.get("kind"))
 
-    logger.info(f"Processing index job {job_id} for project {project_id} (mode={index_mode})")
+    logger.info(
+        "Processing %s index job %s for project %s (mode=%s)",
+        index_kind.lower(),
+        job_id,
+        project_id,
+        index_mode,
+    )
 
-    # Create indexer
-    indexer = DocumentIndexer(db)
-
-    if index_mode == "INCREMENTAL":
-        # Get only documents without chunks
-        documents = await db.query_raw(
-            """
-            SELECT d.id, d.path
-            FROM documents d
-            LEFT JOIN document_chunks dc ON d.id = dc."documentId"
-            WHERE d."projectId" = $1
-            GROUP BY d.id, d.path
-            HAVING COUNT(dc.id) = 0
-            ORDER BY d.path
-            """,
+    if index_kind == CODE_INDEX_KIND:
+        indexer = CodeGraphIndexer(db)
+        documents = await indexer.list_project_documents(
             project_id,
+            incremental=index_mode == "INCREMENTAL",
         )
-        # Convert to list of dicts with id/path
-        documents = [{"id": doc["id"], "path": doc["path"]} for doc in documents]
     else:
-        # Get all documents
-        docs = await db.document.find_many(where={"projectId": project_id})
-        documents = [{"id": doc.id, "path": doc.path} for doc in docs]
+        indexer = DocumentIndexer(db)
+
+        if index_mode == "INCREMENTAL":
+            documents = await db.query_raw(
+                """
+                SELECT d.id, d.path
+                FROM documents d
+                LEFT JOIN document_chunks dc ON d.id = dc."documentId"
+                WHERE d."projectId" = $1
+                  AND d.kind = 'DOC'
+                  AND d."deletedAt" IS NULL
+                GROUP BY d.id, d.path
+                HAVING COUNT(dc.id) = 0
+                ORDER BY d.path
+                """,
+                project_id,
+            )
+            documents = [{"id": doc["id"], "path": doc["path"]} for doc in documents]
+        else:
+            docs = await db.document.find_many(
+                where={"projectId": project_id, "deletedAt": None, "kind": "DOC"}
+            )
+            documents = [{"id": doc.id, "path": doc.path} for doc in docs]
 
     total_docs = len(documents)
 
@@ -366,18 +570,37 @@ async def _process_index_job(db: Prisma, job: dict) -> None:
     )
 
     # Index each document with progress updates
-    results: dict[str, int] = {}
+    results: dict[str, int | dict[str, int | bool | str | None]] = {}
     total_chunks = 0
     processed = 0
 
     for doc in documents:
         try:
-            chunk_count = await indexer.index_document(doc["id"])
-            results[doc["path"]] = chunk_count
-            total_chunks += chunk_count
+            if index_kind == CODE_INDEX_KIND:
+                code_result = await indexer.index_document(doc["id"])
+                results[doc["path"]] = {
+                    "nodes": code_result.node_count,
+                    "edges": code_result.edge_count,
+                    "skipped": code_result.skipped,
+                    "reason": code_result.reason,
+                }
+                total_chunks += code_result.node_count
+            else:
+                chunk_count = await indexer.index_document(doc["id"])
+                results[doc["path"]] = chunk_count
+                total_chunks += chunk_count
         except Exception as e:
             logger.error(f"Error indexing document {doc['path']}: {e}")
-            results[doc["path"]] = 0
+            results[doc["path"]] = (
+                {
+                    "nodes": 0,
+                    "edges": 0,
+                    "skipped": True,
+                    "reason": "index_error",
+                }
+                if index_kind == CODE_INDEX_KIND
+                else 0
+            )
 
         processed += 1
 
@@ -492,6 +715,7 @@ async def create_index_job(
     triggered_by: str | None = None,
     triggered_via: str | None = None,
     index_mode: str = "INCREMENTAL",
+    index_kind: str = DOC_INDEX_KIND,
 ) -> dict:
     """
     Create a new index job for a project.
@@ -502,53 +726,70 @@ async def create_index_job(
         triggered_by: User ID or "system", "webhook".
         triggered_via: "api_key", "internal", "dashboard".
         index_mode: "INCREMENTAL" (only unindexed docs) or "FULL" (all docs).
+        index_kind: "DOC" or "CODE".
 
     Returns the created job data.
     """
     # Validate index_mode
     if index_mode not in ("INCREMENTAL", "FULL"):
         index_mode = "INCREMENTAL"
+    index_kind = _normalize_index_kind(index_kind)
 
-    # Check if there's already a pending/running job for this project
-    existing = await db.query_raw(
-        """
-        SELECT id, status, progress, "indexMode", "createdAt"
-        FROM index_jobs
-        WHERE "projectId" = $1 AND status IN ('PENDING', 'RUNNING')
-        ORDER BY "createdAt" DESC
-        LIMIT 1
-        """,
-        project_id,
-    )
+    async with db.tx() as transaction:
+        # Serialize job creation per (project, kind) across backend replicas.
+        await transaction.execute_raw(
+            "SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))",
+            project_id,
+            index_kind,
+        )
 
-    if existing:
-        row = existing[0]
-        logger.info(f"Index job already exists for project {project_id}: {row['id']}")
-        return {
-            "id": row["id"],
-            "project_id": project_id,
-            "status": row["status"].lower(),
-            "progress": row["progress"],
-            "index_mode": row.get("indexMode", "INCREMENTAL"),
-            "created_at": row["createdAt"] if row["createdAt"] else None,
-            "already_exists": True,
-        }
+        existing = await transaction.query_raw(
+            """
+            SELECT id, status, progress, "indexMode", kind, "createdAt"
+            FROM index_jobs
+            WHERE "projectId" = $1 AND kind = $2::"IndexJobKind" AND status IN ('PENDING', 'RUNNING')
+            ORDER BY "createdAt" DESC
+            LIMIT 1
+            """,
+            project_id,
+            index_kind,
+        )
 
-    # Create new job
-    result = await db.query_raw(
-        """
-        INSERT INTO index_jobs (id, "projectId", status, progress, "indexMode", "createdAt", "updatedAt", "triggeredBy", "triggeredVia")
-        VALUES (gen_random_uuid()::text, $1, 'PENDING', 0, $2::"IndexJobMode", NOW(), NOW(), $3, $4)
-        RETURNING id, "projectId", status, progress, "indexMode", "createdAt"
-        """,
-        project_id,
-        index_mode,
-        triggered_by,
-        triggered_via,
-    )
+        if existing:
+            row = existing[0]
+            logger.info(f"Index job already exists for project {project_id}: {row['id']}")
+            return {
+                "id": row["id"],
+                "project_id": project_id,
+                "status": row["status"].lower(),
+                "progress": row["progress"],
+                "index_mode": row.get("indexMode", "INCREMENTAL"),
+                "index_kind": row.get("kind", DOC_INDEX_KIND),
+                "created_at": row["createdAt"] if row["createdAt"] else None,
+                "already_exists": True,
+            }
+
+        result = await transaction.query_raw(
+            """
+            INSERT INTO index_jobs (id, "projectId", status, progress, "indexMode", kind, "createdAt", "updatedAt", "triggeredBy", "triggeredVia")
+            VALUES (gen_random_uuid()::text, $1, 'PENDING', 0, $2::"IndexJobMode", $3::"IndexJobKind", NOW(), NOW(), $4, $5)
+            RETURNING id, "projectId", status, progress, "indexMode", kind, "createdAt"
+            """,
+            project_id,
+            index_mode,
+            index_kind,
+            triggered_by,
+            triggered_via,
+        )
 
     row = result[0]
-    logger.info(f"Created index job {row['id']} for project {project_id} (mode={index_mode})")
+    logger.info(
+        "Created %s index job %s for project %s (mode=%s)",
+        index_kind.lower(),
+        row["id"],
+        project_id,
+        index_mode,
+    )
 
     return {
         "id": row["id"],
@@ -556,6 +797,7 @@ async def create_index_job(
         "status": row["status"].lower(),
         "progress": row["progress"],
         "index_mode": row["indexMode"],
+        "index_kind": row.get("kind", DOC_INDEX_KIND),
         "created_at": row["createdAt"] if row["createdAt"] else None,
         "already_exists": False,
     }
@@ -565,7 +807,7 @@ async def get_job_status(db: Prisma, project_id: str, job_id: str) -> dict | Non
     """Get the status of an index job."""
     result = await db.query_raw(
         """
-        SELECT id, "projectId", status, progress, "indexMode", "errorMessage",
+        SELECT id, "projectId", status, progress, "indexMode", kind, "errorMessage",
                "documentsTotal", "documentsProcessed", "chunksCreated",
                "retryCount", "maxRetries", "workerId",
                "createdAt", "startedAt", "completedAt", "updatedAt",
@@ -587,6 +829,7 @@ async def get_job_status(db: Prisma, project_id: str, job_id: str) -> dict | Non
         "status": row["status"].lower(),
         "progress": row["progress"],
         "index_mode": row.get("indexMode", "INCREMENTAL"),
+        "index_kind": row.get("kind", DOC_INDEX_KIND),
         "error_message": row["errorMessage"],
         "documents_total": row["documentsTotal"],
         "documents_processed": row["documentsProcessed"],

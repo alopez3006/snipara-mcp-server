@@ -172,7 +172,7 @@ async def get_recent_events(
 
     events = await db.swarmevent.find_many(
         where=where,
-        order_by={"createdAt": "desc"},
+        order={"createdAt": "desc"},
         take=limit,
     )
 
@@ -275,7 +275,7 @@ async def _cleanup_old_events(swarm_id: str):
             # Find cutoff event
             events_to_keep = await db.swarmevent.find_many(
                 where={"swarmId": swarm_id},
-                order_by={"createdAt": "desc"},
+                order={"createdAt": "desc"},
                 take=MAX_EVENTS_PER_SWARM,
                 select={"id": True},
             )
@@ -292,6 +292,95 @@ async def _cleanup_old_events(swarm_id: str):
                 logger.debug(f"Cleaned up {deleted} old events for swarm {swarm_id}")
     except Exception as e:
         logger.warning(f"Event cleanup failed: {e}")
+
+
+async def get_task_events(
+    swarm_id: str,
+    since: datetime | str | None = None,
+    limit: int = 100,
+) -> dict[str, Any]:
+    """Get task status change events for a swarm.
+
+    Filters events to only task-related types:
+    - task_created, task_claimed, task_completed, task_failed, task_cancelled
+
+    Args:
+        swarm_id: The swarm ID
+        since: Only return events after this timestamp (datetime or ISO string)
+        limit: Maximum events to return (default 100)
+
+    Returns:
+        Dict with task events list
+    """
+    db = await get_db()
+
+    where: dict[str, Any] = {
+        "swarmId": swarm_id,
+        "eventType": {
+            "in": [
+                "task_created",
+                "task_claimed",
+                "task_completed",
+                "task_failed",
+                "task_cancelled",
+                "task_status_changed",
+            ]
+        },
+    }
+
+    # Parse since if string
+    if since:
+        if isinstance(since, str):
+            since_dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
+            where["createdAt"] = {"gt": since_dt}
+        else:
+            where["createdAt"] = {"gt": since}
+
+    events = await db.swarmevent.find_many(
+        where=where,
+        order={"createdAt": "desc"},
+        take=limit,
+    )
+
+    # Build events list with agent lookup
+    event_list = []
+    agent_cache: dict[str, str] = {}
+
+    for e in reversed(events):  # Return in chronological order
+        # Get external agent_id from cache or DB
+        external_agent_id = None
+        if e.agentId:
+            if e.agentId in agent_cache:
+                external_agent_id = agent_cache[e.agentId]
+            else:
+                agent = await db.swarmagent.find_first(where={"id": e.agentId})
+                if agent:
+                    external_agent_id = agent.agentId
+                    agent_cache[e.agentId] = agent.agentId
+
+        # Parse payload
+        payload_data = None
+        if e.payload:
+            try:
+                payload_data = json.loads(e.payload) if isinstance(e.payload, str) else e.payload
+            except (json.JSONDecodeError, TypeError):
+                payload_data = e.payload
+
+        event_list.append({
+            "event_id": e.id,
+            "event_type": e.eventType,
+            "agent_id": external_agent_id,
+            "task_id": payload_data.get("task_id") if isinstance(payload_data, dict) else None,
+            "task_title": payload_data.get("task_title") if isinstance(payload_data, dict) else None,
+            "payload": payload_data,
+            "timestamp": e.createdAt.isoformat() if e.createdAt else None,
+        })
+
+    return {
+        "events": event_list,
+        "total": len(event_list),
+        "swarm_id": swarm_id,
+    }
 
 
 # =============================================================================

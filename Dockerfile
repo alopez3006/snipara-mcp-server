@@ -4,6 +4,7 @@
 FROM python:3.12-slim AS builder
 
 WORKDIR /app
+ARG TORCH_VERSION=2.11.0
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -13,30 +14,33 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Create virtual environment
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
 
 # Install Python dependencies
-COPY requirements.txt .
+COPY requirements-prod.txt .
+COPY wheelhouse ./wheelhouse
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+    if find wheelhouse -maxdepth 1 -name 'torch-*.whl' | grep -q .; then \
+        pip install --no-cache-dir --no-index --find-links=wheelhouse "torch==${TORCH_VERSION}"; \
+    else \
+        pip install --no-cache-dir "torch==${TORCH_VERSION}"; \
+    fi && \
+    rm -rf wheelhouse && \
+    pip install --no-cache-dir -r requirements-prod.txt
 
-# Create appuser home directory structure for caches
-RUN mkdir -p /home/appuser/.cache/torch/sentence_transformers
+# Create appuser home directory structure for Prisma and model caches
+RUN mkdir -p \
+    /home/appuser/.cache/prisma \
+    /home/appuser/.cache/huggingface \
+    /home/appuser/.cache/torch/sentence_transformers
 ENV HOME="/home/appuser"
 ENV HF_HOME="/home/appuser/.cache/huggingface"
+ENV TRANSFORMERS_CACHE="/home/appuser/.cache/huggingface"
 ENV SENTENCE_TRANSFORMERS_HOME="/home/appuser/.cache/torch/sentence_transformers"
 
 # Generate Prisma client (with HOME set so binaries go to /home/appuser/.cache)
 COPY prisma ./prisma
 RUN prisma generate
-
-# Pre-download embedding models to avoid runtime network dependency
-# Models are cached in SENTENCE_TRANSFORMERS_HOME
-# Primary model: bge-large (1024 dims) — pgvector indexing, memory, chunk search
-RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-large-en-v1.5', device='cpu')"
-# Light model: bge-small (384 dims) — on-the-fly fallback path (~10x faster on CPU)
-RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-small-en-v1.5', device='cpu')"
-# Verify model cache was created
-RUN ls -la /home/appuser/.cache/torch/sentence_transformers/
 
 
 # ============ RUNTIME STAGE ============
@@ -57,20 +61,19 @@ RUN groupadd --gid 1000 appgroup && \
 COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# Copy Prisma binaries cache from builder (already at /home/appuser/.cache)
-COPY --from=builder /home/appuser/.cache /home/appuser/.cache
-RUN chown -R appuser:appgroup /home/appuser
+# Copy Prisma binaries and cache directory skeleton from builder.
+# Embedding weights are intentionally not baked into the image; production uses
+# dedicated cache volumes plus an explicit warmup step.
+COPY --from=builder --chown=appuser:appgroup /home/appuser/.cache /home/appuser/.cache
 
-# Set HOME and cache paths for appuser (must match build stage)
+# Set HOME and cache variables (must match build stage)
 ENV HOME="/home/appuser"
 ENV HF_HOME="/home/appuser/.cache/huggingface"
+ENV TRANSFORMERS_CACHE="/home/appuser/.cache/huggingface"
 ENV SENTENCE_TRANSFORMERS_HOME="/home/appuser/.cache/torch/sentence_transformers"
 
 # Copy application code
-COPY src ./src
-
-# Set ownership
-RUN chown -R appuser:appgroup /app
+COPY --chown=appuser:appgroup src ./src
 
 # Switch to non-root user
 USER appuser

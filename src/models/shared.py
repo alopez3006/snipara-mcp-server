@@ -11,8 +11,12 @@ class SharedDocumentInfo(BaseModel):
     id: str = Field(..., description="Document ID")
     title: str = Field(..., description="Document title")
     category: DocumentCategoryEnum = Field(..., description="Document category")
+    is_mandatory: bool = Field(default=False, description="Non-negotiable rule flag")
     token_count: int = Field(..., ge=0, description="Token count")
     collection_name: str = Field(..., description="Source collection name")
+    source_type: str = Field(
+        ..., description="Origin of the document: TEAM_CONTEXT or LINKED_COLLECTION"
+    )
     tags: list[str] = Field(default_factory=list, description="Document tags")
 
 
@@ -29,6 +33,15 @@ class SharedContextResult(BaseModel):
     )
     total_tokens: int = Field(default=0, ge=0, description="Total tokens returned")
     collections_loaded: int = Field(default=0, ge=0, description="Number of collections loaded")
+    linked_collections_loaded: int = Field(
+        default=0, ge=0, description="Number of explicitly linked collections loaded"
+    )
+    team_context_documents_loaded: int = Field(
+        default=0, ge=0, description="Number of implicit team-context documents included"
+    )
+    linked_collection_documents_loaded: int = Field(
+        default=0, ge=0, description="Number of linked-collection documents included"
+    )
     context_hash: str = Field(
         default="",
         description="Hash for cache invalidation",

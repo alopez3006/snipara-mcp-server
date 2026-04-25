@@ -23,12 +23,37 @@ class ToolResult:
 class ProjectSettings:
     """Project automation settings from dashboard."""
 
+    # Core query settings
     max_tokens_per_query: int = 4000
     search_mode: str = "hybrid"
     include_summaries: bool = True
-    enrich_prompts: bool = False
+
+    # Automation settings
+    automation_client: str = "claude-code"
     auto_inject_context: bool = False
-    system_instructions: str | None = None  # Custom instructions to prepend to responses
+    track_accessed_files: bool = False
+    preserve_on_compaction: bool = True
+    restore_on_session_start: bool = True
+    enrich_prompts: bool = False
+    system_instructions: str | None = None
+
+    # Memory injection settings (Agents feature)
+    memory_injection_enabled: bool = False
+    memory_inject_types: list[str] | None = None
+    memory_exclude_session_checkpoints: bool = False
+    memory_min_confidence: float = 0.2
+    memory_recall_query: str | None = None
+    memory_save_on_commit: bool = False
+    memory_auto_recall_on_session_start: bool = True
+    memory_auto_recall_on_resume: bool = True
+    memory_deduplicate_before_write: bool = True
+    memory_end_of_task_commit_enabled: bool = True
+    memory_workspace_profile_enabled: bool = True
+    memory_novelty_threshold: float = 0.92
+    memory_resume_window_minutes: int = 180
+    memory_review_mode: str = "AUTO"
+    memory_capture_tool_results: bool = True
+    memory_capture_failures: bool = False
 
 
 class UsageInfo(BaseModel):

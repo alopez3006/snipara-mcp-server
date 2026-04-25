@@ -12,6 +12,7 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
+        extra="ignore",
     )
 
     # Database
@@ -38,7 +39,8 @@ class Settings(BaseSettings):
         "FREE": 20,
         "PRO": 120,
         "TEAM": 300,
-        "ENTERPRISE": 1000,
+        "ENTERPRISE": 2000,
+        "PARTNER": 5000,  # Partners/Integrators with heavy polling
     }
 
     # Demo key rate limiting (stricter, public key)
@@ -49,6 +51,12 @@ class Settings(BaseSettings):
     # IP-based rate limiting (secondary layer)
     ip_rate_limit_requests: int = 300  # requests per window per IP
     ip_rate_limit_window: int = 60  # seconds
+
+    # Failed authentication throttling for /mcp and /v1 surfaces.
+    # These routes intentionally skip broad IP limits for valid multi-agent traffic,
+    # so failed credentials need their own stricter limiter.
+    auth_failure_rate_limit_requests: int = 30
+    auth_failure_rate_limit_window: int = 300  # seconds
 
     # Fail-closed: reject requests when Redis is unavailable in production
     rate_limit_fail_closed: bool = False
@@ -70,6 +78,14 @@ class Settings(BaseSettings):
         "ENTERPRISE": -1,  # unlimited
     }
 
+    # Trash retention days per plan (0 = no trash, hard delete)
+    trash_retention_days: dict[str, int] = {
+        "FREE": 0,  # No trash - hard delete immediately
+        "PRO": 7,  # 7-day trash retention
+        "TEAM": 30,  # 30-day trash retention
+        "ENTERPRISE": 90,  # 90-day trash retention
+    }
+
     # Self-hosted license key (optional)
     snipara_license_key: str = ""
 
@@ -82,6 +98,17 @@ class Settings(BaseSettings):
 
     # Environment name for Sentry
     environment: str = "development"
+
+    # Embeddings
+    preload_embeddings: bool = True
+
+    # Memory V2 rollout flags
+    memory_v2_dual_write: bool = False
+    memory_v2_dual_read: bool = False
+    memory_v2_primary_read: bool = False
+
+    # Code graph rollout
+    enable_code_ingestion: bool = False
 
     @property
     def cors_origins_list(self) -> list[str]:

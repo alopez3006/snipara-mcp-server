@@ -1,20 +1,24 @@
 """Auto-remember middleware for automatic memory storage after tool calls.
 
-When a project has `memory_save_on_commit` enabled, this middleware automatically
-extracts and stores learnings/decisions from meaningful tool results.
+Project policy controls whether successful tool results and failures should
+be persisted, whether writes should land in the review inbox, and whether
+novelty checks should run before storing.
 """
 
 import logging
 from typing import Any
 
-from ...services.agent_memory import store_memory
+from ...services.agent_memory import (
+    remember_if_novel,
+    resolve_review_status_for_source,
+    store_memory,
+)
 
 logger = logging.getLogger(__name__)
 
 # Tools that should trigger auto-remember
 # Format: tool_name -> (memory_type, content_extractor_key)
 AUTO_REMEMBER_TOOLS: dict[str, tuple[str, str]] = {
-    "rlm_context_query": ("LEARNING", "query_result"),
     "rlm_decompose": ("DECISION", "decomposition"),
     "rlm_plan": ("DECISION", "plan"),
     "rlm_upload_document": ("DECISION", "upload"),
@@ -29,6 +33,8 @@ EXCLUDED_TOOLS: set[str] = {
     "rlm_remember",
     "rlm_recall",
     "rlm_memories",
+    "rlm_memory_invalidate",
+    "rlm_memory_supersede",
     "rlm_forget",
     # Meta/utility tools
     "rlm_stats",
@@ -145,44 +151,75 @@ async def maybe_auto_remember(
         params: The parameters passed to the tool.
         result: The result data from the tool (ToolResult.data).
         project_id: The project ID for storing the memory.
-        settings: ProjectSettings object with memory_save_on_commit and
-            memory_inject_types fields.
+        settings: ProjectSettings object with memory capture policy fields.
     """
-    # Check if feature is enabled
-    if not getattr(settings, "memory_save_on_commit", False):
-        return
-
     # Skip excluded tools
     if tool in EXCLUDED_TOOLS:
         return
 
-    # Skip if result indicates failure
-    if isinstance(result, dict) and result.get("error"):
+    capture_tool_results = getattr(settings, "memory_capture_tool_results", True)
+    capture_failures = getattr(settings, "memory_capture_failures", False)
+    result_has_error = isinstance(result, dict) and result.get("error")
+
+    if result_has_error and not capture_failures:
+        return
+
+    if not result_has_error and not capture_tool_results:
         return
 
     try:
-        # Extract memory content
-        extracted = extract_memory_content(tool, params, result if result else {})
+        if result_has_error:
+            error_text = str(result.get("error", "")).strip()[:240]
+            query_hint = params.get("query") or params.get("task_id") or params.get("path") or tool
+            extracted = (
+                "LEARNING",
+                f"Automated tool failure for {tool}: {query_hint} -> {error_text or 'unknown error'}",
+            )
+            category = "auto-failure"
+            source = "auto_failure"
+        else:
+            extracted = extract_memory_content(tool, params, result if result else {})
+            category = "auto-remember"
+            source = "auto"
+
         if not extracted:
             return
 
         memory_type, content = extracted
 
         # Check if this type is in the allowed types
-        allowed_types = getattr(settings, "memory_inject_types", ["DECISION", "LEARNING"])
+        allowed_types = getattr(settings, "memory_inject_types", None) or [
+            "DECISION",
+            "LEARNING",
+        ]
         if memory_type not in allowed_types:
             return
 
-        # Store the memory
-        await store_memory(
-            project_id=project_id,
-            content=content,
-            memory_type=memory_type.lower(),  # DB uses lowercase
-            scope="project",
-            category="auto-remember",
-            ttl_days=30,  # Auto-memories expire after 30 days
-            source="auto",
-        )
+        review_status = resolve_review_status_for_source(settings, source=source)
+
+        if getattr(settings, "memory_deduplicate_before_write", True):
+            await remember_if_novel(
+                project_id=project_id,
+                content=content,
+                memory_type=memory_type.lower(),  # DB uses lowercase
+                scope="project",
+                category=category,
+                ttl_days=30,  # Auto-memories expire after 30 days
+                source=source,
+                review_status=review_status,
+                novelty_threshold=getattr(settings, "memory_novelty_threshold", 0.92),
+            )
+        else:
+            await store_memory(
+                project_id=project_id,
+                content=content,
+                memory_type=memory_type.lower(),
+                scope="project",
+                category=category,
+                ttl_days=30,
+                source=source,
+                review_status=review_status,
+            )
 
         logger.debug(f"Auto-remembered {memory_type} from {tool}: {content[:50]}...")
 

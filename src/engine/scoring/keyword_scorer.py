@@ -8,6 +8,7 @@ This module provides keyword-based relevance scoring using:
 """
 
 import logging
+import math
 import re
 from typing import TYPE_CHECKING, Protocol
 
@@ -17,6 +18,7 @@ from .constants import (
     NUMBERED_SECTION_PATTERNS,
     PLANNED_CONTENT_MARKERS,
     QUERY_EXPANSIONS,
+    SELECTION_QUERY_PATTERNS,
     STOP_WORDS,
 )
 from .stemmer import stem_keyword
@@ -100,6 +102,8 @@ def calculate_keyword_score(
     section: SectionProtocol,
     keywords: list[str],
     is_list_query_flag: bool = False,
+    keyword_weights: dict[str, float] | None = None,
+    query: str | None = None,
 ) -> float:
     """Calculate keyword relevance score for a section.
 
@@ -131,12 +135,19 @@ def calculate_keyword_score(
     length_norm = max(length_norm, 0.15)  # Floor to avoid near-zero
 
     title_keyword_hits = 0
+    distinctive_title_hits = 0
+
+    keyword_weights = keyword_weights or {}
 
     for keyword in keywords:
         if len(keyword) < 2:  # Skip very short words
             continue
 
         stem = stem_keyword(keyword)
+        keyword_weight = max(
+            keyword_weights.get(keyword, 1.0),
+            keyword_weights.get(stem, 1.0),
+        )
 
         # Title matches — reduced weight for generic terms
         title_count = title_lower.count(keyword)
@@ -150,15 +161,16 @@ def calculate_keyword_score(
             # This prevents "Snipara tools not available" ranking above
             # actual tool documentation for "What tools does Snipara expose?"
             if keyword in GENERIC_TITLE_TERMS or stem in GENERIC_TITLE_TERMS:
-                score += title_count * 1.5
+                score += title_count * 1.5 * keyword_weight
             else:
-                score += title_count * 5.0
+                distinctive_title_hits += 1
+                score += title_count * 5.0 * keyword_weight
 
         # Content matches (length-normalized)
         content_count = content_lower.count(keyword)
         if content_count == 0 and stem != keyword:
             content_count = content_lower.count(stem)
-        score += content_count * length_norm
+        score += content_count * length_norm * keyword_weight
 
     # Bonus for higher-level sections (h1, h2 more important)
     level_bonus = max(0, 4 - section.level) * 0.5
@@ -167,8 +179,8 @@ def calculate_keyword_score(
     # Title keyword coverage boost: when multiple query keywords appear
     # in the section title, this section is likely a direct topical match.
     # Apply multiplicative boost proportional to the number of title hits.
-    if title_keyword_hits >= 2:
-        coverage_boost = 1.0 + title_keyword_hits * 2.0
+    if distinctive_title_hits >= 2:
+        coverage_boost = 1.0 + distinctive_title_hits * 2.0
         score *= coverage_boost
 
     # Exact phrase match bonus: if the entire query (or a significant portion)
@@ -184,7 +196,115 @@ def calculate_keyword_score(
     if is_list_query_flag and score > 0:
         score = _apply_list_pattern_boost(section, score)
 
+    if score > 0 and query:
+        score = adjust_score_for_query_intent(section, query, score, keywords=keywords)
+
     return score
+
+
+def compute_keyword_weights(
+    sections: list[SectionProtocol],
+    keywords: list[str],
+) -> dict[str, float]:
+    """Compute IDF-like weights for query keywords over candidate sections."""
+    total_sections = max(len(sections), 1)
+    weights: dict[str, float] = {}
+
+    for keyword in keywords:
+        if len(keyword) < 2:
+            continue
+        stem = stem_keyword(keyword)
+        document_frequency = 0
+
+        for section in sections:
+            text = f"{section.title}\n{section.content}".lower()
+            if keyword in text or (stem != keyword and stem in text):
+                document_frequency += 1
+
+        rarity_weight = 1.0 + 2.0 * math.log((total_sections + 1) / (document_frequency + 1))
+        weights[keyword] = max(rarity_weight, 0.25)
+        if stem != keyword:
+            weights[stem] = max(weights.get(stem, 0.0), weights[keyword])
+
+    return weights
+
+
+def adjust_score_for_query_intent(
+    section: SectionProtocol,
+    query: str,
+    score: float,
+    keywords: list[str] | None = None,
+) -> float:
+    """Apply lightweight reranking heuristics for recommendation-style queries."""
+    if score <= 0:
+        return score
+
+    query_lower = query.lower()
+    title_lower = section.title.lower()
+    normalized = _normalize_text(f"{section.title}\n{section.content}")
+    keywords = keywords or extract_keywords(query)
+
+    phrase_matches = _count_query_phrase_matches(normalized, keywords)
+    if phrase_matches:
+        score *= min(1.0 + 0.2 * phrase_matches, 1.6)
+
+    handle_focus = re.search(r"\bhandle\s+(.+)$", query_lower)
+    if handle_focus:
+        tail_keywords = extract_keywords(handle_focus.group(1))
+        tail_matches = _count_query_phrase_matches(normalized, tail_keywords)
+        if tail_matches:
+            score *= min(1.0 + 0.75 * tail_matches, 2.2)
+        elif tail_keywords and not _contains_tail_keywords(normalized, tail_keywords):
+            score *= 0.25
+
+    if any(re.search(pattern, query_lower) for pattern in SELECTION_QUERY_PATTERNS):
+        actionable = bool(
+            re.search(r"\b(use|choose|pick|select|reserve|recommend(?:ed)?)\b.{0,30}\bfor\b", normalized)
+            or re.search(r"\bbest\s+for\b", normalized)
+        )
+        if actionable:
+            score *= 1.8
+        elif title_lower.endswith(" model"):
+            score *= 0.65
+
+    return score
+
+
+def _normalize_text(text: str) -> str:
+    return re.sub(r"[^\w]+", " ", text.lower()).strip()
+
+
+def _count_query_phrase_matches(normalized_text: str, keywords: list[str]) -> int:
+    significant = [stem_keyword(keyword) for keyword in keywords if len(keyword) >= 3]
+    if len(significant) < 2:
+        return 0
+
+    text_tokens = normalized_text.split()
+    matches = 0
+    for left, right in zip(significant, significant[1:]):
+        if _tokens_within_window(text_tokens, left, right, window=4):
+            matches += 1
+    return matches
+
+
+def _tokens_within_window(tokens: list[str], left: str, right: str, window: int) -> bool:
+    for index, token in enumerate(tokens):
+        if not token.startswith(left):
+            continue
+        for offset in range(1, window + 1):
+            if index + offset >= len(tokens):
+                break
+            if tokens[index + offset].startswith(right):
+                return True
+    return False
+
+
+def _contains_tail_keywords(normalized_text: str, keywords: list[str]) -> bool:
+    tokens = normalized_text.split()
+    stems = [stem_keyword(keyword) for keyword in keywords if len(keyword) >= 3]
+    if not stems:
+        return False
+    return all(any(token.startswith(stem) for token in tokens) for stem in stems)
 
 
 def _apply_list_pattern_boost(section: SectionProtocol, base_score: float) -> float:

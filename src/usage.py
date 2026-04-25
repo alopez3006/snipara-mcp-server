@@ -21,6 +21,7 @@ _redis_available: bool | None = None
 # In-memory rate limiting fallback (per-process)
 _local_rate_limits: dict[str, list[float]] = defaultdict(list)
 _local_ip_rate_limits: dict[str, list[float]] = defaultdict(list)
+_local_auth_failure_limits: dict[str, list[float]] = defaultdict(list)
 _fallback_warning_logged: bool = False
 
 
@@ -56,6 +57,36 @@ async def close_redis() -> None:
         await _redis.close()
         _redis = None
     _redis_available = None
+
+
+async def clear_rate_limit(api_key_id: str) -> bool:
+    """
+    Clear rate limit counter for a specific API key.
+
+    Args:
+        api_key_id: The API key ID to clear rate limits for
+
+    Returns:
+        True if cleared successfully, False if Redis unavailable
+    """
+    global _local_rate_limits
+
+    r = await get_redis()
+    if r is not None:
+        try:
+            key = f"rate_limit:{api_key_id}"
+            await r.delete(key)
+            logger.info(f"Cleared rate limit for {api_key_id[:12]}...")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to clear rate limit in Redis: {e}")
+
+    # Also clear in-memory fallback
+    if api_key_id in _local_rate_limits:
+        del _local_rate_limits[api_key_id]
+        logger.info(f"Cleared in-memory rate limit for {api_key_id[:12]}...")
+
+    return r is not None
 
 
 def _is_demo_key(api_key_id: str) -> bool:
@@ -143,6 +174,9 @@ async def check_rate_limit(
 
         # Increment counter
         await r.incr(key)
+        # Safeguard: ensure TTL is set (fixes stuck keys from migration/failover)
+        if await r.ttl(key) < 0:
+            await r.expire(key, window)
         return True
     except Exception as e:
         # Redis error - fail-closed or fall back to in-memory
@@ -247,6 +281,56 @@ async def check_ip_rate_limit(client_ip: str) -> bool:
     except Exception as e:
         logger.error(f"Redis IP rate limit check failed: {e}")
         return True  # Fail open for IP checks (API key limit is primary)
+
+
+async def check_auth_failure_rate_limit(client_ip: str | None, credential_prefix: str) -> bool:
+    """
+    Throttle repeated failed authentication attempts.
+
+    The MCP and REST API routes skip coarse IP middleware so many valid agents can
+    share an IP. Invalid credentials are not covered by per-key rate limits, so
+    this limiter applies only after an authentication failure.
+    """
+    if not client_ip and not credential_prefix:
+        return True
+
+    label = client_ip or credential_prefix or "unknown"
+    window = settings.auth_failure_rate_limit_window
+    max_requests = settings.auth_failure_rate_limit_requests
+
+    r = await get_redis()
+    if r is not None:
+        try:
+            key = f"auth_failure_rate:{label}"
+            count = await r.get(key)
+            if count is None:
+                await r.setex(key, window, 1)
+                return True
+
+            count_int = int(count)
+            if count_int >= max_requests:
+                logger.warning(f"Auth failure rate limit exceeded for {label}")
+                return False
+
+            await r.incr(key)
+            if await r.ttl(key) < 0:
+                await r.expire(key, window)
+            return True
+        except Exception as e:
+            logger.error(f"Redis auth failure rate limit check failed: {e}")
+            if settings.rate_limit_fail_closed:
+                return False
+
+    now = time.time()
+    attempts = _local_auth_failure_limits[label]
+    attempts[:] = [t for t in attempts if now - t < window]
+
+    if len(attempts) >= max_requests:
+        logger.warning(f"Auth failure rate limit exceeded for {label} (in-memory)")
+        return False
+
+    attempts.append(now)
+    return True
 
 
 async def check_usage_limits(project_id: str, plan: Plan) -> LimitsInfo:
